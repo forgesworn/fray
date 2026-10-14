@@ -4,7 +4,7 @@
 
 Fray is a poll-driven Rust transport for small realtime multiplayer games. Games supply their own rules, simulation and messages. The initial implementation is extracted from the transport already shared by Twang and Stampede, with the same wire format, authentication, defaults and limits.
 
-**Status: initial transport extraction.** Sessions, host election, migration, peer assistance, the authority interface, sandboxed Keep hosting and Godot bindings are future work. The extracted transport supports up to 8 players, including the host, and 1024-byte reliable messages or datagrams. The broader 2–64-player scope is a development target.
+**Status: shared transport, with dedicated-host seat accounting.** Sessions, host election, migration, peer assistance, the authority interface, sandboxed Keep hosting and Godot bindings are future work. The transport supports up to 8 player seats and 1024-byte reliable messages or datagrams. Phone hosts reserve one local seat by default; a dedicated host can expose all eight seats to remote players. The broader 2–64-player scope is a development target.
 
 ## Packages
 
@@ -48,6 +48,18 @@ fn main() {
 This creates a transport identity and echoes reliable bytes; it does not implement a game's admission policy or validate a persona credential. Configure the same app tag in compatible peers, discover the room through `lan_browse`, then use `join_lan`. APIs remain non-blocking; the network runtime stays inside the library.
 
 See [transport v6](docs/transport-v6.md) for the compatibility inventory and [security notes](crates/decented-net/SECURITY.md) for room-code and identity limitations. A room code is an invitation mechanism, not proof of a friend's identity.
+
+## Dedicated game host
+
+Set `NetConfig::host_has_player = false` when the game authority has no local
+player. This exposes eight remote connections and advertises zero players in
+an empty room. The default remains `true`; authentication and wire v6 stay the same.
+
+Stampede's `race-session` integration provides `stampede-headless`: an eight-bot
+CPU benchmark, eight-client localhost QUIC smoke check and an explicitly selected,
+bounded LAN test host. See the game's `docs/api/race-session.md` for commands.
+It uses ephemeral synthetic signed credentials for tests. It is a native development
+process, with no Keep control service, production credentials or sandbox.
 
 ## Development
 

@@ -2434,3 +2434,46 @@ fn punches_leave_from_the_socket_for_their_route() {
     assert_eq!(port(&routes[0].0), port(&online));
     assert_eq!(routes[0].1, targets);
 }
+
+#[test]
+fn a_headless_room_advertises_zero_players_and_seats_eight_remote_clients() {
+    let mut c = cfg();
+    c.host_has_player = false;
+    let mut browser = lan_browse(&c);
+    let h = host(&c, &Identity::ephemeral(), room(8));
+    let addr = local_addr(&h);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(found) = browser.poll().into_iter().find(|r| r.code == h.code()) {
+            assert_eq!(found.player_count, 0);
+            assert_eq!(found.max_players, 8);
+            break;
+        }
+        assert!(Instant::now() < deadline, "headless beacon not heard");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        let client = join_addr(&c, &Identity::ephemeral(), addr, &h.lan_token());
+        wait_client(&client, 10, |e| matches!(e, ClientEvent::Connected { .. }));
+        wait_host(&h, 5, |e| matches!(e, HostEvent::PeerJoined { .. }));
+        clients.push(client);
+    }
+    let late = join_addr(&c, &Identity::ephemeral(), addr, &h.lan_token());
+    let event = wait_client(&late, 10, |e| matches!(e, ClientEvent::Failed { .. }));
+    assert!(
+        matches!(
+            event,
+            ClientEvent::Failed {
+                stage: JoinStage::Handshake,
+                reason: FailReason::RoomFull,
+            }
+        ),
+        "{event:?}"
+    );
+    h.shutdown();
+    for client in clients {
+        client.shutdown();
+    }
+    late.shutdown();
+}

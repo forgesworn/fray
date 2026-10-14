@@ -79,7 +79,7 @@ pub const MAX_RELIABLE_LEN: usize = 1024;
 /// Largest lossy message `send_lossy` will carry (always fits a QUIC datagram
 /// at the minimum 1200-byte path MTU).
 pub const MAX_LOSSY_LEN: usize = 1024;
-/// Most players in a room, the host included.
+/// Most player seats in a room. A playing host occupies one seat.
 pub const MAX_PLAYERS: u8 = 8;
 
 /// Everything the transport needs to know about this install.
@@ -99,6 +99,9 @@ pub struct NetConfig {
     pub lan_port: u16,
     /// UDP port QUIC binds. 0 = ephemeral.
     pub quic_port: u16,
+    /// Whether the host reserves a local player seat. Defaults to true.
+    /// Set false for a dedicated host with only remote players.
+    pub host_has_player: bool,
     /// The app's id. It namespaces room codes, the QUIC ALPN and the LAN
     /// beacon, so two apps on this crate never cross-connect. The crate has
     /// no default: the app passes its own to [`NetConfig::new`].
@@ -142,6 +145,7 @@ impl NetConfig {
             stun: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
             lan_port: DEFAULT_LAN_PORT,
             quic_port: 0,
+            host_has_player: true,
             app_tag: app_tag.into(),
             inbox_relays: Vec::new(),
             withhold_host_attestation: None,

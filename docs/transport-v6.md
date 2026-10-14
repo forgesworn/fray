@@ -37,4 +37,10 @@ LAN beacons and room names are discoverable on the local network. Knowing a room
 
 ## Beyond the initial extraction
 
+The additive dedicated-host option `NetConfig::host_has_player = false` changes
+seat accounting only: an empty beacon reports zero players and a room of eight
+can accept eight remote clients. Its default is `true`, preserving the initial
+host-plus-seven behaviour. The option also reaches virtual hosts through their
+shared initializer. It is local configuration, with no new wire fields or v6 bump.
+
 There is no host migration, reachability-based election, data relay, full-checkpoint transfer, authority component or Keep sandbox in this wire. Neither Link nor mesh is wire-compatible merely because it also connects peers. Any later change must specify its own negotiation/versioning, admission guarantees, bounds and failure cases, with fixtures and consumer acceptance.

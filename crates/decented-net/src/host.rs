@@ -206,6 +206,7 @@ fn host_inner(
     start_host(
         id,
         room,
+        cfg.host_has_player,
         relays_total,
         None,
         move |code, room, keys, shared, cmd_rx| {
@@ -229,6 +230,7 @@ fn host_inner(
 pub(crate) fn start_host<F, Fut>(
     id: &Identity,
     room: RoomInfo,
+    host_has_player: bool,
     relays_total: usize,
     path_override: Option<PathKind>,
     task: F,
@@ -257,7 +259,7 @@ where
             code: Vec::new(),
         }),
         open: AtomicBool::new(true),
-        max_peers: max_players as usize - 1,
+        max_peers: max_players as usize - usize::from(host_has_player),
         next_peer: AtomicU32::new(1),
         ev_tx: Mutex::new(ev_tx),
         relays_up: AtomicUsize::new(0),
@@ -679,7 +681,8 @@ impl HostTask {
                     if open && last_beacon.elapsed() >= BEACON_EVERY {
                         last_beacon = Instant::now();
                         if let Some(local) = local {
-                            let players = 1 + self.shared.peers.lock().map(|p| p.len()).unwrap_or(0);
+                            let players = usize::from(self.cfg.host_has_player)
+                                + self.shared.peers.lock().map(|p| p.len()).unwrap_or(0);
                             // The beacon is IPv4 broadcast; never advertise
                             // the dual-stack socket's `::` wildcard in it.
                             let host_ip = crate::nat::candidates::local_outbound_v4()
