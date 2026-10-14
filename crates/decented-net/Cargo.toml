@@ -1,0 +1,27 @@
+[package]
+name = "fray-net"
+description = "Generic decentralised real-time transport: Nostr room-code rendezvous, NAT punch, QUIC reliable + datagram, LAN discovery."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+decented-relays = { package = "fray-relays", path = "../decented-relays" }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+getrandom = "0.3"
+hex = "0.4"
+if-addrs = "0.13"
+igd-next = "0.17.1"
+log = "0.4"
+nostr = { version = "=0.44.8", features = ["nip44"] }
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.26.2", features = ["rustls-tls-webpki-roots"] }

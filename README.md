@@ -2,43 +2,62 @@
 
 > Join the fray.
 
-**Realtime multiplayer sessions with no game server to run.** Fray is a Rust library that lets players find each other, connect directly and keep a match alive. It works on a phone, a desktop, a home server or a VPS, with no matchmaker, no operated relay and no central backend.
+Fray is a poll-driven Rust transport for small realtime multiplayer games. Games supply their own rules, simulation and messages. The initial implementation is extracted from the transport already shared by Twang and Stampede, with the same wire format, authentication, defaults and limits.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-native-orange)](https://www.rust-lang.org/)
+**Status: initial transport extraction.** Sessions, host election, migration, peer assistance, the authority interface, sandboxed Keep hosting and Godot bindings are future work. The extracted transport supports up to 8 players, including the host, and 1024-byte reliable messages or datagrams. The broader 2–64-player scope is a development target.
 
-Part of the [ForgeSworn](https://github.com/forgesworn) toolkit
+## Packages
 
-> **Status: design stage.** There is no usable code here yet. This repo will hold the library once the design settles.
+| Package | Directory | Responsibility |
+|---|---|---|
+| `fray-net` | `crates/decented-net` | QUIC reliable messages and datagrams, Nostr rendezvous, LAN discovery, NAT candidates and virtual links |
+| `fray-relays` | `crates/decented-relays` | Relay ordering, health, retry schedules, fallback and a shared process-wide pool |
 
-## The Problem
+The legacy directory names preserve the existing source-layout tests. New applications import `fray_net` and `fray_relays`. Existing consumers can keep their source imports using Cargo dependency aliases.
 
-Peer-to-peer multiplayer usually fails in the same places:
+## Try a LAN host
 
-- **Players can't connect.** Mobile carriers and strict routers block direct connections. The usual fix is a relay that somebody has to run and pay for.
-- **The host leaves and the match dies.** One player's phone call or dropped Wi-Fi ends the game for everyone.
-- **Whoever taps "Host" hosts**, even when another player has a far better connection.
-- **Every game re-solves this** with its own lobby, room codes and NAT traversal.
+The packages are not published. From a neighbouring Rust project:
 
-## What Fray Will Do
+```toml
+[dependencies]
+fray-net = { path = "../fray/crates/decented-net" }
+```
 
-| Layer | Responsibility |
-|---|---|
-| **Transport** | QUIC, NAT hole-punching (STUN, UPnP, IPv6), LAN discovery, optional Bluetooth links |
-| **Sessions** | Rooms and room codes rendezvoused over [Nostr](https://nostr.com), presence, reachability scoring, host election |
-| **Resilience** | Host migration from checkpoints; when a direct path fails, relay through a reachable peer the players trust |
-| **Authority** | One trait a game implements for its host logic. The same code runs natively in a player's app or sandboxed (WASM) on a dedicated host |
+```rust
+use fray_net::{HostEvent, Identity, NetConfig, RoomInfo};
 
-The game keeps its own protocol: its snapshots, rules and simulation. Fray carries those messages, picks the host, and keeps the session alive.
+fn main() {
+    let config = NetConfig::new("test-data", "my-game").lan_only();
+    let identity = Identity::ephemeral();
+    let host = fray_net::host(&config, &identity, RoomInfo {
+        name: "Test room".into(),
+        max_players: 8,
+    });
+    loop {
+        match host.poll() {
+            Some(HostEvent::Ready { .. }) => println!("Ready: {}", host.code()),
+            Some(HostEvent::Reliable { peer, bytes }) => host.send_reliable(peer, bytes),
+            Some(HostEvent::Failed { reason }) => panic!("Host failed: {reason}"),
+            _ => std::thread::sleep(std::time::Duration::from_millis(4)),
+        }
+    }
+}
+```
 
-Fray is **poll-driven**: the game calls it from its own frame loop. That suits any Rust engine, and Godot through [godot-rust](https://godot-rust.github.io/).
+This creates a transport identity and echoes reliable bytes; it does not implement a game's admission policy or validate a persona credential. Configure the same app tag in compatible peers, discover the room through `lan_browse`, then use `join_lan`. APIs remain non-blocking; the network runtime stays inside the library.
 
-## Scope
+See [transport v6](docs/transport-v6.md) for the compatibility inventory and [security notes](crates/decented-net/SECURITY.md) for room-code and identity limitations. A room code is an invitation mechanism, not proof of a friend's identity.
 
-Fray is for **sessions with one authority, roughly 2 to 64 players**, hosted on any device. That covers party games, racers, fighting games, small persistent worlds and community servers. **Leagues and ladders** are built on signed match results published as Nostr events.
+## Development
 
-It is **not** a backend for 100-player battle royales or MMO shards. Those need datacentre-scale servers and game-specific netcode.
+```sh
+cargo test --workspace --locked
+cargo fmt --all --check
+```
 
-## License
+The copied transport tests include socket, rendezvous and virtual-link cases. Consumer acceptance also runs the games' unchanged tests and Twang's existing headless bot match. Test results do not establish real-phone NAT reachability or Keep sandbox security.
 
-[MIT](LICENSE)
+## Licence and contributions
+
+MIT. The transport's [NOTICE](crates/decented-net/NOTICE) preserves its AxeNStax source lineage and licence. The relay package retains its [upstream licence](crates/decented-relays/LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md).
