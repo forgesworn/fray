@@ -3116,6 +3116,98 @@ fn activation_retries_cross_normal_actor_handoff_without_native_work_or_liveness
     }
 }
 
+/// Only a named protocol check of the original's frame is a `Frame` fault and
+/// leaves the actor usable. A poisoned replay session (even when the
+/// original's conflicting record poisoned it) and the actor's own watch clock
+/// are `Local` faults. The unclassified `receive` returns the same errors.
+#[test]
+fn standby_receive_attributes_frame_rejection_apart_from_local_faults() {
+    for case in ["frame", "replay", "clock"] {
+        let (descriptor, host, key, player, mut image, mut source, mut sink) =
+            activation_wire_pair(1);
+        let root = &descriptor.root;
+        let initial = source.initial_hash().unwrap();
+        source
+            .acknowledge(CapabilityAck::sign(root, 1, initial, 1, &host).unwrap(), 0)
+            .unwrap();
+        source
+            .acknowledge(
+                CapabilityAck::sign(root, 2, initial, 1, &player).unwrap(),
+                0,
+            )
+            .unwrap();
+        while let Some(wire) = source.poll_send(0).unwrap() {
+            sink.receive(&wire, 0).unwrap();
+        }
+        let (seq, armed, mut server) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+        while let Some(wire) = server.poll_send(0).unwrap() {
+            source.receive(&wire, 0).unwrap();
+        }
+        assert_eq!(source.armed(), Some(&armed));
+        let (primary, mut client) = source.finish(0).unwrap();
+        let bytes = match case {
+            // An ACK naming an unknown activation is refused by Fray's
+            // replay archive check; nothing is poisoned.
+            "frame" => CapabilityAck::sign(root, 1, initial, 99, &host).unwrap(),
+            // Same replay sequence, different bytes: a permanent conflict.
+            "replay" => CapabilityAck::sign(root, 1, [42; 32], 1, &host).unwrap(),
+            _ => CapabilityAck::sign(root, 1, initial, 1, &host).unwrap(),
+        }
+        .encode(root)
+        .unwrap();
+        client.enqueue(PacketKind::Control, &bytes).unwrap();
+        let mut original =
+            PrimaryActor::new(descriptor.clone(), primary, client, Activity::Idle, 0).unwrap();
+        let mut replica = StandbyActor::new(descriptor.clone(), seq, server, 0).unwrap();
+        let before = replica.receipt().clone();
+        let wire = original.poll_send(0).unwrap().unwrap();
+        if case == "clock" {
+            // The actor's watch has already seen a later time.
+            assert!(replica.expired(2000).unwrap());
+        }
+        let result = replica.receive_classified(&wire, 1000, &key, Activity::Idle, |_, _, _| {
+            panic!("a control record cannot restore")
+        });
+        assert_eq!(replica.receipt(), &before);
+        match case {
+            "frame" => {
+                assert_eq!(result, Err(StandbyFault::Frame(Error::Unauthorized)));
+                assert!(replica.failure().is_none());
+            }
+            "replay" => {
+                assert_eq!(result, Err(StandbyFault::Local(Error::Conflict)));
+                assert_eq!(replica.poll_send(1000), Err(Error::Closed));
+                continue;
+            }
+            _ => {
+                assert_eq!(
+                    result,
+                    Err(StandbyFault::Local(Error::Invalid(
+                        "backwards primary watch clock"
+                    )))
+                );
+                continue;
+            }
+        }
+        // After a frame rejection the same actor still installs a real batch.
+        image.logical_ms += 16;
+        image.game[0] = 1;
+        original
+            .prepare(image.clone(), before.watermarks, vec![])
+            .unwrap();
+        let mut installed = false;
+        while let Some(wire) = original.poll_send(1000).unwrap() {
+            installed |= replica
+                .receive_classified(&wire, 1000, &key, Activity::Advancing, |candidate, _, _| {
+                    Ok(candidate.image.clone())
+                })
+                .unwrap()
+                .is_some();
+        }
+        assert!(installed);
+    }
+}
+
 #[test]
 fn actual_quic_activation_stream_hands_the_same_live_channels_to_replication() {
     use fray_net::{Bytes, ClientEvent, HostEvent, Identity, NetConfig};

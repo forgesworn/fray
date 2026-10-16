@@ -7293,6 +7293,34 @@ fn control_kind(root: &Root, bytes: &[u8]) -> Result<u8> {
     r.u8()
 }
 
+/// Attribution of a failed [`StandbyActor::receive_classified`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StandbyFault {
+    /// The original's frame failed a named protocol check. Nothing was
+    /// restored, installed or acknowledged, and the actor is still usable.
+    Frame(Error),
+    /// A standby-side fault. The caller must treat it as permanent.
+    Local(Error),
+}
+impl StandbyFault {
+    pub fn error(&self) -> &Error {
+        match self {
+            Self::Frame(error) | Self::Local(error) => error,
+        }
+    }
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::Frame(error) | Self::Local(error) => error,
+        }
+    }
+}
+/// Marks an error as raised by a protocol check of a peer's frame.
+fn by_frame<T>(frame: &mut bool, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        *frame = true;
+    }
+    result
+}
 /// The fixed-pair replica on the standby's authenticated original-host link.
 /// Installation, receipts and failure detection share one owned sequencer.
 /// Game restore callbacks validate outputs and return a canonical fresh full session image for comparison;
@@ -7441,7 +7469,49 @@ impl StandbyActor {
         now_ms: u64,
         keys: &Keys,
         activity: Activity,
+        restore: impl FnMut(&Candidate, &SessionImage, &SessionImage) -> Result<Vec<u8>>,
+    ) -> Result<Option<Receipt>> {
+        self.receive_classified(wire, now_ms, keys, activity, restore)
+            .map_err(StandbyFault::into_error)
+    }
+    /// [`Self::receive`], with the failure attributed. Only a named protocol
+    /// check of the original's frame yields [`StandbyFault::Frame`]: physical
+    /// framing and binding, decoding, replay order, frontier, delta and
+    /// candidate validation, and liveness-response checks. Every other error
+    /// is [`StandbyFault::Local`], including a failed actor or replay session
+    /// (even when an original's conflicting record poisoned it), the watch
+    /// clock, keys, restore equivalence, installation and all post-install
+    /// receipt, replay-commit and watch bookkeeping. `RateLimited` is a
+    /// `Frame` fault and leaves the frame queued, exactly as before.
+    pub fn receive_classified(
+        &mut self,
+        wire: &[u8],
+        now_ms: u64,
+        keys: &Keys,
+        activity: Activity,
+        restore: impl FnMut(&Candidate, &SessionImage, &SessionImage) -> Result<Vec<u8>>,
+    ) -> std::result::Result<Option<Receipt>, StandbyFault> {
+        let mut frame = false;
+        match self.receive_inner(wire, now_ms, keys, activity, restore, &mut frame) {
+            Ok(receipt) => Ok(receipt),
+            Err(error)
+                if frame
+                    && self.failed.is_none()
+                    && self.sequencer.sender.replay.live().is_ok() =>
+            {
+                Err(StandbyFault::Frame(error))
+            }
+            Err(error) => Err(StandbyFault::Local(error)),
+        }
+    }
+    fn receive_inner(
+        &mut self,
+        wire: &[u8],
+        now_ms: u64,
+        keys: &Keys,
+        activity: Activity,
         mut restore: impl FnMut(&Candidate, &SessionImage, &SessionImage) -> Result<Vec<u8>>,
+        frame: &mut bool,
     ) -> Result<Option<Receipt>> {
         self.sequencer.sender.replay.live()?;
         if self.failed.is_some() {
@@ -7451,69 +7521,76 @@ impl StandbyActor {
         if keys.public_key().to_bytes() != self.descriptor.root.standby {
             return Err(Error::Unauthorized);
         }
-        let Some((kind, _, bytes)) = self.channel.receive(wire, now_ms)? else {
+        let Some((kind, _, bytes)) = by_frame(frame, self.channel.receive(wire, now_ms))? else {
             return Ok(None);
         };
         let root = &self.descriptor.root;
+        let context = root.context()?;
         match kind {
             PacketKind::Candidate | PacketKind::Delta => {
                 let delta_digest = (kind == PacketKind::Delta)
                     .then(|| hash(b"fray/migration/delta-wire/v1\0", &bytes));
                 let incoming;
                 let candidate = if let Some(digest) = delta_digest {
-                    let delta = CandidateDelta::decode(&root.context()?, &bytes)?;
-                    incoming = self.sequencer.sender.replay.begin(
-                        root.host,
-                        delta.sequence,
-                        &bytes,
-                        false,
+                    let delta = by_frame(frame, CandidateDelta::decode(&context, &bytes))?;
+                    incoming = by_frame(
+                        frame,
+                        self.sequencer.sender.replay.begin(
+                            root.host,
+                            delta.sequence,
+                            &bytes,
+                            false,
+                        ),
                     )?;
                     if delta.index == self.sequencer.receipt.index {
                         if self.last_delta != Some((delta.index, digest)) {
-                            return Err(Error::Conflict);
+                            return by_frame(frame, Err(Error::Conflict));
                         }
                         // Identical bytes were fully validated and installed.
                         // Do not reconstruct or run native restore again, and
                         // do not let retries refresh any liveness/security age.
                         let receipt = self.sequencer.receipt.clone();
                         self.channel
-                            .enqueue(PacketKind::Receipt, &receipt.encode(&root.context()?)?)?;
+                            .enqueue(PacketKind::Receipt, &receipt.encode(&context)?)?;
                         incoming.commit()?;
                         return Ok(Some(receipt));
                     } else {
                         // Reject invalid frontiers before allowing a compact
                         // wire message to expand into a complete native image.
                         if delta.term != self.sequencer.receipt.term {
-                            return Err(Error::Closed);
+                            return by_frame(frame, Err(Error::Closed));
                         }
-                        if delta.index
-                            != self
-                                .sequencer
-                                .receipt
-                                .index
-                                .checked_add(1)
-                                .ok_or(Error::Bounds)?
-                            || delta.parent != self.sequencer.receipt.digest(&root.context()?)?
+                        let next = self
+                            .sequencer
+                            .receipt
+                            .index
+                            .checked_add(1)
+                            .ok_or(Error::Bounds)?;
+                        if delta.index != next
+                            || delta.parent != self.sequencer.receipt.digest(&context)?
                         {
-                            return Err(Error::Stale);
+                            return by_frame(frame, Err(Error::Stale));
                         }
                         if delta.patch.base != self.sequencer.receipt.state {
-                            return Err(Error::Conflict);
+                            return by_frame(frame, Err(Error::Conflict));
                         }
-                        delta.expand(self.sequencer.image())?
+                        by_frame(frame, delta.expand(self.sequencer.image()))?
                     }
                 } else {
-                    let candidate = Candidate::decode(&root.context()?, &bytes)?;
-                    incoming = self.sequencer.sender.replay.begin(
-                        root.host,
-                        candidate.sequence,
-                        &bytes,
-                        false,
+                    let candidate = by_frame(frame, Candidate::decode(&context, &bytes))?;
+                    incoming = by_frame(
+                        frame,
+                        self.sequencer.sender.replay.begin(
+                            root.host,
+                            candidate.sequence,
+                            &bytes,
+                            false,
+                        ),
                     )?;
                     candidate
                 };
-                let staged = self.sequencer.stage(candidate)?;
-                let image = SessionImage::decode(root, &staged.candidate.image)?;
+                let staged = by_frame(frame, self.sequencer.stage(candidate))?;
+                let image = by_frame(frame, SessionImage::decode(root, &staged.candidate.image))?;
                 let previous = SessionImage::decode(root, self.sequencer.image())?;
                 let restore_once = |restore: &mut dyn FnMut(
                     &Candidate,
@@ -7547,29 +7624,40 @@ impl StandbyActor {
                 self.members = image.members;
                 self.watch.installed(&self.sequencer, now_ms)?;
                 self.channel
-                    .enqueue(PacketKind::Receipt, &receipt.encode(&root.context()?)?)?;
+                    .enqueue(PacketKind::Receipt, &receipt.encode(&context)?)?;
                 Ok(Some(receipt))
             }
             PacketKind::Control => {
-                match control_kind(root, &bytes)? {
+                match by_frame(frame, control_kind(root, &bytes))? {
                     1 => {
-                        let ack = CapabilityAck::decode(root, &bytes)?;
-                        self.sequencer.sender.replay.archived_duplicate(
-                            root.member(ack.player)?.key.ok_or(Error::Unauthorized)?,
-                            ack.sequence,
-                            &bytes,
+                        let ack = by_frame(frame, CapabilityAck::decode(root, &bytes))?;
+                        let issuer = by_frame(
+                            frame,
+                            root.member(ack.player)
+                                .and_then(|member| member.key.ok_or(Error::Unauthorized)),
+                        )?;
+                        by_frame(
+                            frame,
+                            self.sequencer.sender.replay.archived_duplicate(
+                                issuer,
+                                ack.sequence,
+                                &bytes,
+                            ),
                         )?;
                     }
                     10 => {
-                        let probe = PulseProbe::decode(root, &bytes)?;
+                        let probe = by_frame(frame, PulseProbe::decode(root, &bytes))?;
                         if probe.tls != self.channel.tls() {
-                            return Err(Error::Unauthorized);
+                            return by_frame(frame, Err(Error::Unauthorized));
                         }
-                        let incoming = self.sequencer.sender.replay.begin(
-                            root.host,
-                            probe.sequence,
-                            &bytes,
-                            false,
+                        let incoming = by_frame(
+                            frame,
+                            self.sequencer.sender.replay.begin(
+                                root.host,
+                                probe.sequence,
+                                &bytes,
+                                false,
+                            ),
                         )?;
                         if !incoming.is_new() {
                             return Ok(None);
@@ -7589,22 +7677,34 @@ impl StandbyActor {
                         incoming.commit()?;
                     }
                     11 => {
-                        let response = PrimaryAlive::decode(root, &bytes)?;
-                        self.sequencer.sender.replay.receipt(&response.frontier)?;
-                        let incoming = self.sequencer.sender.replay.begin(
-                            root.host,
-                            response.sequence,
-                            &bytes,
-                            false,
+                        let response = by_frame(frame, PrimaryAlive::decode(root, &bytes))?;
+                        by_frame(
+                            frame,
+                            self.sequencer.sender.replay.receipt(&response.frontier),
                         )?;
-                        self.watch.response(&self.sequencer, &response, now_ms)?;
+                        let incoming = by_frame(
+                            frame,
+                            self.sequencer.sender.replay.begin(
+                                root.host,
+                                response.sequence,
+                                &bytes,
+                                false,
+                            ),
+                        )?;
+                        // The watch's own clock and term are standby state.
+                        self.watch.advance(now_ms)?;
+                        self.watch.current(&self.sequencer)?;
+                        by_frame(
+                            frame,
+                            self.watch.response(&self.sequencer, &response, now_ms),
+                        )?;
                         incoming.commit()?;
                     }
-                    _ => return Err(Error::Unauthorized),
+                    _ => return by_frame(frame, Err(Error::Unauthorized)),
                 }
                 Ok(None)
             }
-            _ => Err(Error::Unauthorized),
+            _ => by_frame(frame, Err(Error::Unauthorized)),
         }
     }
     pub fn poll_send(&mut self, now_ms: u64) -> Result<Option<Vec<u8>>> {
