@@ -6991,6 +6991,14 @@ impl PrimaryWatch {
         }
         Ok(())
     }
+    /// True while a probe at `now_ms` would be paced out. Callers check this
+    /// before allocating a sender sequence so a too-early probe burns no number.
+    /// It advances the clock first, exactly as `probe_with_sequence` does, so a
+    /// backwards clock still errors before the subtraction.
+    fn probe_paced_out(&mut self, now_ms: u64) -> Result<bool> {
+        self.advance(now_ms)?;
+        Ok(self.last_probe.is_some_and(|last| now_ms - last < 50))
+    }
     pub fn probe(&mut self, now_ms: u64) -> Result<PulseProbe> {
         self.probe_with_sequence(now_ms, self.next)
     }
@@ -6999,7 +7007,7 @@ impl PrimaryWatch {
         if sequence < self.next {
             return Err(Error::Stale);
         }
-        if self.last_probe.is_some_and(|last| now_ms - last < 50) {
+        if self.probe_paced_out(now_ms)? {
             return Err(Error::Stale);
         }
         let next = sequence.checked_add(1).ok_or(Error::Bounds)?;
@@ -7141,6 +7149,14 @@ impl ProgressWatch {
         self.activity = activity;
         Ok(())
     }
+    /// True while a probe at `now_ms` would be paced out. Callers check this
+    /// before allocating a sender sequence so a too-early probe burns no number.
+    /// It advances the clock first, exactly as `probe_with_sequence` does, so a
+    /// backwards clock still errors before the subtraction.
+    fn probe_paced_out(&mut self, now_ms: u64) -> Result<bool> {
+        self.advance(now_ms)?;
+        Ok(self.last_probe.is_some_and(|last| now_ms - last < 50))
+    }
     pub fn probe(&mut self, now_ms: u64) -> Result<PulseProbe> {
         self.probe_with_sequence(now_ms, self.next)
     }
@@ -7151,7 +7167,7 @@ impl ProgressWatch {
         if sequence < self.next || sequence == 0 {
             return Err(Error::Stale);
         }
-        if self.last_probe.is_some_and(|last| now_ms - last < 50) {
+        if self.probe_paced_out(now_ms)? {
             return Err(Error::Stale);
         }
         let next = sequence.checked_add(1).ok_or(Error::Bounds)?;
@@ -7454,6 +7470,9 @@ impl StandbyActor {
         self.sequencer.sender.replay.live()?;
         if self.failed.is_some() {
             return Err(Error::Closed);
+        }
+        if self.watch.probe_paced_out(now_ms)? {
+            return Err(Error::Stale);
         }
         let probe = self
             .watch
@@ -7951,6 +7970,9 @@ impl PrimaryActor {
         self.primary.sender.replay.live()?;
         if self.failed.is_some() {
             return Err(Error::Closed);
+        }
+        if self.watch.probe_paced_out(now_ms)? {
+            return Err(Error::Stale);
         }
         let probe = self
             .watch

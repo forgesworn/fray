@@ -3693,6 +3693,46 @@ fn authority_and_human_sender_ids_share_activation_links_and_promotion_without_r
 }
 
 #[test]
+fn paced_out_probes_burn_no_sender_sequence_on_either_side() {
+    let (root, _, _, mut original, mut standby, _) = replication_actors();
+
+    // Primary side: the shared sender counter is observable directly.
+    let shared = original.primary().sender_sequence();
+    original.probe(0).unwrap();
+    let mut sent = Vec::new();
+    while let Some(wire) = original.poll_send(0).unwrap() {
+        sent.push(PulseProbe::decode(&root, &Frame::decode(&wire).unwrap().payload).unwrap());
+    }
+    assert_eq!(sent.len(), 1);
+    let first = sent[0].sequence;
+    assert_eq!(original.probe(49), Err(Error::Stale));
+    assert!(original.poll_send(49).unwrap().is_none());
+    // The paced-out probe allocated nothing: the next number is still free.
+    assert_eq!(shared.allocate().unwrap(), first + 1);
+    original.probe(50).unwrap();
+    let wire = original.poll_send(50).unwrap().unwrap();
+    let probe = PulseProbe::decode(&root, &Frame::decode(&wire).unwrap().payload).unwrap();
+    assert_eq!(probe.sequence, first + 2);
+
+    // Standby side: its sender is private to the sequencer, so observe the
+    // numbers on the wire; an interleaved allocation would leave a gap.
+    standby.probe(0).unwrap();
+    let wire = standby.poll_send(0).unwrap().unwrap();
+    let first = PulseProbe::decode(&root, &Frame::decode(&wire).unwrap().payload)
+        .unwrap()
+        .sequence;
+    assert!(standby.poll_send(0).unwrap().is_none());
+    assert_eq!(standby.probe(49), Err(Error::Stale));
+    assert!(standby.poll_send(49).unwrap().is_none());
+    standby.probe(50).unwrap();
+    let wire = standby.poll_send(50).unwrap().unwrap();
+    let second = PulseProbe::decode(&root, &Frame::decode(&wire).unwrap().payload)
+        .unwrap()
+        .sequence;
+    assert_eq!(second, first + 1);
+}
+
+#[test]
 fn delta_codec_binds_context_exact_base_and_target_and_rejects_noncanonical_lengths() {
     let (context, _) = pair();
     let base = vec![3; 200_000];
