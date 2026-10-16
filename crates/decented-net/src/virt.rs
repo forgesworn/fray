@@ -153,6 +153,8 @@ pub fn host_virtual(
         cfg.host_has_player,
         0,
         Some(PathKind::Virtual),
+        cfg.app_tag.clone(),
+        None,
         move |code, _room, _keys, shared, cmd_rx| run_host(app_tag, code, links, shared, cmd_rx),
     )
 }

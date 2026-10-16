@@ -252,6 +252,8 @@ async fn write_frame(send: &mut quinn::SendStream, payload: &[u8]) -> Result<(),
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Hello {
     pub v: u32,
+    #[serde(default)]
+    pub migration: Option<crate::migration::ConnectionBinding>,
     pub session: Option<String>,
     pub path: PathKind,
     /// Proofs of an admission token (code-derived or the LAN beacon's), each
@@ -288,6 +290,10 @@ pub(crate) struct Accepted {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Welcome {
     pub v: u32,
+    #[serde(default)]
+    pub challenge: [u8; 32],
+    #[serde(default)]
+    pub migration: Option<crate::migration::ConnectionBinding>,
     pub peer: u32,
     pub host_pubkey: String,
     pub host_name: String,
@@ -309,6 +315,8 @@ pub(crate) struct Welcome {
 /// The host, as proven by a verified welcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostProof {
+    pub challenge: [u8; 32],
+    pub migration: Option<crate::migration::ConnectionBinding>,
     pub peer: u32,
     pub pubkey: PublicKey,
     pub name: String,
@@ -343,6 +351,25 @@ fn identify_digest(
     h.update(a.as_bytes());
     update_inbox_relays(&mut h, inbox_relays);
     h.finalize().into()
+}
+
+fn transcript_digest(
+    base: [u8; 32],
+    challenge: &[u8; 32],
+    migration: Option<&crate::migration::ConnectionBinding>,
+) -> Result<[u8; 32], String> {
+    let mut h = Sha256::new();
+    h.update(b"fray/net/transcript/v7\0");
+    h.update(base);
+    h.update(challenge);
+    match migration {
+        None => h.update([0]),
+        Some(binding) => {
+            h.update([1]);
+            h.update(binding.canonical().map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(h.finalize().into())
 }
 
 /// Length-prefixed list, so no entry can bleed into the next.
@@ -403,6 +430,7 @@ fn welcome_digest(
 }
 
 /// Build the host's signed welcome for this connection.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_welcome(
     host: &Keys,
@@ -414,6 +442,33 @@ pub(crate) fn sign_welcome(
     attestation: Option<&str>,
     inbox_relays: &[String],
 ) -> Welcome {
+    sign_welcome_bound(
+        host,
+        binding,
+        session,
+        peer,
+        name,
+        relay_key,
+        attestation,
+        inbox_relays,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_welcome_bound(
+    host: &Keys,
+    binding: &[u8; 32],
+    session: Option<&str>,
+    peer: u32,
+    name: &str,
+    relay_key: &PublicKey,
+    attestation: Option<&str>,
+    inbox_relays: &[String],
+    migration: Option<crate::migration::ConnectionBinding>,
+) -> Welcome {
+    let mut challenge = [0; 32];
+    getrandom::fill(&mut challenge).expect("OS RNG unavailable");
     let mut end = name.len().min(MAX_HOST_NAME);
     while !name.is_char_boundary(end) {
         end -= 1;
@@ -422,7 +477,7 @@ pub(crate) fn sign_welcome(
     let relay_key = relay_key.to_hex();
     let attestation = attestation.filter(|a| a.len() <= crate::identity::MAX_ATTESTATION_LEN);
     let inbox_relays = crate::identity::sanitize_inbox_relays(inbox_relays);
-    let msg = Message::from_digest(welcome_digest(
+    let base = welcome_digest(
         binding,
         session,
         peer,
@@ -430,9 +485,15 @@ pub(crate) fn sign_welcome(
         &relay_key,
         attestation,
         &inbox_relays,
-    ));
+    );
+    let msg = Message::from_digest(
+        transcript_digest(base, &challenge, migration.as_ref())
+            .expect("validated migration binding"),
+    );
     Welcome {
         v: NET_PROTOCOL_VERSION,
+        challenge,
+        migration,
         peer,
         host_pubkey: host.public_key().to_hex(),
         host_name: name.to_string(),
@@ -464,7 +525,7 @@ pub(crate) fn verify_welcome(
         .sig
         .parse()
         .map_err(|e| format!("welcome signature: {e}"))?;
-    let msg = Message::from_digest(welcome_digest(
+    let base = welcome_digest(
         binding,
         session,
         w.peer,
@@ -472,11 +533,14 @@ pub(crate) fn verify_welcome(
         &w.relay_key,
         w.attestation.as_deref(),
         &w.inbox_relays,
-    ));
+    );
+    let msg = Message::from_digest(transcript_digest(base, &w.challenge, w.migration.as_ref())?);
     nostr::SECP256K1
         .verify_schnorr(&sig, &msg, &xonly)
         .map_err(|_| "bad welcome signature".to_string())?;
     Ok(HostProof {
+        challenge: w.challenge,
+        migration: w.migration.clone(),
         peer: w.peer,
         pubkey: pk,
         name: crate::lan::sanitize_name(&w.host_name),
@@ -511,9 +575,23 @@ pub(crate) async fn client_open(
     tokens: &[[u8; 32]],
     check: &HostCheck,
 ) -> Result<Opened, HandshakeError> {
+    client_open_bound(conn, session, path, tokens, check, None).await
+}
+pub(crate) async fn client_open_bound(
+    conn: &quinn::Connection,
+    session: Option<&str>,
+    path: PathKind,
+    tokens: &[[u8; 32]],
+    check: &HostCheck,
+    expected: Option<&crate::migration::ConnectionBinding>,
+) -> Result<Opened, HandshakeError> {
+    if let Some(binding) = expected {
+        binding.validate().map_err(|e| e.to_string())?;
+    }
     let b = binding(conn)?;
     let hello = Hello {
         v: NET_PROTOCOL_VERSION,
+        migration: expected.cloned(),
         session: session.map(str::to_string),
         path,
         admit: tokens
@@ -534,6 +612,11 @@ pub(crate) async fn client_open(
     let w: Welcome = serde_json::from_slice(&frame)
         .map_err(|e| HandshakeError::Unverified(format!("welcome: {e}")))?;
     let proof = verify_welcome(&w, &b, session).map_err(HandshakeError::Unverified)?;
+    if proof.migration.as_ref() != expected {
+        return Err(HandshakeError::Unverified(
+            "session/role binding mismatch".into(),
+        ));
+    }
     check(&proof).map_err(HandshakeError::Unverified)?;
     Ok(Opened {
         conn: conn.clone(),
@@ -554,13 +637,18 @@ pub(crate) async fn client_identify(
 ) -> Result<(), HandshakeError> {
     let attestation = attestation.filter(|a| a.len() <= crate::identity::MAX_ATTESTATION_LEN);
     let inbox_relays = crate::identity::sanitize_inbox_relays(inbox_relays);
-    let msg = Message::from_digest(identify_digest(
+    let base = identify_digest(
         &opened.binding,
         session,
         &opened.proof.pubkey,
         attestation,
         &inbox_relays,
-    ));
+    );
+    let msg = Message::from_digest(transcript_digest(
+        base,
+        &opened.proof.challenge,
+        opened.proof.migration.as_ref(),
+    )?);
     let id = Identify {
         pubkey: keys.public_key().to_hex(),
         sig: keys.sign_schnorr(&msg).to_string(),
@@ -629,6 +717,7 @@ pub(crate) async fn server_read_hello(
     Ok((send, recv, hello))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn server_send_welcome(
     conn: &quinn::Connection,
@@ -640,9 +729,39 @@ pub(crate) async fn server_send_welcome(
     relay_key: &PublicKey,
     session: Option<&str>,
     peer: u32,
-) -> Result<(), String> {
+) -> Result<HostProof, String> {
+    server_send_welcome_bound(
+        conn,
+        send,
+        host,
+        attestation,
+        inbox_relays,
+        name,
+        relay_key,
+        session,
+        peer,
+        None,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn server_send_welcome_bound(
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    host: &Keys,
+    attestation: Option<&str>,
+    inbox_relays: &[String],
+    name: &str,
+    relay_key: &PublicKey,
+    session: Option<&str>,
+    peer: u32,
+    migration: Option<crate::migration::ConnectionBinding>,
+) -> Result<HostProof, String> {
+    if let Some(binding) = &migration {
+        binding.validate().map_err(|e| e.to_string())?;
+    }
     let b = binding(conn)?;
-    let w = sign_welcome(
+    let w = sign_welcome_bound(
         host,
         &b,
         session,
@@ -651,9 +770,11 @@ pub(crate) async fn server_send_welcome(
         relay_key,
         attestation,
         inbox_relays,
+        migration,
     );
     let json = serde_json::to_vec(&w).map_err(|e| e.to_string())?;
-    write_frame(send, &json).await
+    write_frame(send, &json).await?;
+    verify_welcome(&w, &b, session)
 }
 
 /// Host, phase 2: read and verify the joiner's identity (signed over this
@@ -663,6 +784,7 @@ pub(crate) async fn server_read_identify(
     recv: &mut quinn::RecvStream,
     session: Option<&str>,
     host: &PublicKey,
+    transcript: &HostProof,
 ) -> Result<(PublicKey, Option<String>, Vec<String>), (u32, String)> {
     let frame = read_frame(recv, HANDSHAKE_FRAME_CAP)
         .await
@@ -685,13 +807,17 @@ pub(crate) async fn server_read_identify(
     }
     crate::identity::check_inbox_relays(&id.inbox_relays).map_err(|e| (close::BAD_HELLO, e))?;
     let b = binding(conn).map_err(|e| (close::BAD_HELLO, e))?;
-    let msg = Message::from_digest(identify_digest(
+    let base = identify_digest(
         &b,
         session,
         host,
         id.attestation.as_deref(),
         &id.inbox_relays,
-    ));
+    );
+    let msg = Message::from_digest(
+        transcript_digest(base, &transcript.challenge, transcript.migration.as_ref())
+            .map_err(|e| (close::BAD_HELLO, e))?,
+    );
     nostr::SECP256K1
         .verify_schnorr(&sig, &msg, &xonly)
         .map_err(|_| (close::BAD_HELLO, "bad identity signature".to_string()))?;
@@ -712,7 +838,13 @@ pub(crate) async fn server_send_accepted(send: &mut quinn::SendStream) -> Result
 /// The app-facing half of a live connection.
 #[derive(Clone)]
 pub(crate) struct Link {
+    pub session_key: Option<[u8; 32]>,
+    pub session_player: Option<u64>,
+    pub session_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub session_channel_claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub conn: quinn::Connection,
+    pub migration: Option<crate::migration::ConnectionBinding>,
+    pub generation: u64,
     pub tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     pub queued: Arc<AtomicUsize>,
 }
@@ -722,7 +854,15 @@ impl Link {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Link {
+                session_key: None,
+                session_player: None,
                 conn,
+                migration: None,
+                generation: 0,
+                session_live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                session_channel_claimed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
                 tx,
                 queued: Arc::new(AtomicUsize::new(0)),
             },
@@ -1129,6 +1269,8 @@ mod tests {
         assert_eq!(
             proof,
             HostProof {
+                challenge: w.challenge,
+                migration: None,
                 peer: 3,
                 pubkey: host.public_key(),
                 name: "Ava".into(),
@@ -1211,6 +1353,7 @@ mod tests {
         let b = [9u8; 32];
         let hello = |admit: Vec<String>| Hello {
             v: NET_PROTOCOL_VERSION,
+            migration: None,
             session: None,
             path: PathKind::Lan,
             admit,

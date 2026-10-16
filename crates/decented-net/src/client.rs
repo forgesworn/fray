@@ -39,9 +39,11 @@ pub const MAX_QUEUED_LOSSY: usize = 128;
 type Queued = (ClientEvent, Option<Arc<AtomicUsize>>);
 
 struct Shared {
+    local_key: [u8; 32],
     link: Mutex<Option<Link>>,
     ev_tx: Mutex<mpsc::Sender<Queued>>,
     closing: AtomicBool,
+    migration: Mutex<Option<crate::migration::ConnectionBinding>>,
 }
 
 impl Shared {
@@ -75,7 +77,11 @@ pub(crate) enum Target {
     /// Code, relay, and a pinned UTC day (tests) or `None` for the clock.
     Code(String, Box<dyn RendezvousRelay>, Option<u64>),
     /// Address and the LAN admission token (hex) from the beacon.
-    Lan(SocketAddr, String),
+    Lan(
+        SocketAddr,
+        String,
+        Option<(crate::migration::ConnectionBinding, PublicKey)>,
+    ),
     /// A point-to-point packet link to the host (see `virt`). Its first
     /// packet carries the room's LAN token; then it is a LAN join.
     Virtual(crate::virt::VirtualLink),
@@ -93,13 +99,31 @@ pub fn join(cfg: &NetConfig, id: &Identity, code: &str) -> ClientHandle {
 
 /// Join a room heard on the LAN beacon: dials its address directly, no internet.
 pub fn join_lan(cfg: &NetConfig, id: &Identity, room: &LanRoom) -> ClientHandle {
-    spawn(cfg, id, Target::Lan(room.addr, room.token.clone()))
+    spawn(cfg, id, Target::Lan(room.addr, room.token.clone(), None))
 }
 
 /// Join a host at a known address (same as a LAN join). `token` is the room's
 /// LAN admission token ([`LanRoom::token`], or [`crate::HostHandle::lan_token`]).
 pub fn join_addr(cfg: &NetConfig, id: &Identity, addr: SocketAddr, token: &str) -> ClientHandle {
-    spawn(cfg, id, Target::Lan(addr, token.to_string()))
+    spawn(cfg, id, Target::Lan(addr, token.to_string(), None))
+}
+
+/// Connect a prepared authenticated migration route. The expected runtime
+/// identity and signed root/role tuple are checked before Identify is sent.
+pub fn join_session_addr(
+    cfg: &NetConfig,
+    id: &Identity,
+    addr: SocketAddr,
+    token: &str,
+    binding: crate::migration::ConnectionBinding,
+    host: PublicKey,
+) -> Result<ClientHandle, String> {
+    binding.validate().map_err(|e| e.to_string())?;
+    Ok(spawn(
+        cfg,
+        id,
+        Target::Lan(addr, token.to_string(), Some((binding, host))),
+    ))
 }
 
 /// Join by code over a caller-supplied relay (e.g. [`crate::relay::FakeRelayHub`] in tests).
@@ -128,9 +152,11 @@ pub(crate) fn spawn(cfg: &NetConfig, id: &Identity, target: Target) -> ClientHan
     let (ev_tx, ev_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
+        local_key: id.pubkey().to_bytes(),
         link: Mutex::new(None),
         ev_tx: Mutex::new(ev_tx),
         closing: AtomicBool::new(false),
+        migration: Mutex::new(None),
     });
     let s = Arc::clone(&shared);
     let cfg = cfg.clone();
@@ -168,6 +194,59 @@ pub(crate) fn spawn(cfg: &NetConfig, id: &Identity, target: Target) -> ClientHan
 }
 
 impl ClientHandle {
+    /// This connection's local runtime identity.
+    pub fn runtime_key(&self) -> [u8; 32] {
+        self.shared.local_key
+    }
+
+    /// The host key proven by the signed welcome on this live connection.
+    /// Game admission and the player's host confirmation remain required.
+    pub fn host_key(&self) -> Option<[u8; 32]> {
+        let link = self.link()?;
+        if !link.session_live.load(Ordering::Acquire) || link.conn.close_reason().is_some() {
+            return None;
+        }
+        link.session_key
+    }
+
+    pub fn connection_binding(&self) -> Option<crate::migration::ConnectionBinding> {
+        self.shared.migration.lock().ok()?.clone()
+    }
+    /// Build session framing from the verified welcome and live TLS exporter.
+    /// policy supplies the already verified descriptor/current public roster;
+    /// it cannot replace the handshake's root, endpoint role or runtime key.
+    pub fn migration_channel(
+        &self,
+        policy: &crate::migration::EndpointPolicy,
+    ) -> Result<crate::migration::Channel, String> {
+        let link = self.link().ok_or("client is not connected")?;
+        if link.conn.close_reason().is_some() {
+            return Err("client connection is closed".into());
+        }
+        let binding = link
+            .migration
+            .clone()
+            .ok_or("ordinary link has no migration binding")?;
+        let remote = link.session_key.ok_or("host identity is not bound")?;
+        let tls = quic::binding(&link.conn)?;
+        let channel = crate::migration::Channel::new_bound(
+            policy,
+            binding,
+            crate::migration::ChannelSide::Client,
+            self.shared.local_key,
+            remote,
+            tls,
+        )
+        .map_err(|error| error.to_string())?;
+        link.session_channel_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "session framing already attached; reconnect requires fresh TLS")?;
+        Ok(channel)
+    }
+    pub fn tls_binding(&self) -> Option<[u8; 32]> {
+        quic::binding(&self.link()?.conn).ok()
+    }
+
     pub fn poll(&self) -> Option<ClientEvent> {
         let (ev, counter) = self.events.lock().ok()?.try_recv().ok()?;
         if let Some(c) = counter {
@@ -252,7 +331,7 @@ async fn run(
     let (target, mut virtual_link) = match target {
         Target::Virtual(mut link) => match crate::virt::read_preframe(&mut link).await {
             Ok(token) => (
-                Target::Lan(crate::virt::HOST_ADDR, hex::encode(token)),
+                Target::Lan(crate::virt::HOST_ADDR, hex::encode(token), None),
                 Some(link),
             ),
             Err((stage, reason)) => return fail(stage, reason),
@@ -261,7 +340,7 @@ async fn run(
     };
     let (mut opened, session, path) = match target {
         Target::Virtual(_) => unreachable!("converted to a LAN join above"),
-        Target::Lan(addr, token) => {
+        Target::Lan(addr, token, session_link) => {
             let Some(t) = crate::lan::parse_token(&token) else {
                 return fail(JoinStage::Preparing, FailReason::NotAdmitted);
             };
@@ -311,10 +390,23 @@ async fn run(
             shared.emit(ClientEvent::Progress {
                 stage: JoinStage::Handshake,
             });
-            let any_host: quic::HostCheck = Arc::new(|_| Ok(()));
+            let expected_host = session_link.as_ref().map(|(_, key)| *key);
+            let any_host: quic::HostCheck = Arc::new(move |proof| match expected_host {
+                Some(key) if proof.pubkey != key => {
+                    Err("unexpected session endpoint identity".into())
+                }
+                _ => Ok(()),
+            });
             let open = tokio::time::timeout(
                 quic::HANDSHAKE_TIMEOUT,
-                quic::client_open(&conn, None, path, &tokens, &any_host),
+                quic::client_open_bound(
+                    &conn,
+                    None,
+                    path,
+                    &tokens,
+                    &any_host,
+                    session_link.as_ref().map(|(binding, _)| binding),
+                ),
             )
             .await
             .unwrap_or_else(|_| Err(quic::HandshakeError::Io("handshake timed out".into())));
@@ -480,7 +572,12 @@ async fn run(
     let quic::Opened {
         send, recv, proof, ..
     } = opened;
-    let (link, out_rx) = Link::new(conn.clone());
+    let (mut link, out_rx) = Link::new(conn.clone());
+    link.migration = proof.migration.clone();
+    link.session_key = Some(proof.pubkey.to_bytes());
+    if let Ok(mut binding) = shared.migration.lock() {
+        *binding = proof.migration.clone();
+    }
     if let Ok(mut l) = shared.link.lock() {
         *l = Some(link.clone());
     }

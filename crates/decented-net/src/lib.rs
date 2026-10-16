@@ -26,6 +26,7 @@ mod host;
 mod identity;
 pub mod ifaces;
 mod lan;
+pub mod migration;
 pub mod nat;
 pub mod netbind;
 mod quic;
@@ -34,7 +35,7 @@ pub mod rendezvous;
 pub mod room;
 mod virt;
 
-pub use client::{join, join_addr, join_lan, join_with_relay, ClientHandle};
+pub use client::{join, join_addr, join_lan, join_session_addr, join_with_relay, ClientHandle};
 pub use host::HostHandle;
 pub use identity::{npub_of, Identity};
 pub use lan::{lan_browse, LanBrowser};
@@ -66,13 +67,15 @@ pub const DEFAULT_LAN_PORT: u16 = 7715;
 /// is the same as v5, so a v5 build and a v6 one do find each other on the
 /// relays and are told "version"; on the LAN the beacon is filtered on the
 /// version, so they never list each other.
+/// v7: signed welcome and identify bind a fresh server challenge and the
+/// migration session, descriptor, term and endpoint roles when enabled.
 /// A v1 build can never half-match a later one: different tags, different
 /// ALPN, and the beacon is filtered on it. v2 to v4 share the room
 /// derivation, so a mix is told "version"; v5 has its own derivation, so a v5
 /// build and an older one never find each other on the relays at all, and the
 /// bump keeps an older LAN browser from listing a v5 beacon (a code of letters
 /// outside I and O is valid in both alphabets) and joining it by beacon token.
-pub const NET_PROTOCOL_VERSION: u32 = 6;
+pub const NET_PROTOCOL_VERSION: u32 = 7;
 /// Largest reliable message `send_reliable` will carry (and accept: a bigger
 /// frame from a peer ends the connection).
 pub const MAX_RELIABLE_LEN: usize = 1024;
@@ -178,6 +181,57 @@ pub fn host_with_relay(
     relay: Option<Box<dyn relay::RendezvousRelay>>,
 ) -> HostHandle {
     host::host_with_relay(cfg, &virt::host_identity(cfg, id, false), room, relay)
+}
+
+/// Start the designated standby's passive, unadvertised control listener.
+/// The code and credentials arrive through the existing encrypted consent path.
+pub fn host_standby(
+    cfg: &NetConfig,
+    id: &Identity,
+    code: &str,
+    descriptor: migration::Descriptor,
+) -> Result<HostHandle, String> {
+    let policy = migration::EndpointPolicy {
+        descriptor,
+        role: migration::LinkRole::Standby,
+        promotion: None,
+        membership: None,
+    };
+    host::start_session_endpoint(
+        cfg,
+        &virt::host_identity(cfg, id, false),
+        RoomInfo {
+            name: "Standby".into(),
+            max_players: MAX_PLAYERS,
+        },
+        code,
+        policy,
+    )
+}
+/// Resume exactly the signed promotion under the existing room code. Ordinary
+/// host() still generates a fresh code. Known roster links may authenticate
+/// while gameplay admission remains closed; the runner requires ResumeProof.
+pub fn resume_host(
+    cfg: &NetConfig,
+    id: &Identity,
+    room: RoomInfo,
+    code: &str,
+    descriptor: migration::Descriptor,
+    promotion: migration::Promotion,
+) -> Result<HostHandle, String> {
+    let policy = migration::EndpointPolicy {
+        descriptor,
+        role: migration::LinkRole::Successor,
+        promotion: Some(promotion),
+        membership: None,
+    };
+    host::start_session_endpoint(
+        cfg,
+        &virt::host_identity(cfg, id, false),
+        room,
+        code,
+        policy,
+    )
 }
 
 /// What the host advertises.

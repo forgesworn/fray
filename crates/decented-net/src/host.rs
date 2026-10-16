@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,45 @@ const KICK_FLUSH: Duration = Duration::from_millis(250);
 const UPNP_RENEW_CHECK: Duration = Duration::from_secs(60);
 
 /// An event plus the per-peer counter it occupies until polled.
-type Queued<E> = (E, Option<Arc<AtomicUsize>>);
+type Queued<E> = (E, Option<Arc<AtomicUsize>>, u64, Option<PeerEventFence>);
+struct PeerEventFence {
+    live: Arc<AtomicBool>,
+    binding: Option<crate::migration::ConnectionBinding>,
+    key: Option<[u8; 32]>,
+    player: Option<u64>,
+}
+impl PeerEventFence {
+    fn new(link: &Link) -> Self {
+        Self {
+            live: link.session_live.clone(),
+            binding: link.migration.clone(),
+            key: link.session_key,
+            player: link.session_player,
+        }
+    }
+    fn valid(&self, shared: &Shared) -> bool {
+        if !self.live.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(binding) = &self.binding else {
+            return true;
+        };
+        let Some(key) = self.key else {
+            return false;
+        };
+        shared
+            .session_policy
+            .lock()
+            .map(|policy| {
+                policy.as_ref().is_some_and(|p| {
+                    p.authorize(binding, key).is_ok()
+                        && (binding.client == crate::migration::LinkRole::Original
+                            || p.player_for_key(key) == self.player)
+                })
+            })
+            .unwrap_or(false)
+    }
+}
 
 /// Who may join: proofs of any of these tokens are admitted.
 struct Tokens {
@@ -57,6 +95,12 @@ fn random_token() -> [u8; 32] {
 
 pub(crate) struct Shared {
     peers: Mutex<HashMap<PeerId, Link>>,
+    session_policy: Mutex<Option<crate::migration::EndpointPolicy>>,
+    app_tag: String,
+    pending_handshakes: AtomicUsize,
+    generation: AtomicU64,
+    #[cfg(test)]
+    before_registration: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Each connected peer's identity key (for the kick deny-list).
     peer_keys: Mutex<HashMap<PeerId, PublicKey>>,
     /// Identity keys kicked from this room; refused for the room's life.
@@ -88,19 +132,65 @@ pub(crate) struct Shared {
 
 impl Shared {
     pub(crate) fn emit(&self, ev: HostEvent) {
+        self.emit_at(ev, self.generation.load(Ordering::Acquire));
+    }
+    fn emit_at(&self, ev: HostEvent, generation: u64) {
         if let Ok(tx) = self.ev_tx.lock() {
-            let _ = tx.send((ev, None));
+            let _ = tx.send((ev, None, generation, None));
         }
+    }
+    fn emit_registered(&self, peer: PeerId, generation: u64, ev: HostEvent) -> bool {
+        let Ok(peers) = self.peers.lock() else {
+            return false;
+        };
+        if self.generation.load(Ordering::Acquire) != generation
+            || !peers
+                .get(&peer)
+                .is_some_and(|link| link.generation == generation)
+        {
+            return false;
+        }
+        if let Ok(tx) = self.ev_tx.lock() {
+            let _ = tx.send((
+                ev,
+                None,
+                generation,
+                Some(PeerEventFence::new(&peers[&peer])),
+            ));
+        }
+        true
     }
 
     /// Queue a peer message if that peer is under `cap`. `false` = over.
-    fn emit_counted(&self, ev: HostEvent, counter: &Arc<AtomicUsize>, cap: usize) -> bool {
+    fn emit_counted(
+        &self,
+        peer: PeerId,
+        generation: u64,
+        ev: HostEvent,
+        counter: &Arc<AtomicUsize>,
+        cap: usize,
+    ) -> bool {
+        let Ok(peers) = self.peers.lock() else {
+            return false;
+        };
+        if self.generation.load(Ordering::Acquire) != generation
+            || !peers
+                .get(&peer)
+                .is_some_and(|link| link.generation == generation)
+        {
+            return false;
+        }
         if counter.fetch_add(1, Ordering::AcqRel) >= cap {
             counter.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
         if let Ok(tx) = self.ev_tx.lock() {
-            let _ = tx.send((ev, Some(Arc::clone(counter))));
+            let _ = tx.send((
+                ev,
+                Some(Arc::clone(counter)),
+                generation,
+                Some(PeerEventFence::new(&peers[&peer])),
+            ));
         }
         true
     }
@@ -131,6 +221,25 @@ impl Shared {
             .unwrap_or_default()
     }
 
+    /// Detach and optionally ban in the same lock order as final admission.
+    /// A concurrent authenticated reconnect cannot slip between removal/ban.
+    fn detach_peer(&self, peer: PeerId, ban: bool) -> Option<Link> {
+        let mut peers = self.peers.lock().ok()?;
+        let link = peers.get(&peer)?.clone();
+        let mut keys = self.peer_keys.lock().ok()?;
+        let mut denied = if ban {
+            Some(self.denied.lock().ok()?)
+        } else {
+            None
+        };
+        if let Some(key) = keys.remove(&peer) {
+            if let Some(denied) = denied.as_mut() {
+                denied.insert(key);
+            }
+        }
+        peers.remove(&peer);
+        Some(link)
+    }
     /// Close every connection (host gone).
     pub(crate) fn close_all(&self, code: u32, why: &'static [u8]) {
         let links: Vec<Link> = self
@@ -209,6 +318,8 @@ fn host_inner(
         cfg.host_has_player,
         relays_total,
         None,
+        cfg.app_tag.clone(),
+        None,
         move |code, room, keys, shared, cmd_rx| {
             HostTask {
                 cfg,
@@ -223,6 +334,68 @@ fn host_inner(
     )
 }
 
+/// Open the consented standby's passive control endpoint, or resume the
+/// certified successor under the existing code. A standby never advertises.
+pub(crate) fn start_session_endpoint(
+    cfg: &NetConfig,
+    id: &Identity,
+    room: RoomInfo,
+    code: &str,
+    policy: crate::migration::EndpointPolicy,
+) -> Result<HostHandle, String> {
+    policy
+        .validate(id.pubkey().to_bytes(), code, &cfg.app_tag)
+        .map_err(|e| e.to_string())?;
+    if policy.role == crate::migration::LinkRole::Original {
+        return Err("pin the existing original host handle".into());
+    }
+    let code = crate::room::normalize_code(code).ok_or("invalid room code")?;
+    let mut cfg = cfg.clone();
+    let relay: Option<Box<dyn RendezvousRelay>> = if policy.passive() || cfg.relays.is_empty() {
+        None
+    } else {
+        Some(Box::new(MultiRelay::start_in(
+            decented_relays::RelayPool::global(),
+            cfg.relays.clone(),
+            cfg.relay_fallback,
+        )))
+    };
+    cfg.host_has_player = policy
+        .descriptor
+        .root
+        .members
+        .iter()
+        .any(|m| m.key == Some(id.pubkey().to_bytes()));
+    if policy.passive() {
+        cfg.relays.clear();
+        cfg.stun.clear();
+        cfg.relay_fallback = false;
+        cfg.host_has_player = false;
+    }
+    let relays_total = cfg.relays.len();
+    let has_player = cfg.host_has_player;
+    Ok(start_host(
+        id,
+        room,
+        has_player,
+        relays_total,
+        None,
+        cfg.app_tag.clone(),
+        Some((code, policy)),
+        move |code, room, keys, shared, cmd_rx| {
+            HostTask {
+                cfg,
+                keys,
+                room,
+                code,
+                shared,
+                fixed_day: None,
+            }
+            .run(relay, cmd_rx)
+        },
+    ))
+}
+
 /// Everything about a host but its transport: the room code, the shared state
 /// and the handle. `task` gets the code, the clamped room, the relay key, the
 /// shared state and the command channel, and returns the transport's loop,
@@ -233,6 +406,8 @@ pub(crate) fn start_host<F, Fut>(
     host_has_player: bool,
     relays_total: usize,
     path_override: Option<PathKind>,
+    app_tag: String,
+    pinned: Option<(String, crate::migration::EndpointPolicy)>,
     task: F,
 ) -> HostHandle
 where
@@ -245,20 +420,29 @@ where
     ) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let code = crate::room::generate_code();
+    let code = pinned
+        .as_ref()
+        .map(|(code, _)| code.clone())
+        .unwrap_or_else(crate::room::generate_code);
     let (ev_tx, ev_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let max_players = room.max_players.clamp(2, MAX_PLAYERS);
     let relay_keys = Keys::generate();
     let shared = Arc::new(Shared {
         peers: Mutex::new(HashMap::new()),
+        session_policy: Mutex::new(pinned.as_ref().map(|(_, p)| p.clone())),
+        app_tag,
+        pending_handshakes: AtomicUsize::new(0),
+        generation: AtomicU64::new(0),
+        #[cfg(test)]
+        before_registration: Mutex::new(None),
         peer_keys: Mutex::new(HashMap::new()),
         denied: Mutex::new(HashSet::new()),
         tokens: Mutex::new(Tokens {
             lan: random_token(),
             code: Vec::new(),
         }),
-        open: AtomicBool::new(true),
+        open: AtomicBool::new(pinned.is_none()),
         max_peers: max_players as usize - usize::from(host_has_player),
         next_peer: AtomicU32::new(1),
         ev_tx: Mutex::new(ev_tx),
@@ -312,17 +496,201 @@ where
 }
 
 impl HostHandle {
+    /// This endpoint's runtime identity. This does not attest a persona.
+    pub fn runtime_key(&self) -> PublicKey {
+        self.shared.host_keys.public_key()
+    }
+
+    /// The runtime key proven by Identify on this currently live connection.
+    /// Game admission remains the caller's responsibility.
+    pub fn peer_key(&self, peer: PeerId) -> Option<PublicKey> {
+        let peers = self.shared.peers.lock().ok()?;
+        let link = peers.get(&peer)?;
+        if !link.session_live.load(Ordering::Acquire) || link.conn.close_reason().is_some() {
+            return None;
+        }
+        self.shared.peer_keys.lock().ok()?.get(&peer).copied()
+    }
+
+    /// Pin the original host after the arming runner freezes and detaches
+    /// ordinary connections. Every replacement link must prove the root/role.
+    pub fn pin_session(&self, descriptor: crate::migration::Descriptor) -> Result<(), String> {
+        if self.shared.path_override == Some(PathKind::Virtual) {
+            return Err("virtual migration is unsupported".into());
+        }
+        let policy = crate::migration::EndpointPolicy {
+            descriptor,
+            role: crate::migration::LinkRole::Original,
+            promotion: None,
+            membership: None,
+        };
+        policy
+            .validate(
+                self.shared.host_keys.public_key().to_bytes(),
+                &self.code,
+                &self.shared.app_tag,
+            )
+            .map_err(|e| e.to_string())?;
+        let peers = self.shared.peers.lock().map_err(|_| "host peer lock")?;
+        if !peers.is_empty() || self.shared.pending_handshakes.load(Ordering::Acquire) != 0 {
+            return Err(
+                "ordinary connections and pending handshakes must drain before pinning".into(),
+            );
+        }
+        let mut current = self
+            .shared
+            .session_policy
+            .lock()
+            .map_err(|_| "host policy lock")?;
+        if let Some(existing) = &*current {
+            if existing == &policy {
+                return Ok(());
+            }
+            return Err("session policy already pinned".into());
+        }
+        self.shared
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| g.checked_add(1))
+            .map_err(|_| "host generation exhausted")?;
+        *current = Some(policy);
+        self.shared.open.store(false, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(Cmd::SetOpen(false));
+        Ok(())
+    }
+    pub fn connection_binding(&self, peer: PeerId) -> Option<crate::migration::ConnectionBinding> {
+        self.shared.peers.lock().ok()?.get(&peer)?.migration.clone()
+    }
+    /// Install only sequencer-certified membership. Admission sees either the
+    /// old complete policy or the new one; removed routes detach under the same
+    /// peer lock used by final handshake registration.
+    pub fn update_session_membership(
+        &self,
+        certificate: crate::migration::MembershipCertificate,
+    ) -> Result<(), String> {
+        let mut peers = self.shared.peers.lock().map_err(|_| "host peer lock")?;
+        let mut current = self
+            .shared
+            .session_policy
+            .lock()
+            .map_err(|_| "host policy lock")?;
+        let existing = current.as_ref().ok_or("host session is not pinned")?;
+        let mut next = existing.clone();
+        if let Some(previous) = &existing.membership {
+            certificate
+                .follows(&existing.descriptor.root, previous)
+                .map_err(|e| e.to_string())?;
+        }
+        next.membership = Some(certificate);
+        next.validate(
+            self.shared.host_keys.public_key().to_bytes(),
+            &self.code,
+            &self.shared.app_tag,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut keys = self.shared.peer_keys.lock().map_err(|_| "host key lock")?;
+        let removed: Vec<_> =
+            peers
+                .iter()
+                .filter_map(|(&peer, link)| {
+                    let authorized = link.migration.as_ref().zip(keys.get(&peer)).is_some_and(
+                        |(binding, key)| {
+                            next.authorize(binding, key.to_bytes()).is_ok()
+                                && (binding.client == crate::migration::LinkRole::Original
+                                    || next.player_for_key(key.to_bytes()) == link.session_player)
+                        },
+                    );
+                    (!authorized).then_some(peer)
+                })
+                .collect();
+        let links: Vec<_> = removed
+            .iter()
+            .filter_map(|peer| {
+                keys.remove(peer);
+                peers.remove(peer).map(|link| {
+                    link.session_live.store(false, Ordering::Release);
+                    (*peer, link)
+                })
+            })
+            .collect();
+        *current = Some(next);
+        drop(keys);
+        drop(current);
+        drop(peers);
+        for (peer, link) in links {
+            link.conn
+                .close(close::CLOSED.into(), b"session membership retired");
+            self.shared.emit_at(
+                HostEvent::PeerLeft {
+                    peer,
+                    reason: LeaveReason::Kicked,
+                },
+                link.generation,
+            );
+        }
+        Ok(())
+    }
+    /// Build framing from this live link's verified handshake and the current
+    /// installed membership, rather than caller-supplied identity/role fields.
+    pub fn migration_channel(&self, peer: PeerId) -> Result<crate::migration::Channel, String> {
+        let peers = self.shared.peers.lock().map_err(|_| "host peer lock")?;
+        let link = peers.get(&peer).ok_or("peer is not connected")?;
+        if !link.session_live.load(Ordering::Acquire) || link.conn.close_reason().is_some() {
+            return Err("peer connection is closed".into());
+        }
+        let policy = self
+            .shared
+            .session_policy
+            .lock()
+            .map_err(|_| "host policy lock")?;
+        let policy = policy.as_ref().ok_or("host session is not pinned")?;
+        let binding = link
+            .migration
+            .clone()
+            .ok_or("ordinary peer has no migration binding")?;
+        let key = link.session_key.ok_or("peer identity is not bound")?;
+        if binding.client != crate::migration::LinkRole::Original
+            && policy.player_for_key(key) != link.session_player
+        {
+            return Err("peer membership changed".into());
+        }
+        let tls = quic::binding(&link.conn)?;
+        let channel = crate::migration::Channel::new_bound(
+            policy,
+            binding,
+            crate::migration::ChannelSide::Server,
+            self.shared.host_keys.public_key().to_bytes(),
+            key,
+            tls,
+        )
+        .map_err(|error| error.to_string())?;
+        link.session_channel_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "session framing already attached; reconnect requires fresh TLS")?;
+        Ok(channel)
+    }
+    /// Exporter for a ResumeProof challenge on this live authenticated link.
+    pub fn tls_binding(&self, peer: PeerId) -> Option<[u8; 32]> {
+        quic::binding(&self.link(peer)?.conn).ok()
+    }
+
     /// The room code (also delivered in `Ready`).
     pub fn code(&self) -> &str {
         &self.code
     }
 
     pub fn poll(&self) -> Option<HostEvent> {
-        let (ev, counter) = self.events.lock().ok()?.try_recv().ok()?;
-        if let Some(c) = counter {
-            c.fetch_sub(1, Ordering::AcqRel);
+        let receiver = self.events.lock().ok()?;
+        loop {
+            let (ev, counter, generation, session_live) = receiver.try_recv().ok()?;
+            if let Some(c) = counter {
+                c.fetch_sub(1, Ordering::AcqRel);
+            }
+            if generation == self.shared.generation.load(Ordering::Acquire)
+                && session_live.is_none_or(|fence| fence.valid(&self.shared))
+            {
+                return Some(ev);
+            }
         }
-        Some(ev)
     }
 
     /// The LAN admission token currently in the beacon (hex). Needed to dial
@@ -378,34 +746,19 @@ impl HostHandle {
     }
 
     fn remove_peer(&self, peer: PeerId, ban: bool, code: u32) {
-        let link = self
-            .shared
-            .peers
-            .lock()
-            .ok()
-            .and_then(|mut p| p.remove(&peer));
-        if let Some(l) = link {
-            if let Some(pk) = self
-                .shared
-                .peer_keys
-                .lock()
-                .ok()
-                .and_then(|mut k| k.remove(&peer))
-            {
-                if ban {
-                    if let Ok(mut d) = self.shared.denied.lock() {
-                        d.insert(pk);
-                    }
-                }
-            }
+        if let Some(l) = self.shared.detach_peer(peer, ban) {
+            let generation = l.generation;
             crate::runtime().spawn(async move {
                 tokio::time::sleep(KICK_FLUSH).await;
                 l.conn.close(code.into(), b"kicked");
             });
-            self.shared.emit(HostEvent::PeerLeft {
-                peer,
-                reason: LeaveReason::Kicked,
-            });
+            self.shared.emit_at(
+                HostEvent::PeerLeft {
+                    peer,
+                    reason: LeaveReason::Kicked,
+                },
+                generation,
+            );
         }
     }
 
@@ -414,6 +767,15 @@ impl HostHandle {
     /// Each change rotates the LAN admission token, so a token heard in an
     /// earlier lobby does not admit anyone later.
     pub fn set_open(&self, open: bool) {
+        if self
+            .shared
+            .session_policy
+            .lock()
+            .map(|p| p.as_ref().is_some_and(|p| p.passive()))
+            .unwrap_or(true)
+        {
+            return;
+        }
         if self.shared.open.swap(open, Ordering::Relaxed) != open {
             self.shared.rotate_lan_token();
         }
@@ -647,7 +1009,7 @@ impl HostTask {
                     None => break,
                 },
                 _ = tick.tick() => {
-                    let open = self.shared.open.load(Ordering::Relaxed);
+                    let open = self.shared.open.load(Ordering::Relaxed) && !self.shared.session_policy.lock().map(|p|p.as_ref().is_some_and(|p|p.passive())).unwrap_or(true);
                     if let Some(r) = &relay {
                         let now_day = self.fixed_day.unwrap_or_else(utc_today);
                         if now_day > day {
@@ -781,6 +1143,18 @@ impl HostTask {
         punchers: &Punchers,
         open: bool,
     ) {
+        // Pinned rooms stop all accepted reanswers at the commit/arming fence,
+        // including a cached offer which ordinary discovery would retransmit.
+        if !open
+            && self
+                .shared
+                .session_policy
+                .lock()
+                .map(|p| p.is_some())
+                .unwrap_or(true)
+        {
+            return;
+        }
         let now = crate::unix_now();
         // The offer's `#t` names the day it was derived for; open it with that key.
         let Some(room) = room_for(ev, secrets) else {
@@ -1102,6 +1476,7 @@ struct PeerGuard {
     armed: bool,
     /// `PeerJoined` went out, so a leave must be reported.
     announced: bool,
+    generation: u64,
 }
 
 impl Drop for PeerGuard {
@@ -1109,32 +1484,36 @@ impl Drop for PeerGuard {
         if !self.armed {
             return;
         }
-        let removed = self
-            .shared
-            .peers
-            .lock()
-            .map(|mut p| p.remove(&self.peer).is_some())
-            .unwrap_or(false);
-        if let Ok(mut k) = self.shared.peer_keys.lock() {
-            k.remove(&self.peer);
-        }
+        let removed = self.shared.detach_peer(self.peer, false).is_some();
         if removed {
             self.conn.close(close::LEAVE.into(), b"internal error");
         }
         if removed && self.announced {
-            self.shared.emit(HostEvent::PeerLeft {
-                peer: self.peer,
-                reason: LeaveReason::Error("internal error".into()),
-            });
+            self.shared.emit_at(
+                HostEvent::PeerLeft {
+                    peer: self.peer,
+                    reason: LeaveReason::Error("internal error".into()),
+                },
+                self.generation,
+            );
         }
     }
 }
 
 /// Why a seat can't be given right now, if it can't.
 fn seat_refusal(shared: &Shared, peers: &HashMap<PeerId, Link>) -> Option<u32> {
-    if !shared.open.load(Ordering::Relaxed) {
+    let session = match shared.session_policy.lock() {
+        Ok(p) => p.clone(),
+        Err(_) => return Some(close::CLOSED),
+    };
+    let capacity = if session.as_ref().is_some_and(|p| p.passive()) {
+        9
+    } else {
+        shared.max_peers
+    };
+    if session.is_none() && !shared.open.load(Ordering::Relaxed) {
         Some(close::CLOSED)
-    } else if peers.len() >= shared.max_peers {
+    } else if peers.len() >= capacity {
         Some(close::FULL)
     } else {
         None
@@ -1149,6 +1528,38 @@ fn seat_refusal(shared: &Shared, peers: &HashMap<PeerId, Link>) -> Option<u32> {
 /// says who it is only after verifying that welcome, and is checked against
 /// the kick deny-list and seated only then.
 pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) {
+    struct PendingSlot(Arc<Shared>);
+    impl Drop for PendingSlot {
+        fn drop(&mut self) {
+            self.0.pending_handshakes.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    // Register every handshake in the same lock order as pin_session. A pin
+    // cannot leave ordinary-generation handshakes running outside its limits.
+    let (policy, generation, slot) = {
+        let Ok(_peers) = shared.peers.lock() else {
+            incoming.refuse();
+            return;
+        };
+        let policy = match shared.session_policy.lock() {
+            Ok(p) => p.clone(),
+            Err(_) => {
+                incoming.refuse();
+                return;
+            }
+        };
+        let count = shared.pending_handshakes.fetch_add(1, Ordering::AcqRel);
+        if policy.is_some() && count >= 2 {
+            shared.pending_handshakes.fetch_sub(1, Ordering::AcqRel);
+            incoming.refuse();
+            return;
+        }
+        (
+            policy,
+            shared.generation.load(Ordering::Acquire),
+            PendingSlot(shared.clone()),
+        )
+    };
     // Shown as IPv4 when the joiner is IPv4 (it arrives v4-mapped).
     let remote = crate::nat::addr::canonical(incoming.remote_address());
     let setup = async {
@@ -1175,6 +1586,21 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                 "no valid admission proof".into(),
             );
         }
+        match (&policy, &hello.migration) {
+            (Some(policy), Some(binding)) => {
+                if let Err(e) = policy.check_request(binding) {
+                    return refuse(&conn, close::BAD_HELLO, e.to_string());
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return refuse(
+                    &conn,
+                    close::BAD_HELLO,
+                    "session binding required/mismatched".into(),
+                )
+            }
+        }
         // No point welcoming a joiner there is no seat for (checked again,
         // under the lock, before it is seated).
         let early = shared
@@ -1185,8 +1611,13 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         if let Some(code) = early {
             return refuse(&conn, code, "refused".into());
         }
-        let peer = PeerId(shared.next_peer.fetch_add(1, Ordering::Relaxed));
-        quic::server_send_welcome(
+        let peer = PeerId(
+            shared
+                .next_peer
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                .map_err(|_| "peer namespace exhausted")?,
+        );
+        let transcript = quic::server_send_welcome_bound(
             &conn,
             &mut send,
             &shared.host_keys,
@@ -1196,17 +1627,28 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             &shared.relay_key,
             hello.session.as_deref(),
             peer.0,
+            hello.migration.clone(),
         )
         .await?;
         // The joiner verified us; now it says who it is.
         let host_pk = shared.host_keys.public_key();
-        let (pk, attestation, inbox_relays) =
-            match quic::server_read_identify(&conn, &mut recv, hello.session.as_deref(), &host_pk)
-                .await
-            {
-                Ok(x) => x,
-                Err((code, why)) => return refuse(&conn, code, why),
-            };
+        let (pk, attestation, inbox_relays) = match quic::server_read_identify(
+            &conn,
+            &mut recv,
+            hello.session.as_deref(),
+            &host_pk,
+            &transcript,
+        )
+        .await
+        {
+            Ok(x) => x,
+            Err((code, why)) => return refuse(&conn, code, why),
+        };
+        if let (Some(policy), Some(binding)) = (&policy, &hello.migration) {
+            if let Err(e) = policy.authorize(binding, pk.to_bytes()) {
+                return refuse(&conn, close::NOT_ADMITTED, e.to_string());
+            }
+        }
         if shared
             .denied
             .lock()
@@ -1215,10 +1657,31 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         {
             return refuse(&conn, close::KICKED, "kicked earlier".into());
         }
+        #[cfg(test)]
+        {
+            let barrier = shared
+                .before_registration
+                .lock()
+                .ok()
+                .and_then(|b| b.clone());
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
         Ok((conn, send, recv, hello, pk, attestation, inbox_relays, peer))
     };
     let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer) =
-        match tokio::time::timeout(quic::HANDSHAKE_TIMEOUT, setup).await {
+        match tokio::time::timeout(
+            if policy.is_some() {
+                Duration::from_secs(5)
+            } else {
+                quic::HANDSHAKE_TIMEOUT
+            },
+            setup,
+        )
+        .await
+        {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => {
                 log::info!("[host] {remote}: handshake failed: {e}");
@@ -1230,11 +1693,50 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             }
         };
 
+    drop(slot);
     // Seat under the lock so two simultaneous joiners can't both take the last seat.
-    let (link, out_rx) = Link::new(conn.clone());
+    let (mut link, out_rx) = Link::new(conn.clone());
+    link.migration = hello.migration.clone();
+    link.generation = generation;
     let refused = match shared.peers.lock() {
         Ok(mut peers) => {
-            let r = seat_refusal(&shared, &peers);
+            let mut r = if shared.generation.load(Ordering::Acquire) != generation
+                || shared
+                    .session_policy
+                    .lock()
+                    .map(
+                        |current| match (current.as_ref(), hello.migration.as_ref()) {
+                            (Some(current), Some(binding)) => {
+                                link.session_key = Some(pubkey.to_bytes());
+                                link.session_player = current.player_for_key(pubkey.to_bytes());
+                                current.authorize(binding, pubkey.to_bytes()).is_err()
+                            }
+                            (None, None) => false,
+                            _ => true,
+                        },
+                    )
+                    .unwrap_or(true)
+            {
+                Some(close::CLOSED)
+            } else {
+                seat_refusal(&shared, &peers)
+            };
+            match shared.peer_keys.lock() {
+                Ok(mut keys) => match shared.denied.lock() {
+                    Ok(denied) => {
+                        if denied.contains(&pubkey) {
+                            r = Some(close::KICKED);
+                        } else if policy.is_some() && keys.values().any(|key| *key == pubkey) {
+                            r = Some(close::FULL);
+                        }
+                        if r.is_none() {
+                            keys.insert(peer, pubkey);
+                        }
+                    }
+                    Err(_) => r = Some(close::CLOSED),
+                },
+                Err(_) => r = Some(close::CLOSED),
+            }
             if r.is_none() {
                 peers.insert(peer, link.clone());
             }
@@ -1252,24 +1754,28 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         conn: conn.clone(),
         armed: true,
         announced: false,
+        generation,
     };
-    if let Ok(mut k) = shared.peer_keys.lock() {
-        k.insert(peer, pubkey);
-    }
     if let Err(e) = quic::server_send_accepted(&mut send).await {
         log::info!("[host] {remote}: accept failed: {e}");
         return; // the guard removes the peer
     }
     let path = shared.path_override.unwrap_or(hello.path);
     log::info!("[host] {peer} joined from {remote} via {path:?}");
-    shared.emit(HostEvent::PeerJoined {
+    if !shared.emit_registered(
         peer,
-        pubkey,
-        path,
-        rtt_ms: link.rtt_ms(),
-        attestation,
-        inbox_relays,
-    });
+        generation,
+        HostEvent::PeerJoined {
+            peer,
+            pubkey,
+            path,
+            rtt_ms: link.rtt_ms(),
+            attestation,
+            inbox_relays,
+        },
+    ) {
+        return;
+    }
     guard.announced = true;
 
     let (s1, s2) = (Arc::clone(&shared), Arc::clone(&shared));
@@ -1282,6 +1788,8 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         Arc::clone(&link.queued),
         move |bytes| {
             s1.emit_counted(
+                peer,
+                generation,
                 HostEvent::Reliable { peer, bytes },
                 &reliable_q,
                 MAX_QUEUED_RELIABLE,
@@ -1289,20 +1797,19 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         },
         move |bytes| {
             // Over the cap: dropped, as the network might have.
-            s2.emit_counted(HostEvent::Lossy { peer, bytes }, &lossy_q, MAX_QUEUED_LOSSY);
+            s2.emit_counted(
+                peer,
+                generation,
+                HostEvent::Lossy { peer, bytes },
+                &lossy_q,
+                MAX_QUEUED_LOSSY,
+            );
         },
     )
     .await;
     guard.armed = false;
-    if let Ok(mut k) = shared.peer_keys.lock() {
-        k.remove(&peer);
-    }
-    // Whoever removes the link reports the leave (kick already did).
-    let removed = shared
-        .peers
-        .lock()
-        .map(|mut p| p.remove(&peer).is_some())
-        .unwrap_or(false);
+    // Whoever atomically detaches the link reports the leave (kick already did).
+    let removed = shared.detach_peer(peer, false).is_some();
     if removed {
         let reason = match ended {
             Ended::Remote(close::KICKED) => LeaveReason::Kicked,
@@ -1312,6 +1819,511 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             Ended::Error(e) => LeaveReason::Error(e),
         };
         log::info!("[host] {peer} left: {reason:?}");
-        shared.emit(HostEvent::PeerLeft { peer, reason });
+        shared.emit_at(HostEvent::PeerLeft { peer, reason }, generation);
+    }
+}
+
+#[cfg(test)]
+mod migration_transition_tests {
+    use super::*;
+    use crate::migration::*;
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "transition timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn descriptor(
+        h: &HostHandle,
+        cfg: &NetConfig,
+        host: &Identity,
+        standby: &Identity,
+        player: &Identity,
+    ) -> Descriptor {
+        let root = Root {
+            session: fresh_session().unwrap(),
+            app: cfg.app_tag.clone(),
+            transport_version: 7,
+            game_version: 13,
+            checkpoint_version: 1,
+            host: host.pubkey().to_bytes(),
+            standby: standby.pubkey().to_bytes(),
+            controller: host.pubkey().to_bytes(),
+            code: room_code_hash(h.code()).unwrap(),
+            created_day: 20741,
+            roster_revision: 1,
+            members: vec![Member {
+                player: 1,
+                seat: 0,
+                key: Some(player.pubkey().to_bytes()),
+            }],
+            config: [1; 32],
+            content: [2; 32],
+            limits: ResourceLimits::default(),
+        };
+        let mut descriptor = Descriptor::offer(root, host.keys()).unwrap();
+        descriptor.consent(standby.keys()).unwrap();
+        descriptor
+    }
+    #[test]
+    fn pin_waits_for_ordinary_handshakes_then_fences_detached_pumps_and_queued_events() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-pin-test").lan_only();
+        cfg.lan_port = 0;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let player = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            h.local_addr().unwrap().port(),
+        );
+        let descriptor = descriptor(&h, &cfg, &original, &standby, &player);
+        let token: [u8; 32] = hex::decode(h.lan_token()).unwrap().try_into().unwrap();
+        // Real QUIC barrier: Opened has received its verified welcome, but has
+        // deliberately not sent Identify, so the host is awaiting frame3.
+        let (endpoint, opened) = crate::runtime().block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let endpoint = quic::client_endpoint(socket, &cfg.app_tag).unwrap();
+            let conn = endpoint
+                .connect(addr, quic::SERVER_NAME)
+                .unwrap()
+                .await
+                .unwrap();
+            let check: quic::HostCheck = Arc::new(|_| Ok(()));
+            let opened = quic::client_open(&conn, None, PathKind::Lan, &[token], &check)
+                .await
+                .unwrap();
+            (endpoint, opened)
+        });
+        assert!(h.pin_session(descriptor.clone()).is_err());
+        opened.conn.close(close::LEAVE.into(), b"barrier release");
+        drop(opened);
+        drop(endpoint);
+        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 0);
+        let client = crate::join_addr(&cfg, &player, addr, &h.lan_token());
+        wait_until(|| matches!(client.poll(), Some(crate::ClientEvent::Connected { .. })));
+        let mut peer = None;
+        wait_until(|| {
+            if let Some(HostEvent::PeerJoined { peer: p, .. }) = h.poll() {
+                peer = Some(p);
+            }
+            peer.is_some()
+        });
+        let peer = peer.unwrap();
+        let old = h.link(peer).unwrap();
+        let old_generation = old.generation;
+        // remove_peer's delayed close leaves the old pump live. Hold a sender
+        // behind an explicit barrier until pin_session has advanced generation.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let sender_barrier = barrier.clone();
+        let sender = std::thread::spawn(move || {
+            sender_barrier.wait();
+            client.send_reliable(Bytes::from_static(b"late ordinary input"));
+            client
+        });
+        h.disconnect(peer);
+        h.pin_session(descriptor.clone()).unwrap();
+        barrier.wait();
+        let _client = sender.join().unwrap();
+        assert!(
+            h.poll().is_none(),
+            "queued old-generation leave was exposed"
+        );
+        assert!(!h.shared.emit_registered(
+            peer,
+            old_generation,
+            HostEvent::PeerJoined {
+                peer,
+                pubkey: player.pubkey(),
+                path: PathKind::Lan,
+                rtt_ms: 0,
+                attestation: None,
+                inbox_relays: vec![]
+            }
+        ));
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert!(!h.shared.emit_counted(
+            peer,
+            old_generation,
+            HostEvent::Reliable {
+                peer,
+                bytes: Bytes::from_static(b"late")
+            },
+            &counter,
+            16
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        let binding = ConnectionBinding {
+            session: descriptor.root.session,
+            descriptor: descriptor.root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        };
+        let bound = crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding,
+            original.pubkey(),
+        )
+        .unwrap();
+        wait_until(|| matches!(bound.poll(), Some(crate::ClientEvent::Connected { .. })));
+        let mut new_peer = None;
+        wait_until(|| {
+            if let Some(HostEvent::PeerJoined { peer: p, .. }) = h.poll() {
+                new_peer = Some(p);
+            }
+            new_peer.is_some()
+        });
+        assert_ne!(new_peer, Some(peer));
+        while let Some(event) = h.poll() {
+            assert!(
+                !matches!(event,HostEvent::Reliable{peer:p,..}|HostEvent::Lossy{peer:p,..} if p==peer)
+            );
+        }
+        h.shutdown();
+    }
+    #[test]
+    fn kicked_key_cannot_race_a_previously_authenticated_reconnect_into_a_pinned_host() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-ban-test").lan_only();
+        cfg.lan_port = 0;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let player = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            h.local_addr().unwrap().port(),
+        );
+        let descriptor = descriptor(&h, &cfg, &original, &standby, &player);
+        h.pin_session(descriptor.clone()).unwrap();
+        let binding = ConnectionBinding {
+            session: descriptor.root.session,
+            descriptor: descriptor.root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        };
+        let first = crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding.clone(),
+            original.pubkey(),
+        )
+        .unwrap();
+        wait_until(|| matches!(first.poll(), Some(crate::ClientEvent::Connected { .. })));
+        let mut peer = None;
+        wait_until(|| {
+            if let Some(HostEvent::PeerJoined { peer: p, .. }) = h.poll() {
+                peer = Some(p);
+            }
+            peer.is_some()
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *h.shared.before_registration.lock().unwrap() = Some(barrier.clone());
+        let reconnect = crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding,
+            original.pubkey(),
+        )
+        .unwrap();
+        crate::runtime().block_on(barrier.wait()); // Identify passed the early denied check.
+        h.kick(peer.unwrap());
+        crate::runtime().block_on(barrier.wait()); // Final insertion must see the ban.
+        let mut refused = false;
+        wait_until(|| {
+            if let Some(event) = reconnect.poll() {
+                match event {
+                    crate::ClientEvent::Failed { .. } => refused = true,
+                    crate::ClientEvent::Connected { .. } => panic!("banned reconnect was seated"),
+                    _ => {}
+                }
+            }
+            refused
+        });
+        assert_eq!(h.peer_count(), 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn pin_suppresses_cached_accepted_relay_reanswers() {
+        use crate::rendezvous::{new_session_id, seal_offer, Offer};
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-offer-test").lan_only();
+        cfg.lan_port = 0;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let player = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let secrets =
+            crate::room::derive(&cfg.app_tag, h.code(), crate::room::utc_today()).unwrap();
+        let joiner = Keys::generate();
+        let relay_keys = Keys::generate();
+        let offer = Offer {
+            v: NET_PROTOCOL_VERSION,
+            session: new_session_id(),
+            pubkey: joiner.public_key().to_hex(),
+            candidates: vec![],
+            sent_at: crate::unix_now(),
+        };
+        let event = seal_offer(&joiner, &secrets.keys.public_key(), &secrets.tag, &offer).unwrap();
+        let answer = Answer {
+            v: NET_PROTOCOL_VERSION,
+            session: offer.session.clone(),
+            accepted: true,
+            reason: None,
+            candidates: vec![],
+            sent_at: crate::unix_now(),
+            host_pubkey: original.pubkey().to_hex(),
+        };
+        let answer_event = seal_answer(&relay_keys, &joiner.public_key(), &answer).unwrap();
+        let key = (offer.session.clone(), event.pubkey);
+        let mut offers = Offers::default();
+        offers.sessions.insert(
+            key.clone(),
+            Answered {
+                event: answer_event,
+                accepted: true,
+                last_sent: Instant::now() - REANSWER_EVERY,
+                sends: 1,
+                targets: vec![],
+            },
+        );
+        let hub = crate::relay::FakeRelayHub::new();
+        let relay = hub.client();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let punchers = Punchers {
+            online: socket,
+            lan: None,
+        };
+        let task = HostTask {
+            cfg: cfg.clone(),
+            keys: relay_keys,
+            room: RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+            code: h.code().into(),
+            shared: h.shared.clone(),
+            fixed_day: None,
+        };
+        task.on_offer(
+            &event,
+            std::slice::from_ref(&secrets),
+            &relay,
+            &[],
+            &mut offers,
+            &punchers,
+            false,
+        );
+        assert_eq!(
+            offers.sessions[&key].sends, 2,
+            "ordinary retransmission positive control"
+        );
+        offers.sessions.get_mut(&key).unwrap().last_sent = Instant::now() - REANSWER_EVERY;
+        h.pin_session(descriptor(&h, &cfg, &original, &standby, &player))
+            .unwrap();
+        task.on_offer(
+            &event,
+            &[secrets],
+            &relay,
+            &[],
+            &mut offers,
+            &punchers,
+            false,
+        );
+        assert_eq!(
+            offers.sessions[&key].sends, 2,
+            "cached accepted answer escaped pin"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn membership_refresh_preserves_handshakes_and_retirement_fences_queued_peer_events() {
+        for detach_before_retirement in [false, true] {
+            use crate::migration::{Sequencer, SessionImage};
+            let mut cfg =
+                NetConfig::new(std::env::temp_dir(), "migration-member-fence-test").lan_only();
+            cfg.lan_port = 0;
+            let original = Identity::ephemeral();
+            let standby = Identity::ephemeral();
+            let first = Identity::ephemeral();
+            let second = Identity::ephemeral();
+            let h = host(
+                &cfg,
+                &original,
+                RoomInfo {
+                    name: "Original".into(),
+                    max_players: 8,
+                },
+            );
+            wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+            let mut root = descriptor(&h, &cfg, &original, &standby, &first).root;
+            root.members.push(Member {
+                player: 2,
+                seat: 1,
+                key: Some(second.pubkey().to_bytes()),
+            });
+            let mut descriptor = Descriptor::offer(root, original.keys()).unwrap();
+            descriptor.consent(standby.keys()).unwrap();
+            h.pin_session(descriptor.clone()).unwrap();
+            let mut image =
+                SessionImage::initial(&descriptor.root, &[(1, 10), (2, 11)], vec![0], 1, 100)
+                    .unwrap();
+            let mut sequencer =
+                Sequencer::arm_session(descriptor.root.clone(), image.clone(), standby.keys())
+                    .unwrap();
+            h.update_session_membership(sequencer.membership_certificate(standby.keys()).unwrap())
+                .unwrap();
+            let addr = SocketAddr::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                h.local_addr().unwrap().port(),
+            );
+            let binding = ConnectionBinding {
+                session: descriptor.root.session,
+                descriptor: descriptor.root.digest().unwrap(),
+                term: 0,
+                client: LinkRole::Player,
+                server: LinkRole::Original,
+            };
+            let a = crate::join_session_addr(
+                &cfg,
+                &first,
+                addr,
+                &h.lan_token(),
+                binding.clone(),
+                original.pubkey(),
+            )
+            .unwrap();
+            wait_until(|| matches!(a.poll(), Some(crate::ClientEvent::Connected { .. })));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            *h.shared.before_registration.lock().unwrap() = Some(barrier.clone());
+            let b = crate::join_session_addr(
+                &cfg,
+                &second,
+                addr,
+                &h.lan_token(),
+                binding,
+                original.pubkey(),
+            )
+            .unwrap();
+            crate::runtime().block_on(barrier.wait());
+            let candidate = sequencer
+                .next(
+                    image.encode(&descriptor.root).unwrap(),
+                    100,
+                    sequencer.receipt().watermarks.clone(),
+                    vec![],
+                )
+                .unwrap();
+            let token = sequencer.stage(candidate).unwrap();
+            sequencer.install(token, standby.keys()).unwrap();
+            h.update_session_membership(sequencer.membership_certificate(standby.keys()).unwrap())
+                .unwrap();
+            crate::runtime().block_on(barrier.wait());
+            wait_until(|| matches!(b.poll(), Some(crate::ClientEvent::Connected { .. })));
+            let (pa, pb) = {
+                let keys = h.shared.peer_keys.lock().unwrap();
+                (
+                    *keys.iter().find(|(_, k)| **k == first.pubkey()).unwrap().0,
+                    *keys.iter().find(|(_, k)| **k == second.pubkey()).unwrap().0,
+                )
+            };
+            let count = Arc::new(AtomicUsize::new(0));
+            let generation = h.shared.generation.load(Ordering::Acquire);
+            for peer in [pa, pb] {
+                assert!(h.shared.emit_counted(
+                    peer,
+                    generation,
+                    HostEvent::Reliable {
+                        peer,
+                        bytes: Bytes::from_static(b"queued")
+                    },
+                    &count,
+                    10
+                ));
+                assert!(h.shared.emit_counted(
+                    peer,
+                    generation,
+                    HostEvent::Lossy {
+                        peer,
+                        bytes: Bytes::from_static(b"queued")
+                    },
+                    &count,
+                    10
+                ));
+            }
+            if detach_before_retirement {
+                h.disconnect(pa);
+            }
+            image.members.remove(0);
+            image.inputs.remove(&1);
+            image.membership_revision += 1;
+            let mut marks = sequencer.receipt().watermarks.clone();
+            marks[0].retired = true;
+            let candidate = sequencer
+                .next(image.encode(&descriptor.root).unwrap(), 100, marks, vec![])
+                .unwrap();
+            let token = sequencer.stage(candidate).unwrap();
+            sequencer.install(token, standby.keys()).unwrap();
+            h.update_session_membership(sequencer.membership_certificate(standby.keys()).unwrap())
+                .unwrap();
+            let mut left = 0;
+            let mut survivor_data = 0;
+            let mut survivor_joined = 0;
+            while let Some(event) = h.poll() {
+                match event {
+                    HostEvent::PeerJoined { peer, .. } => {
+                        assert_eq!(peer, pb);
+                        survivor_joined += 1;
+                    }
+                    HostEvent::Reliable { peer, .. } | HostEvent::Lossy { peer, .. } => {
+                        assert_eq!(peer, pb);
+                        survivor_data += 1;
+                    }
+                    HostEvent::PeerLeft { peer, .. } => {
+                        assert_eq!(peer, pa);
+                        left += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!((left, survivor_data, survivor_joined), (1, 2, 1));
+            assert_eq!(count.load(Ordering::Acquire), 0);
+            assert_eq!(h.peer_count(), 1);
+            h.shutdown();
+        }
     }
 }
