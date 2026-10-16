@@ -7091,6 +7091,197 @@ fn one_slot_selection_is_fair_to_busy_and_quiet_humans_bots_and_views() {
 }
 
 #[test]
+fn every_signed_lossy_view_is_delivered_in_number_order_and_overflow_drops_the_oldest() {
+    let (mut descriptor, _, key, player) = descriptor_fixture();
+    descriptor.consent(&key).unwrap();
+    let root = descriptor.root.clone();
+    let image =
+        SessionImage::initial(&root, &[(1, 10), (2, 11), (3, 12)], vec![0], 1, 100).unwrap();
+    let seq = Sequencer::arm_session(root.clone(), image.clone(), &key).unwrap();
+    let mut primary = Primary::armed(
+        root.context().unwrap(),
+        image.encode(&root).unwrap(),
+        seq.receipt().clone(),
+    )
+    .unwrap();
+    let certificate = seq.membership_certificate(&key).unwrap();
+    let policy = EndpointPolicy {
+        descriptor,
+        role: LinkRole::Original,
+        promotion: None,
+        membership: Some(certificate.clone()),
+    };
+    let binding = ConnectionBinding {
+        session: root.session,
+        descriptor: root.digest().unwrap(),
+        term: 0,
+        client: LinkRole::Player,
+        server: LinkRole::Original,
+    };
+    let channel = Channel::new(
+        &policy,
+        binding,
+        ChannelSide::Server,
+        player.public_key().to_bytes(),
+        [1; 32],
+    )
+    .unwrap();
+    let mut queue = primary
+        .attach_player(&channel, certificate.clone())
+        .unwrap();
+    let mut control = 0u64;
+    let mut wire = |action| {
+        control += 1;
+        PlayerControl::sign(&root, &certificate, 0, control, 2, [1; 32], action, &player)
+            .unwrap()
+            .encode(&root)
+            .unwrap()
+    };
+    let view = |number: u64| PlayerAction::Lossy {
+        number,
+        bytes: vec![number as u8, 0xa0],
+    };
+    // Eight datagrams from one player land in one batch, with two originals.
+    let mut wires = Vec::new();
+    assert!(queue
+        .receive(
+            &wire(PlayerAction::Intent {
+                number: 1,
+                bytes: vec![1],
+            }),
+            &primary,
+        )
+        .unwrap());
+    for number in 1..=8 {
+        let signed = wire(view(number));
+        assert!(queue.receive(&signed, &primary).unwrap());
+        wires.push(signed);
+    }
+    assert!(queue
+        .receive(
+            &wire(PlayerAction::Intent {
+                number: 2,
+                bytes: vec![2],
+            }),
+            &primary,
+        )
+        .unwrap());
+    // A replayed control, a re-signed duplicate number and a stale number
+    // carrying different bytes are all dropped, exactly as before.
+    assert!(!queue.receive(&wires[7], &primary).unwrap());
+    for number in [8, 3] {
+        let tampered = wire(PlayerAction::Lossy {
+            number,
+            bytes: vec![0xff],
+        });
+        assert!(!queue.receive(&tampered, &primary).unwrap());
+    }
+    assert_eq!(queue.lossy(), Some((8, &[8, 0xa0][..])));
+    let selected =
+        select_player_inputs(&root, &primary, &[&queue], MAX_BATCH, MAX_JOURNAL_BYTES).unwrap();
+    let views: Vec<_> = selected
+        .iter()
+        .filter_map(|input| match input {
+            SelectedPlayerInput::Lossy {
+                player,
+                number,
+                bytes,
+            } => Some((*player, *number, bytes.clone())),
+            SelectedPlayerInput::Reliable { .. } => None,
+        })
+        .collect();
+    let originals: Vec<_> = selected
+        .iter()
+        .filter_map(|input| match input {
+            SelectedPlayerInput::Reliable { number, .. } => Some(*number),
+            SelectedPlayerInput::Lossy { .. } => None,
+        })
+        .collect();
+    assert_eq!(originals, vec![1, 2]);
+    assert_eq!(
+        views.iter().map(|(_, n, _)| *n).collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<_>>()
+    );
+    // Each delivered view is exactly the payload of its own verified signature.
+    for ((player_id, number, bytes), signed) in views.iter().zip(&wires) {
+        assert_eq!(*player_id, 2);
+        let control = PlayerControl::decode(&root, signed).unwrap();
+        control.verify(&root, &certificate, 2, [1; 32], 0).unwrap();
+        assert_eq!(
+            control.action,
+            PlayerAction::Lossy {
+                number: *number,
+                bytes: bytes.clone(),
+            }
+        );
+    }
+    // A short batch takes a number-ordered prefix; adopting it frees only that
+    // prefix and keeps the newer views for the next batch.
+    let short = select_player_inputs(&root, &primary, &[&queue], 5, MAX_JOURNAL_BYTES).unwrap();
+    let short_views: Vec<_> = short
+        .iter()
+        .filter_map(|input| match input {
+            SelectedPlayerInput::Lossy { number, .. } => Some(*number),
+            SelectedPlayerInput::Reliable { .. } => None,
+        })
+        .collect();
+    assert!(!short_views.is_empty());
+    assert!(short_views.windows(2).all(|w| w[1] == w[0] + 1) && short_views[0] == 1);
+    queue.discard_lossy(*short_views.last().unwrap());
+    assert_eq!(
+        queue.lossy_views().map(|(n, _)| n).collect::<Vec<_>>(),
+        (short_views.last().unwrap() + 1..=8).collect::<Vec<_>>()
+    );
+    // Overflow keeps lossy semantics: full-size views never pause intake or
+    // touch reliable originals; the oldest views go first.
+    assert_eq!(MAX_LOSSY_VIEWS * 1024, MAX_JOURNAL_BYTES);
+    let total = 8 + MAX_LOSSY_VIEWS as u64 + 3;
+    for number in 9..=total {
+        let signed = wire(PlayerAction::Lossy {
+            number,
+            bytes: vec![number as u8; 1024],
+        });
+        assert!(queue.receive(&signed, &primary).unwrap());
+    }
+    let kept: Vec<_> = queue.lossy_views().map(|(n, _)| n).collect();
+    assert_eq!(kept.len(), MAX_LOSSY_VIEWS);
+    assert_eq!(
+        kept,
+        (total - MAX_LOSSY_VIEWS as u64 + 1..=total).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        queue
+            .pending()
+            .map(|(n, b)| (n, b.to_vec()))
+            .collect::<Vec<_>>(),
+        vec![(1, vec![1]), (2, vec![2])]
+    );
+    assert!(queue
+        .receive(
+            &wire(PlayerAction::Intent {
+                number: 3,
+                bytes: vec![3],
+            }),
+            &primary,
+        )
+        .unwrap());
+    assert_eq!(queue.pending().count(), 3);
+    let full =
+        select_player_inputs(&root, &primary, &[&queue], MAX_BATCH, MAX_JOURNAL_BYTES).unwrap();
+    assert!(
+        full.iter()
+            .filter(|i| matches!(i, SelectedPlayerInput::Reliable { .. }))
+            .count()
+            == 3
+    );
+    let first_view = full.iter().find_map(|i| match i {
+        SelectedPlayerInput::Lossy { number, .. } => Some(*number),
+        SelectedPlayerInput::Reliable { .. } => None,
+    });
+    assert_eq!(first_view, Some(total - MAX_LOSSY_VIEWS as u64 + 1));
+}
+
+#[test]
 fn human_control_replay_conflict_is_sticky_and_bad_lengths_or_wrap_never_decode() {
     let (mut descriptor, _, key, player) = descriptor_fixture();
     descriptor.consent(&key).unwrap();

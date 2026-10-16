@@ -27,6 +27,10 @@ pub const MAX_PROOF_BYTES: usize = 512 * 1024;
 pub const MAX_JOURNAL_RECORDS: usize = 512;
 pub const MAX_JOURNAL_BYTES: usize = 256 * 1024;
 pub const MAX_PLAYERS: usize = 8;
+/// Signed lossy views one human queue retains between commits. A view's payload
+/// is capped at the 1024-byte transport limit, so this many views fit the same
+/// per-player memory cap as the original journal. Overflow drops the oldest view.
+pub const MAX_LOSSY_VIEWS: usize = MAX_JOURNAL_BYTES / crate::MAX_RELIABLE_LEN;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -10520,7 +10524,7 @@ pub struct PlayerQueue {
     bytes: usize,
     applied: u64,
     lossy_number: u64,
-    lossy: Option<Vec<u8>>,
+    lossy: VecDeque<(u64, Vec<u8>)>,
     closed: bool,
     reconnect: Option<PendingReconnect>,
     reconnect_ms: Option<u64>,
@@ -10550,7 +10554,7 @@ impl PlayerQueue {
             bytes: 0,
             applied: 0,
             lossy_number,
-            lossy: None,
+            lossy: VecDeque::new(),
             closed: false,
             reconnect: None,
             reconnect_ms: None,
@@ -10588,16 +10592,21 @@ impl PlayerQueue {
     pub fn output_ack(&self) -> u64 {
         self.applied
     }
+    /// The newest retained lossy view, if any.
     pub fn lossy(&self) -> Option<(u64, &[u8])> {
-        self.lossy
-            .as_deref()
-            .map(|bytes| (self.lossy_number, bytes))
+        self.lossy.back().map(|(n, bytes)| (*n, bytes.as_slice()))
     }
-    /// Called after adoption of the batch which used this view. A newer view
-    /// received while that batch was in flight remains queued.
+    /// Every retained lossy view in number order. Each is one verified signed
+    /// view, delivered on its own, as the plain host processes every datagram.
+    pub fn lossy_views(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.lossy.iter().map(|(n, bytes)| (*n, bytes.as_slice()))
+    }
+    /// Called after adoption of the batch which used this view. Selection takes
+    /// a number-ordered prefix, so this view and any older one are consumed; a
+    /// newer view received while that batch was in flight remains queued.
     pub fn discard_lossy(&mut self, number: u64) {
-        if number == self.lossy_number {
-            self.lossy = None;
+        while self.lossy.front().is_some_and(|(n, _)| *n <= number) {
+            self.lossy.pop_front();
         }
     }
     /// Adopt committed input hashes and prune only that committed prefix. The
@@ -10886,8 +10895,13 @@ impl PlayerQueue {
             }
             PlayerAction::Lossy { number, bytes } => {
                 if number > self.lossy_number {
+                    // Lossy semantics: a full view list drops its oldest view,
+                    // never pauses intake and never touches reliable originals.
+                    if self.lossy.len() >= MAX_LOSSY_VIEWS {
+                        self.lossy.pop_front();
+                    }
                     self.lossy_number = number;
-                    self.lossy = Some(bytes);
+                    self.lossy.push_back((number, bytes));
                     true
                 } else {
                     false
@@ -10921,7 +10935,7 @@ impl PlayerQueue {
     }
 }
 
-/// One verified original or replaceable view selected for a private game batch.
+/// One verified original or signed lossy view selected for a private game batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectedPlayerInput {
     Reliable {
@@ -10944,7 +10958,8 @@ pub struct LocalInputs {
 /// Deterministic fair selection, bounded by both bytes and records. Rotate the
 /// first player using the committed index, then select one action per player
 /// per pass. On alternating full rotations views get a turn ahead of originals,
-/// so neither stream can starve even when only one action fits a batch.
+/// so neither stream can starve even when only one action fits a batch. Each
+/// player's originals and lossy views leave in number order.
 pub fn select_player_inputs(
     root: &Root,
     primary: &Primary,
@@ -10985,7 +11000,10 @@ pub fn select_player_and_local_inputs(
                         .pending()
                         .map(|(n, b)| (n, b.to_vec()))
                         .collect::<Vec<_>>(),
-                    queue.lossy().map(|(n, b)| (n, b.to_vec())),
+                    queue
+                        .lossy_views()
+                        .map(|(n, b)| (n, b.to_vec()))
+                        .collect::<Vec<_>>(),
                 ),
             )
             .is_some()
@@ -11018,7 +11036,10 @@ pub fn select_player_and_local_inputs(
                     pending.push((*number, payload.clone()));
                 }
             }
-            if ordered.insert(local.player, (pending, None)).is_some() {
+            if ordered
+                .insert(local.player, (pending, Vec::new()))
+                .is_some()
+            {
                 return Err(Error::Conflict);
             }
         }
@@ -11031,7 +11052,7 @@ pub fn select_player_and_local_inputs(
     let start = (primary.receipt.index % count as u64) as usize;
     let prefer_view = (primary.receipt.index / count as u64) % 2 == 1;
     let mut cursors = vec![0; count];
-    let mut views = vec![false; count];
+    let mut view_cursors = vec![0; count];
     let mut remaining = max_bytes;
     let mut selected = Vec::new();
     while selected.len() < max_records {
@@ -11041,14 +11062,10 @@ pub fn select_player_and_local_inputs(
                 break;
             }
             let i = (start + step) % count;
-            let (player, (pending, view)) = &ordered[i];
+            let (player, (pending, views)) = &ordered[i];
             let player = *player;
             let original = pending.get(cursors[i]).map(|(n, b)| (*n, b.as_slice()));
-            let view = if views[i] {
-                None
-            } else {
-                view.as_ref().map(|(n, b)| (*n, b.as_slice()))
-            };
+            let view = views.get(view_cursors[i]).map(|(n, b)| (*n, b.as_slice()));
             let use_view = match (original, view) {
                 (Some((_, bytes)), Some((_, view))) => {
                     if prefer_view && view.len() <= remaining {
@@ -11068,7 +11085,7 @@ pub fn select_player_and_local_inputs(
             if use_view {
                 let (number, bytes) = view.unwrap();
                 remaining -= bytes.len();
-                views[i] = true;
+                view_cursors[i] += 1;
                 selected.push(SelectedPlayerInput::Lossy {
                     player,
                     number,

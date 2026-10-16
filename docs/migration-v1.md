@@ -69,8 +69,17 @@ the original ID nor the signed control cursor. A known ID with different bytes
 faults the queue. Delivery ACKs remain speculative until a later commit includes
 them; only that commit can prune reliable output proofs.
 
+Lossy views are kept as a bounded, number-ordered list per player, not just the
+newest. Each signed view is delivered as its own `Lossy` input, in the order the
+plain host would process the datagrams, so a burst within one batch loses no
+press. Views at or below the newest received number are still dropped as stale or
+duplicate. The list holds `MAX_LOSSY_VIEWS` (256 = `MAX_JOURNAL_BYTES` / the
+1024-byte payload cap, so the same per-player memory as the original journal).
+Overflow drops the oldest view; it never pauses intake or touches a reliable
+original. Adopting a batch discards its selected view and any older one.
+
 The games' queued-batch adapters select bounded fair prefixes across humans,
-bots and latest views. Reading a batch does not drain journals. They stage native
+bots and lossy views. Reading a batch does not drain journals. They stage native
 operations privately and reduce the selected prefix if native reply expansion
 would exceed a complete candidate's bounds. Local UI mutations must use the same
 journal and publication boundary as remote commands.
