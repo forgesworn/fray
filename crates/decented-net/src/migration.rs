@@ -7681,9 +7681,11 @@ impl StandbyActor {
     /// clock, keys, restore equivalence, installation and all post-install
     /// receipt, replay-commit and watch bookkeeping. `RateLimited` is a
     /// `Frame` fault and leaves the frame queued, exactly as before. A reply
-    /// (receipt and certificate) that the send queue cannot hold is also a
-    /// `Frame` fault: the original's traffic filled it. An install that
-    /// already happened stands, and the original's retry resends its reply.
+    /// (receipt and certificate, or the Pulse answering a probe) that the send
+    /// queue cannot hold is also a `Frame` fault: the original's traffic filled
+    /// it. An install that already happened stands, and the original's retry
+    /// resends its reply; an unanswered probe is not recorded, so its retry is
+    /// answered.
     pub fn receive_classified(
         &mut self,
         wire: &[u8],
@@ -7861,6 +7863,10 @@ impl StandbyActor {
                         if !incoming.is_new() {
                             return Ok(None);
                         }
+                        // A reply the queue refuses still burns this sender
+                        // sequence. The gap is harmless: the original's replay
+                        // set and its monotonic probe-response check both
+                        // tolerate gaps.
                         let sequence = self.sequence()?;
                         let pulse = Pulse::respond(
                             &self.descriptor.root,
@@ -7871,8 +7877,11 @@ impl StandbyActor {
                             sequence,
                             keys,
                         )?;
-                        self.channel
-                            .enqueue(PacketKind::Control, &pulse.encode(&self.descriptor.root)?)?;
+                        let pulse = pulse.encode(&self.descriptor.root)?;
+                        // A full queue is the original's traffic: a frame
+                        // fault. The probe stays unrecorded, so a retry of it
+                        // is answered.
+                        by_frame(frame, self.channel.enqueue(PacketKind::Control, &pulse))?;
                         incoming.commit()?;
                     }
                     11 => {

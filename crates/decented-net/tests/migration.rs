@@ -3464,6 +3464,22 @@ fn replication_actors_with_player() -> (
     SessionImage,
     Keys,
 ) {
+    let (root, host, key, original, standby, image, player, _) =
+        replication_actors_with_raw_original();
+    (root, host, key, original, standby, image, player)
+}
+/// The replication actors plus a second, independent original-side channel
+/// on the same pair link, for frames the original actor would never send.
+fn replication_actors_with_raw_original() -> (
+    Root,
+    Keys,
+    Keys,
+    PrimaryActor,
+    StandbyActor,
+    SessionImage,
+    Keys,
+    Channel,
+) {
     let (mut descriptor, host, key, player) = descriptor_fixture();
     descriptor.consent(&key).unwrap();
     let root = descriptor.root.clone();
@@ -3497,11 +3513,19 @@ fn replication_actors_with_player() -> (
         [7; 32],
     )
     .unwrap();
+    let raw = Channel::new(
+        &policy,
+        binding.clone(),
+        ChannelSide::Client,
+        root.standby,
+        [7; 32],
+    )
+    .unwrap();
     let server = Channel::new(&policy, binding, ChannelSide::Server, root.host, [7; 32]).unwrap();
     let original =
         PrimaryActor::new(descriptor.clone(), primary, client, Activity::Advancing, 0).unwrap();
     let standby = StandbyActor::new(descriptor, seq, server, 0).unwrap();
-    (root, host, key, original, standby, image, player)
+    (root, host, key, original, standby, image, player, raw)
 }
 fn replication_actors() -> (Root, Keys, Keys, PrimaryActor, StandbyActor, SessionImage) {
     let (root, host, key, original, standby, image, _) = replication_actors_with_player();
@@ -11047,6 +11071,137 @@ fn a_single_retried_reply_still_carries_its_certificate() {
                 outputs: vec![],
             }),
             PrimaryUpdate::Membership(certificate.clone()),
+        ]
+    );
+}
+
+/// A flood of distinct original probes fills the standby's send queue. The
+/// refused Pulse reply is the original's traffic, so it is a frame fault: the
+/// actor stays usable, the unanswered probe is not recorded and a retry of the
+/// same probe payload (in a new transfer) is answered.
+#[test]
+fn a_probe_flood_that_fills_the_send_queue_is_a_frame_fault_and_the_retry_is_answered() {
+    let (root, host, key, mut original, mut standby, mut image, _, mut raw) =
+        replication_actors_with_raw_original();
+    let no_restore = |_: &Candidate, _: &SessionImage, _: &SessionImage| -> Result<Vec<u8>> {
+        panic!("a probe restores nothing")
+    };
+    // The original actor's own transfers start at 1. Move the raw channel's
+    // transfer IDs past them so both can reach the same standby receiver.
+    let mut now = 0;
+    for _ in 0..64 {
+        raw.enqueue(PacketKind::Control, &[0]).unwrap();
+        while raw.poll_send(now).unwrap().is_some() {}
+        now += 1;
+    }
+    // Probe sequences far above the original's own sender numbers.
+    let probe_bytes = |sequence: u64| {
+        PulseProbe {
+            term: 0,
+            sequence,
+            nonce: [sequence as u8; 32],
+            tls: [7; 32],
+        }
+        .encode(&root)
+        .unwrap()
+    };
+    let deliver = |raw: &mut Channel, standby: &mut StandbyActor, bytes: &[u8], now: u64| {
+        raw.enqueue(PacketKind::Control, bytes).unwrap();
+        let mut result = Ok(None);
+        let mut frames = 0;
+        while let Some(wire) = raw.poll_send(now).unwrap() {
+            frames += 1;
+            result = standby.receive_classified(&wire, now, &key, Activity::Advancing, no_restore);
+        }
+        assert_eq!(frames, 1, "one probe is one frame");
+        result
+    };
+    let mut accepted = 0u64;
+    let refused = loop {
+        assert!(accepted < 2000, "the send queue never filled");
+        now += 1;
+        let bytes = probe_bytes(1_000_000 + accepted);
+        match deliver(&mut raw, &mut standby, &bytes, now) {
+            Ok(None) => accepted += 1,
+            Err(fault) => break (fault, bytes),
+            Ok(Some(receipt)) => panic!("a probe installed {receipt:?}"),
+        }
+    };
+    assert_eq!(refused.0, StandbyFault::Frame(Error::Bounds));
+    assert!(standby.failure().is_none());
+    // Drain every queued Pulse; each accepted probe got exactly one.
+    let drain = |standby: &mut StandbyActor, now: &mut u64| {
+        let mut pulses = vec![];
+        let mut quiet = 0;
+        while quiet < 100 {
+            match standby.poll_send(*now).unwrap() {
+                Some(wire) => {
+                    let frame = Frame::decode(&wire).unwrap();
+                    assert_eq!(frame.kind, PacketKind::Control);
+                    Pulse::decode(&root, &frame.payload).unwrap();
+                    pulses.push(wire.len());
+                    quiet = 0;
+                }
+                None => {
+                    quiet += 1;
+                    *now += 1;
+                }
+            }
+        }
+        pulses
+    };
+    let flooded = drain(&mut standby, &mut now);
+    assert_eq!(flooded.len() as u64, accepted);
+    // It was the 64 KiB priority send queue that refused the reply.
+    let queued: usize = flooded.iter().sum();
+    assert!(queued <= 64 * 1024 && queued + flooded[0] > 64 * 1024);
+    // The refused probe was not recorded: its retry is answered exactly once.
+    now += 1;
+    assert_eq!(deliver(&mut raw, &mut standby, &refused.1, now), Ok(None));
+    assert_eq!(drain(&mut standby, &mut now).len(), 1);
+    // A second retry of it is now a recorded duplicate and is not answered.
+    now += 1;
+    assert_eq!(deliver(&mut raw, &mut standby, &refused.1, now), Ok(None));
+    assert!(drain(&mut standby, &mut now).is_empty());
+    // A fresh probe is answered once.
+    now += 1;
+    let fresh = probe_bytes(1_000_000 + accepted + 1);
+    assert_eq!(deliver(&mut raw, &mut standby, &fresh, now), Ok(None));
+    assert_eq!(drain(&mut standby, &mut now).len(), 1);
+    // The actor still installs and replies with a receipt and its certificate.
+    image.logical_ms = 150;
+    image.game = vec![1];
+    let marks = original.primary().receipt().watermarks.clone();
+    original.prepare(image, marks, vec![]).unwrap();
+    let mut receipts = vec![];
+    while let Some(wire) = original.poll_send(now).unwrap() {
+        if let Some(receipt) = standby
+            .receive_classified(&wire, now, &key, Activity::Advancing, |candidate, _, _| {
+                Ok(candidate.image.clone())
+            })
+            .unwrap()
+        {
+            receipts.push(receipt);
+        }
+    }
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(&receipts[0], standby.receipt());
+    let mut updates = vec![];
+    while let Some(wire) = standby.poll_send(now).unwrap() {
+        if let Some(update) = original.receive_update(&wire, now, &host).unwrap() {
+            updates.push(update);
+        }
+    }
+    let certificate = standby.membership_certificate(&key).unwrap();
+    assert_eq!(certificate.receipt, receipts[0]);
+    assert_eq!(
+        updates,
+        vec![
+            PrimaryUpdate::Event(PrimaryEvent::Committed {
+                receipt: receipts[0].clone(),
+                outputs: vec![],
+            }),
+            PrimaryUpdate::Membership(certificate),
         ]
     );
 }
