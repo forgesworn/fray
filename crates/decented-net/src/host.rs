@@ -1523,7 +1523,8 @@ fn seat_refusal(shared: &Shared, peers: &HashMap<PeerId, Link>) -> Option<u32> {
 /// One incoming connection: handshake, admit or refuse, then pump until it ends.
 ///
 /// The handshake (see `quic`) runs in this order, all within
-/// `HANDSHAKE_TIMEOUT`: the hello must prove admission before the joiner
+/// `HANDSHAKE_TIMEOUT` (`SESSION_HANDSHAKE_DEADLINE` once pinned, timed from
+/// accept, so a stalled peer frees its slot): the hello must prove admission before the joiner
 /// learns anything about this host; only then is the welcome sent; the joiner
 /// says who it is only after verifying that welcome, and is checked against
 /// the kick deny-list and seated only then.
@@ -1674,7 +1675,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
     let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer) =
         match tokio::time::timeout(
             if policy.is_some() {
-                Duration::from_secs(5)
+                quic::SESSION_HANDSHAKE_DEADLINE
             } else {
                 quic::HANDSHAKE_TIMEOUT
             },
@@ -2325,5 +2326,306 @@ mod migration_transition_tests {
             assert_eq!(h.peer_count(), 1);
             h.shutdown();
         }
+    }
+
+    /// The decision is 5 s overall; the window is fixed here, not read from
+    /// the constant, so restoring the old 8 s fails these tests.
+    const DEADLINE: Duration = Duration::from_secs(5);
+    const DEADLINE_SLACK: Duration = Duration::from_millis(6500);
+
+    /// A pinned host whose root seats every one of `players`.
+    fn pinned_host(
+        tag: &str,
+        players: &[Identity],
+    ) -> (
+        NetConfig,
+        HostHandle,
+        Identity,
+        SocketAddr,
+        ConnectionBinding,
+    ) {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), tag).lan_only();
+        cfg.lan_port = 0;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let mut root = descriptor(&h, &cfg, &original, &standby, &players[0]).root;
+        for (i, p) in players.iter().enumerate().skip(1) {
+            root.members.push(Member {
+                player: i as u64 + 1,
+                seat: i as u8,
+                key: Some(p.pubkey().to_bytes()),
+            });
+        }
+        let mut descriptor = Descriptor::offer(root, original.keys()).unwrap();
+        descriptor.consent(standby.keys()).unwrap();
+        h.pin_session(descriptor.clone()).unwrap();
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            h.local_addr().unwrap().port(),
+        );
+        let binding = ConnectionBinding {
+            session: descriptor.root.session,
+            descriptor: descriptor.root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        };
+        (cfg, h, original, addr, binding)
+    }
+
+    /// Polls every client together until each has emitted Connected or
+    /// Failed; returns, per client, how long after `start` that came and the
+    /// event. Panics if any client goes 15 s with neither.
+    fn terminals(
+        clients: &[&crate::ClientHandle],
+        start: Instant,
+    ) -> Vec<(Duration, crate::ClientEvent)> {
+        let mut out: Vec<Option<(Duration, crate::ClientEvent)>> = vec![None; clients.len()];
+        while out.iter().any(Option::is_none) {
+            for (client, slot) in clients.iter().zip(out.iter_mut()) {
+                while slot.is_none() {
+                    match client.poll() {
+                        Some(
+                            ev @ (crate::ClientEvent::Connected { .. }
+                            | crate::ClientEvent::Failed { .. }),
+                        ) => *slot = Some((start.elapsed(), ev)),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "a join hung with no Connected or Failed event"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        out.into_iter().map(Option::unwrap).collect()
+    }
+
+    #[test]
+    fn pinned_handshake_cuts_stalled_peers_at_the_deadline_and_frees_their_slots() {
+        let player = Identity::ephemeral();
+        let (cfg, h, original, addr, binding) =
+            pinned_host("migration-stall-test", std::slice::from_ref(&player));
+        let token: [u8; 32] = hex::decode(h.lan_token()).unwrap().try_into().unwrap();
+        // Two peers fill both pinned slots: verified welcome, never Identify.
+        let start = Instant::now();
+        let (endpoints, stalled) = crate::runtime().block_on(async {
+            let (mut endpoints, mut stalled) = (Vec::new(), Vec::new());
+            for _ in 0..2 {
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let endpoint = quic::client_endpoint(socket, &cfg.app_tag).unwrap();
+                let conn = endpoint
+                    .connect(addr, quic::SERVER_NAME)
+                    .unwrap()
+                    .await
+                    .unwrap();
+                let check: quic::HostCheck = Arc::new(|_| Ok(()));
+                let opened = quic::client_open_bound(
+                    &conn,
+                    None,
+                    PathKind::Lan,
+                    &[token],
+                    &check,
+                    Some(&binding),
+                )
+                .await
+                .unwrap();
+                endpoints.push(endpoint);
+                stalled.push(opened);
+            }
+            (endpoints, stalled)
+        });
+        assert_eq!(h.shared.pending_handshakes.load(Ordering::Acquire), 2);
+        // The 2-slot limit stays: a third handshake is refused at once.
+        let early = Instant::now();
+        let refused = crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding.clone(),
+            original.pubkey(),
+        )
+        .unwrap();
+        let (t, ev) = terminals(&[&refused], early).remove(0);
+        assert!(matches!(ev, crate::ClientEvent::Failed { .. }), "{ev:?}");
+        assert!(t < Duration::from_secs(2), "refusal took {t:?}");
+        drop(refused);
+        // The host cuts each stalled handshake by the deadline from accept.
+        let cut = crate::runtime().block_on(async {
+            let mut cut = Vec::new();
+            for opened in &stalled {
+                let _ = tokio::time::timeout(Duration::from_secs(15), opened.conn.closed()).await;
+                cut.push(start.elapsed());
+            }
+            cut
+        });
+        for t in cut {
+            assert!(
+                (DEADLINE..DEADLINE_SLACK).contains(&t),
+                "stalled handshake cut after {t:?}"
+            );
+        }
+        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 0);
+        drop(stalled);
+        drop(endpoints);
+        // The freed slot seats an honest rejoin.
+        let honest = crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding,
+            original.pubkey(),
+        )
+        .unwrap();
+        let (_, ev) = terminals(&[&honest], Instant::now()).remove(0);
+        assert!(matches!(ev, crate::ClientEvent::Connected { .. }), "{ev:?}");
+        wait_until(|| matches!(h.poll(), Some(HostEvent::PeerJoined { .. })));
+        assert_eq!(h.peer_count(), 1);
+        h.shutdown();
+    }
+
+    #[test]
+    fn session_join_has_one_overall_deadline_across_its_stages() {
+        let mut cfg =
+            NetConfig::new(std::env::temp_dir(), "migration-client-deadline-test").lan_only();
+        cfg.lan_port = 0;
+        // A listener that takes 2.5 s to complete the QUIC handshake, then
+        // never answers the hello, holding the connection open. Staged
+        // timeouts would allow 2.5 s plus a whole handshake timeout.
+        let (tx, rx) = mpsc::channel();
+        let app = cfg.app_tag.clone();
+        let server = crate::runtime().spawn(async move {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let endpoint = quic::server_endpoint(socket, &app).unwrap();
+            tx.send(endpoint.local_addr().unwrap()).unwrap();
+            let incoming = endpoint.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let conn = incoming.accept().unwrap().await.unwrap();
+            let reason = conn.closed().await;
+            drop(endpoint);
+            reason
+        });
+        let addr = rx.recv().unwrap();
+        let binding = ConnectionBinding {
+            session: fresh_session().unwrap(),
+            descriptor: [7; 32],
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        };
+        let start = Instant::now();
+        let client = crate::join_session_addr(
+            &cfg,
+            &Identity::ephemeral(),
+            addr,
+            &hex::encode([9u8; 32]),
+            binding,
+            Identity::ephemeral().pubkey(),
+        )
+        .unwrap();
+        let (t, ev) = terminals(&[&client], start).remove(0);
+        assert!(
+            matches!(
+                ev,
+                crate::ClientEvent::Failed {
+                    stage: crate::JoinStage::Handshake,
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        assert!(
+            (DEADLINE..DEADLINE_SLACK).contains(&t),
+            "session join failed after {t:?}"
+        );
+        drop(client);
+        // The joiner gave up; the stalled listener never closed it.
+        let reason = crate::runtime()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), server).await })
+            .expect("joiner left the connection open")
+            .unwrap();
+        assert!(
+            !matches!(reason, quinn::ConnectionError::LocallyClosed),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn four_concurrent_rejoins_on_two_pinned_slots_each_get_an_event_by_the_deadline() {
+        let players: Vec<Identity> = (0..4).map(|_| Identity::ephemeral()).collect();
+        let (cfg, h, original, addr, binding) = pinned_host("migration-four-rejoin-test", &players);
+        // Park every handshake that reaches registration and never release
+        // it: the two holding the slots must still end by the deadline.
+        let barrier = Arc::new(tokio::sync::Barrier::new(64));
+        *h.shared.before_registration.lock().unwrap() = Some(barrier);
+        let join = |p: &Identity| {
+            crate::join_session_addr(
+                &cfg,
+                p,
+                addr,
+                &h.lan_token(),
+                binding.clone(),
+                original.pubkey(),
+            )
+            .unwrap()
+        };
+        let start = Instant::now();
+        let clients: Vec<_> = players.iter().map(join).collect();
+        let (mut refused, mut cut) = (0, 0);
+        for (t, ev) in terminals(&clients.iter().collect::<Vec<_>>(), start) {
+            assert!(matches!(ev, crate::ClientEvent::Failed { .. }), "{ev:?}");
+            assert!(t < DEADLINE_SLACK, "a rejoin went {t:?} without an event");
+            if t < Duration::from_secs(2) {
+                refused += 1;
+            } else {
+                assert!(t >= DEADLINE, "{t:?}");
+                cut += 1;
+            }
+        }
+        assert_eq!((refused, cut), (2, 2));
+        drop(clients);
+        *h.shared.before_registration.lock().unwrap() = None;
+        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 0);
+        // Retrying with backoff, every rejoin is seated, and no attempt goes
+        // past the deadline without an event.
+        let mut waiting: Vec<&Identity> = players.iter().collect();
+        let mut seated = Vec::new();
+        let mut backoff = Duration::from_millis(50);
+        for _ in 0..8 {
+            let start = Instant::now();
+            let attempt: Vec<_> = waiting.iter().map(|p| join(p)).collect();
+            let results = terminals(&attempt.iter().collect::<Vec<_>>(), start);
+            let mut still = Vec::new();
+            for ((p, client), (t, ev)) in waiting.iter().zip(attempt).zip(results) {
+                assert!(t < DEADLINE_SLACK, "a rejoin went {t:?} without an event");
+                match ev {
+                    crate::ClientEvent::Connected { .. } => seated.push(client),
+                    _ => still.push(*p),
+                }
+            }
+            waiting = still;
+            if waiting.is_empty() {
+                break;
+            }
+            std::thread::sleep(backoff);
+            backoff *= 2;
+        }
+        assert!(waiting.is_empty(), "{} rejoins never seated", waiting.len());
+        assert_eq!(h.peer_count(), 4);
+        drop(seated);
+        h.shutdown();
     }
 }

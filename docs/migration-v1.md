@@ -196,6 +196,18 @@ stale without new trust or artificial strikes. This may leave identity badges
 unverified until Results; seated gameplay continues. Normal armed batches also
 require explicit real security time independently of their logical clock.
 
+A session-bound transport handshake (`join_session_addr` against a pinned
+listener) has one overall five-second deadline per attempt, on a monotonic
+clock, replacing the staged timeouts (5 s connect, 8 s open, 8 s identify). The joiner times it from dial
+start to the host's `Accepted`; on expiry it emits `ClientEvent::Failed` (stage
+`Connecting` or `Handshake`) and never waits without an event. The pinned host
+times it from accept to an authenticated binding, so a stalled peer frees its
+pending-handshake slot by then. The pinned listener still admits at most two
+concurrent handshakes and refuses the rest at once. Fray does not retry; the game
+retries with backoff. A retry just after a joiner-side expiry can briefly get
+`FULL` while the host detaches the seated peer.
+Ordinary lobby joins keep their per-stage timeouts.
+
 A matching runtime key and transport handshake do not prove retained client
 state. Normal TLS replacement uses `PlayerQueue::begin_reconnect`, then the
 retained `PlayerEndpoint::reconnect`, followed by the queue's `finish_reconnect`.

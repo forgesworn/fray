@@ -308,6 +308,12 @@ impl Drop for ClientHandle {
     }
 }
 
+/// When a join stage must end: what is left of the overall session-bound
+/// deadline if there is one, else the stage's own timeout from now.
+fn stage_end(deadline: Option<tokio::time::Instant>, timeout: Duration) -> tokio::time::Instant {
+    deadline.unwrap_or_else(|| tokio::time::Instant::now() + timeout)
+}
+
 async fn run(
     cfg: NetConfig,
     keys: Keys,
@@ -338,7 +344,9 @@ async fn run(
         },
         t => (t, None),
     };
-    let (mut opened, session, path) = match target {
+    // A session-bound join has one overall deadline (no staged timeouts);
+    // `None` keeps each stage's own timeout (ordinary LAN and code joins).
+    let (mut opened, session, path, deadline) = match target {
         Target::Virtual(_) => unreachable!("converted to a LAN join above"),
         Target::Lan(addr, token, session_link) => {
             let Some(t) = crate::lan::parse_token(&token) else {
@@ -374,8 +382,14 @@ async fn run(
                 Ok(ep) => ep,
                 Err(e) => return fail(JoinStage::Connecting, FailReason::Network(e)),
             };
+            // Dial start: the session-bound deadline runs from here to Accepted.
+            let deadline = session_link
+                .as_ref()
+                .map(|_| tokio::time::Instant::now() + quic::SESSION_HANDSHAKE_DEADLINE);
             let conn = match endpoint.connect(addr, quic::SERVER_NAME) {
-                Ok(c) => match tokio::time::timeout(LAN_CONNECT_TIMEOUT, c).await {
+                Ok(c) => match tokio::time::timeout_at(stage_end(deadline, LAN_CONNECT_TIMEOUT), c)
+                    .await
+                {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
                         log::info!("[join] LAN connect to {addr}: {e}");
@@ -397,8 +411,8 @@ async fn run(
                 }
                 _ => Ok(()),
             });
-            let open = tokio::time::timeout(
-                quic::HANDSHAKE_TIMEOUT,
+            let open = tokio::time::timeout_at(
+                stage_end(deadline, quic::HANDSHAKE_TIMEOUT),
                 quic::client_open_bound(
                     &conn,
                     None,
@@ -411,7 +425,7 @@ async fn run(
             .await
             .unwrap_or_else(|_| Err(quic::HandshakeError::Io("handshake timed out".into())));
             match open {
-                Ok(o) => (o, None, path),
+                Ok(o) => (o, None, path, deadline),
                 Err(quic::HandshakeError::Unverified(e)) => {
                     log::warn!("[join] {e}");
                     conn.close(close::HOST_UNVERIFIED.into(), b"host unverified");
@@ -515,7 +529,7 @@ async fn run(
                     shared.emit(ClientEvent::Progress {
                         stage: JoinStage::Handshake,
                     });
-                    (opened, Some(session), path)
+                    (opened, Some(session), path, None)
                 }
                 Err(f) => {
                     log::info!("[join] connect race: {f:?}");
@@ -549,8 +563,8 @@ async fn run(
 
     // Only now, with the host verified (and, for a code join, nobody else
     // answering), do we say who we are (review-net-1 N5).
-    let id = tokio::time::timeout(
-        quic::HANDSHAKE_TIMEOUT,
+    let id = tokio::time::timeout_at(
+        stage_end(deadline, quic::HANDSHAKE_TIMEOUT),
         quic::client_identify(
             &mut opened,
             &keys,

@@ -30,6 +30,11 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 const KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// QUIC handshake + stream open + hello must finish within this.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+/// A session-bound (pinned-listener) handshake attempt has this one overall
+/// deadline instead of staged timeouts: the joiner from dial start to an
+/// accepted, bound session; the pinned host from accept to an authenticated
+/// binding, so a stalled peer frees its pending-handshake slot by then.
+pub(crate) const SESSION_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 /// Bytes queued for one peer before it is declared too slow and dropped.
 pub(crate) const MAX_OUTBOUND_QUEUE_BYTES: usize = 1024 * 1024;
 
