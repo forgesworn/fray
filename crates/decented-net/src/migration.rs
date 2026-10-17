@@ -2203,6 +2203,7 @@ pub struct Primary {
     committed: Vec<u8>,
     pending: Option<Candidate>,
     closed: bool,
+    membership: Option<MembershipCertificate>,
 }
 impl Primary {
     /// Claim the one initial route for an armed human. Only this owned initial
@@ -2288,6 +2289,7 @@ impl Primary {
             committed: image,
             pending: None,
             closed: false,
+            membership: None,
         })
     }
     pub fn committed_image(&self) -> &[u8] {
@@ -2295,6 +2297,13 @@ impl Primary {
     }
     pub fn receipt(&self) -> &Receipt {
         &self.receipt
+    }
+    /// The newest standby-signed membership certificate received over the
+    /// pair link, verified against an installed receipt and its image. It may
+    /// trail [`Self::receipt`] until the certificate following that receipt
+    /// arrives; callers needing the current frontier compare the receipts.
+    pub fn membership_certificate(&self) -> Option<&MembershipCertificate> {
+        self.membership.as_ref()
     }
     pub fn pending(&self) -> Option<&Candidate> {
         self.pending.as_ref()
@@ -3497,6 +3506,7 @@ pub struct ActivationSource {
     channel: Channel,
     acknowledgements: BTreeMap<u64, CapabilityAck>,
     armed: Option<Armed>,
+    membership: Option<MembershipCertificate>,
     clock: ActivationClock,
 }
 struct ActivationClock {
@@ -3542,6 +3552,12 @@ impl ActivationSource {
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
     }
+    /// The standby-signed index-0 membership certificate, once received after
+    /// `Armed`. `finish` moves it into the returned [`Primary`]; if it arrives
+    /// after the handoff, [`PrimaryActor`] accepts it instead.
+    pub fn membership_certificate(&self) -> Option<&MembershipCertificate> {
+        self.membership.as_ref()
+    }
     pub fn new(
         descriptor: Descriptor,
         image: SessionImage,
@@ -3559,6 +3575,7 @@ impl ActivationSource {
             channel,
             acknowledgements: BTreeMap::new(),
             armed: None,
+            membership: None,
             clock: ActivationClock::new(now_ms),
         })
     }
@@ -3604,6 +3621,30 @@ impl ActivationSource {
         };
         if kind != PacketKind::Control {
             return Err(Error::Unauthorized);
+        }
+        match control_kind(&self.descriptor.root, &bytes)? {
+            2 => {}
+            9 => {
+                let installed = self.armed.as_ref().ok_or(Error::Gap)?.receipt.clone();
+                let accepted = accept_pair_certificate(
+                    &self.replay,
+                    &self.descriptor.root,
+                    &installed,
+                    &self.image,
+                    self.membership.as_ref(),
+                    &bytes,
+                );
+                if accepted == Err((Error::Conflict, true)) {
+                    // A signature-verified standby certificate contradicting
+                    // the armed receipt, the frozen image or the ledger.
+                    self.clock.failed = true;
+                }
+                if let Some(certificate) = accepted.map_err(|(error, _)| error)? {
+                    self.membership = Some(certificate);
+                }
+                return Ok(false);
+            }
+            _ => return Err(Error::Unauthorized),
         }
         let armed = Armed::decode(&self.descriptor.root.context()?, &bytes)?;
         let image = SessionImage::decode(&self.descriptor.root, &self.image)?;
@@ -3653,6 +3694,7 @@ impl ActivationSource {
         self.channel.expire(now_ms)?;
         let receipt = self.armed.take().ok_or(Error::Gap)?.receipt;
         let mut primary = Primary::armed(self.descriptor.root.context()?, self.image, receipt)?;
+        primary.membership = self.membership.take();
         if let Some(ack) = self.acknowledgements.values().find(|ack| {
             self.descriptor
                 .root
@@ -3819,6 +3861,13 @@ impl ActivationSink {
         self.channel.enqueue(
             PacketKind::Control,
             &armed.encode(&self.descriptor.root.context()?)?,
+        )?;
+        // Only the standby can sign membership; the original needs index 0.
+        self.channel.enqueue(
+            PacketKind::Control,
+            &sequencer
+                .membership_certificate(keys)?
+                .encode(&self.descriptor.root)?,
         )?;
         Ok((sequencer, armed, self.channel))
     }
@@ -6579,6 +6628,35 @@ impl Channel {
         self.next = next;
         Ok(id)
     }
+    /// Queue several manifest-free messages (Receipt or Control) as one
+    /// all-or-nothing unit; returns the last message's transfer ID.
+    fn enqueue_replies(&mut self, messages: &[(PacketKind, &[u8])]) -> Result<u64> {
+        let receiving_side = match self.side {
+            ChannelSide::Client => ChannelSide::Server,
+            ChannelSide::Server => ChannelSide::Client,
+        };
+        let mut frames = vec![];
+        let mut id = self.next;
+        let mut last = 0;
+        for (kind, bytes) in messages {
+            if !matches!(kind, PacketKind::Receipt | PacketKind::Control) {
+                return Err(Error::Unauthorized);
+            }
+            self.check(receiving_side, *kind, bytes.len())?;
+            frames.extend(Frame::split(
+                self.binding.session,
+                self.term,
+                id,
+                *kind,
+                bytes,
+            )?);
+            last = id;
+            id = id.checked_add(1).ok_or(Error::Bounds)?;
+        }
+        self.sender.enqueue(frames)?;
+        self.next = id;
+        Ok(last)
+    }
     pub fn poll_send(&mut self, now_ms: u64) -> Result<Option<Vec<u8>>> {
         self.sender.poll(now_ms)
     }
@@ -7313,6 +7391,69 @@ fn control_kind(root: &Root, bytes: &[u8]) -> Result<u8> {
     r.u8()
 }
 
+/// Verify a standby-signed membership certificate received on the pair link
+/// (control kind 9) against the original's installed receipt and image.
+/// Returns `None` for an exact retry of `current`. Decode authenticates the
+/// standby's signature, root binding, term/sequence frontier and the 2048-byte
+/// bound. A refusal carries `true` only once that authentication passed.
+fn accept_pair_certificate(
+    replay: &ReplaySession,
+    root: &Root,
+    installed: &Receipt,
+    image: &[u8],
+    current: Option<&MembershipCertificate>,
+    bytes: &[u8],
+) -> std::result::Result<Option<MembershipCertificate>, (Error, bool)> {
+    let certificate = MembershipCertificate::decode(root, bytes).map_err(|error| (error, false))?;
+    accept_signed_certificate(replay, root, installed, image, current, bytes, certificate)
+        .map_err(|error| (error, true))
+}
+fn accept_signed_certificate(
+    replay: &ReplaySession,
+    root: &Root,
+    installed: &Receipt,
+    image: &[u8],
+    current: Option<&MembershipCertificate>,
+    bytes: &[u8],
+    certificate: MembershipCertificate,
+) -> Result<Option<MembershipCertificate>> {
+    let context = root.context()?;
+    // Reserve, but do not yet record, the embedded receipt and the certificate.
+    // Different bytes at a remembered standby sequence still fault the shared
+    // session here. A record that a sibling consumer of the same ledger (a
+    // local seat) already holds is not new, and is not recorded twice.
+    let receipt = replay.begin(
+        root.standby,
+        certificate.receipt.sequence,
+        &certificate.receipt.encode(&context)?,
+        true,
+    )?;
+    let incoming = replay.begin(root.standby, certificate.sequence, bytes, false)?;
+    let exact_retry = current == Some(&certificate);
+    if !exact_retry {
+        if certificate.receipt != *installed {
+            return Err(match certificate.receipt.index.cmp(&installed.index) {
+                std::cmp::Ordering::Less => Error::Stale,
+                std::cmp::Ordering::Equal => Error::Conflict,
+                std::cmp::Ordering::Greater => Error::Gap,
+            });
+        }
+        let image = SessionImage::decode(root, image)?;
+        if certificate.members != image.members
+            || certificate.revision != image.membership_revision
+            || certificate.next_player != image.next_player
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some(previous) = current {
+            certificate.follows(root, previous)?;
+        }
+    }
+    receipt.commit()?;
+    incoming.commit()?;
+    Ok((!exact_retry).then_some(certificate))
+}
+
 /// Attribution of a failed [`StandbyActor::receive_classified`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StandbyFault {
@@ -7355,6 +7496,9 @@ pub struct StandbyActor {
     // Only an identical delta actually installed here may reuse the target
     // image after an ACK is lost. A claimed target hash alone is insufficient.
     last_delta: Option<(u64, Hash)>,
+    // The receipt whose reply (receipt then certificate) is still queued, and
+    // the reply's last transfer ID. Identical retries coalesce onto it.
+    queued_reply: Option<(Receipt, u64)>,
     failed: Option<Error>,
 }
 impl StandbyActor {
@@ -7384,6 +7528,7 @@ impl StandbyActor {
             watch,
             checkpoint_received_ms: now_ms,
             last_delta: None,
+            queued_reply: None,
             failed: None,
         })
     }
@@ -7466,6 +7611,36 @@ impl StandbyActor {
     fn sequence(&mut self) -> Result<u64> {
         self.sequencer.sender.allocate()
     }
+    /// Every receipt sent to the original is followed by the certificate for
+    /// that exact receipt, queued together. The certificate's sequence is the
+    /// receipt's reserved successor, so a retry resends byte-identical bytes
+    /// and allocates nothing. While the same reply is still queued, a retry
+    /// queues nothing more. A full queue is the original's traffic, so that
+    /// refusal is a frame fault; the install stands and a retry resends it.
+    fn reply(&mut self, receipt: &Receipt, keys: &Keys, frame: &mut bool) -> Result<()> {
+        if self
+            .queued_reply
+            .as_ref()
+            .is_some_and(|(queued, _)| queued == receipt)
+        {
+            return Ok(());
+        }
+        let certificate = self.sequencer.membership_certificate(keys)?;
+        if &certificate.receipt != receipt {
+            return Err(Error::Invalid("membership certificate frontier"));
+        }
+        let receipt_bytes = receipt.encode(&self.descriptor.root.context()?)?;
+        let certificate_bytes = certificate.encode(&self.descriptor.root)?;
+        let last = by_frame(
+            frame,
+            self.channel.enqueue_replies(&[
+                (PacketKind::Receipt, &receipt_bytes),
+                (PacketKind::Control, &certificate_bytes),
+            ]),
+        )?;
+        self.queued_reply = Some((receipt.clone(), last));
+        Ok(())
+    }
     pub fn probe(&mut self, now_ms: u64) -> Result<()> {
         self.sequencer.sender.replay.live()?;
         if self.failed.is_some() {
@@ -7505,7 +7680,10 @@ impl StandbyActor {
     /// (even when an original's conflicting record poisoned it), the watch
     /// clock, keys, restore equivalence, installation and all post-install
     /// receipt, replay-commit and watch bookkeeping. `RateLimited` is a
-    /// `Frame` fault and leaves the frame queued, exactly as before.
+    /// `Frame` fault and leaves the frame queued, exactly as before. A reply
+    /// (receipt and certificate) that the send queue cannot hold is also a
+    /// `Frame` fault: the original's traffic filled it. An install that
+    /// already happened stands, and the original's retry resends its reply.
     pub fn receive_classified(
         &mut self,
         wire: &[u8],
@@ -7573,8 +7751,7 @@ impl StandbyActor {
                         // Do not reconstruct or run native restore again, and
                         // do not let retries refresh any liveness/security age.
                         let receipt = self.sequencer.receipt.clone();
-                        self.channel
-                            .enqueue(PacketKind::Receipt, &receipt.encode(&context)?)?;
+                        self.reply(&receipt, keys, frame)?;
                         incoming.commit()?;
                         return Ok(Some(receipt));
                     } else {
@@ -7646,8 +7823,7 @@ impl StandbyActor {
                 }
                 self.members = image.members;
                 self.watch.installed(&self.sequencer, now_ms)?;
-                self.channel
-                    .enqueue(PacketKind::Receipt, &receipt.encode(&context)?)?;
+                self.reply(&receipt, keys, frame)?;
                 Ok(Some(receipt))
             }
             PacketKind::Control => {
@@ -7732,7 +7908,14 @@ impl StandbyActor {
     }
     pub fn poll_send(&mut self, now_ms: u64) -> Result<Option<Vec<u8>>> {
         self.sequencer.sender.replay.live()?;
-        self.channel.poll_send(now_ms)
+        let wire = self.channel.poll_send(now_ms)?;
+        if let (Some(wire), Some((_, last))) = (&wire, &self.queued_reply) {
+            let frame = Frame::decode(wire)?;
+            if frame.transfer == *last && frame.ordinal + 1 == frame.count {
+                self.queued_reply = None;
+            }
+        }
+        Ok(wire)
     }
     /// Consuming the actor prevents reopening its old sequencer. The returned
     /// warm channel carries promotion while the owned Recovery reconciles at C.
@@ -7764,6 +7947,16 @@ pub enum PrimaryEvent {
         outputs: Vec<CertifiedOutput>,
     },
     Promoted(Promotion),
+}
+/// One result of [`PrimaryActor::receive_update`]. `Membership` reports a newly
+/// accepted standby-signed certificate. It arrives on the frame after the
+/// `Committed` event for the same receipt, and equals the certificate
+/// [`PrimaryActor::membership_certificate`] now exposes. [`PrimaryEvent`]
+/// itself is unchanged, so existing exhaustive matches keep compiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrimaryUpdate {
+    Event(PrimaryEvent),
+    Membership(MembershipCertificate),
 }
 /// Original-host replication/publication gate. The game stages its authority,
 /// local transports and UI before prepare; only Committed permits adoption.
@@ -7842,6 +8035,11 @@ impl PrimaryActor {
     }
     pub fn primary(&self) -> &Primary {
         &self.primary
+    }
+    /// The newest verified standby-signed membership certificate; see
+    /// [`Primary::membership_certificate`].
+    pub fn membership_certificate(&self) -> Option<&MembershipCertificate> {
+        self.primary.membership_certificate()
     }
     pub fn failure(&self) -> Option<&Error> {
         self.failed.as_ref()
@@ -7981,12 +8179,27 @@ impl PrimaryActor {
             .enqueue(PacketKind::Control, &probe.encode(&self.descriptor.root)?)?;
         Ok(())
     }
+    /// [`Self::receive_update`] without membership notices: an accepted
+    /// certificate is still verified and exposed, but reported as `None`.
     pub fn receive(
         &mut self,
         wire: &[u8],
         now_ms: u64,
         keys: &Keys,
     ) -> Result<Option<PrimaryEvent>> {
+        Ok(match self.receive_update(wire, now_ms, keys)? {
+            Some(PrimaryUpdate::Event(event)) => Some(event),
+            Some(PrimaryUpdate::Membership(_)) | None => None,
+        })
+    }
+    /// Receive one pair-link frame, reporting an accepted membership
+    /// certificate as [`PrimaryUpdate::Membership`].
+    pub fn receive_update(
+        &mut self,
+        wire: &[u8],
+        now_ms: u64,
+        keys: &Keys,
+    ) -> Result<Option<PrimaryUpdate>> {
         self.primary.sender.replay.live()?;
         self.watch.advance(now_ms)?;
         if keys.public_key().to_bytes() != self.descriptor.root.host {
@@ -8020,7 +8233,12 @@ impl PrimaryActor {
                 }
                 self.watch.committed(&receipt, now_ms)?;
                 incoming.commit()?;
-                Ok((!duplicate).then_some(PrimaryEvent::Committed { receipt, outputs }))
+                Ok(
+                    (!duplicate).then_some(PrimaryUpdate::Event(PrimaryEvent::Committed {
+                        receipt,
+                        outputs,
+                    })),
+                )
             }
             PacketKind::Control => {
                 match control_kind(root, &bytes)? {
@@ -8045,6 +8263,21 @@ impl PrimaryActor {
                         self.watch.pulse(&pulse, now_ms)?;
                         incoming.commit()?;
                     }
+                    9 => {
+                        if let Some(certificate) = accept_pair_certificate(
+                            &self.primary.sender.replay,
+                            root,
+                            &self.primary.receipt,
+                            &self.primary.committed,
+                            self.primary.membership.as_ref(),
+                            &bytes,
+                        )
+                        .map_err(|(error, _)| error)?
+                        {
+                            self.primary.membership = Some(certificate.clone());
+                            return Ok(Some(PrimaryUpdate::Membership(certificate)));
+                        }
+                    }
                     6 => {
                         let promotion = Promotion::decode(&root.context()?, &bytes)?;
                         self.primary
@@ -8061,7 +8294,9 @@ impl PrimaryActor {
                         self.watch.promote(&promotion, now_ms)?;
                         self.channel.promote(&promotion)?;
                         incoming.commit()?;
-                        return Ok(Some(PrimaryEvent::Promoted(promotion)));
+                        return Ok(Some(PrimaryUpdate::Event(PrimaryEvent::Promoted(
+                            promotion,
+                        ))));
                     }
                     10 => {
                         let probe = PulseProbe::decode(root, &bytes)?;
@@ -8720,6 +8955,7 @@ impl SuccessorActor {
             committed: sequencer.image.clone(),
             pending: None,
             closed: false,
+            membership: sequencer.membership.clone(),
         };
         Ok(Self {
             root,

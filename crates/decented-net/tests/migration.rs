@@ -10230,3 +10230,823 @@ fn normal_player_applies_newer_membership_already_seen_by_shared_consumer() {
     assert_eq!(endpoint.journals().1.acknowledged(), 1);
     assert!(endpoint.failure().is_none());
 }
+
+/// Arm through the real activation pair. `stop_at_armed` hands the remaining
+/// standby frames (the index-0 certificate) to the PrimaryActor instead.
+fn armed_actors(
+    stop_at_armed: bool,
+) -> (
+    Descriptor,
+    Keys,
+    Keys,
+    SessionImage,
+    PrimaryActor,
+    StandbyActor,
+    MembershipCertificate,
+) {
+    armed_actors_sized(1, stop_at_armed)
+}
+fn armed_actors_sized(
+    size: usize,
+    stop_at_armed: bool,
+) -> (
+    Descriptor,
+    Keys,
+    Keys,
+    SessionImage,
+    PrimaryActor,
+    StandbyActor,
+    MembershipCertificate,
+) {
+    let (descriptor, host, key, player, image, mut source, mut sink) = activation_wire_pair(size);
+    let root = &descriptor.root;
+    let initial = source.initial_hash().unwrap();
+    for (id, signer) in [(1, &host), (2, &player)] {
+        source
+            .acknowledge(
+                CapabilityAck::sign(root, id, initial, 1, signer).unwrap(),
+                0,
+            )
+            .unwrap();
+    }
+    while let Some(wire) = source.poll_send(0).unwrap() {
+        sink.receive(&wire, 0).unwrap();
+    }
+    let (seq, armed, mut server) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+    let cert0 = seq.membership_certificate(&key).unwrap();
+    assert_eq!(cert0.receipt, armed.receipt);
+    let mut rest = vec![];
+    while let Some(wire) = server.poll_send(0).unwrap() {
+        if stop_at_armed && source.armed().is_some() {
+            rest.push(wire);
+        } else {
+            source.receive(&wire, 0).unwrap();
+        }
+    }
+    assert_eq!(source.armed(), Some(&armed));
+    if stop_at_armed {
+        assert!(!rest.is_empty());
+        assert_eq!(source.membership_certificate(), None);
+    } else {
+        assert_eq!(source.membership_certificate(), Some(&cert0));
+    }
+    let (primary, client) = source.finish(0).unwrap();
+    assert_eq!(
+        primary.membership_certificate(),
+        (!stop_at_armed).then_some(&cert0)
+    );
+    let mut original =
+        PrimaryActor::new(descriptor.clone(), primary, client, Activity::Idle, 0).unwrap();
+    for wire in rest {
+        assert_eq!(original.receive(&wire, 0, &host).unwrap(), None);
+    }
+    assert_eq!(original.membership_certificate(), Some(&cert0));
+    let standby = StandbyActor::new(descriptor.clone(), seq, server, 0).unwrap();
+    (descriptor, host, key, image, original, standby, cert0)
+}
+
+/// One replication round over the actors' own pair link.
+fn replicate(
+    original: &mut PrimaryActor,
+    standby: &mut StandbyActor,
+    key: &Keys,
+    host: &Keys,
+    image: &SessionImage,
+    marks: Vec<Watermark>,
+    now: u64,
+) -> Vec<Option<PrimaryEvent>> {
+    original.prepare(image.clone(), marks, vec![]).unwrap();
+    let mut installed = false;
+    while let Some(wire) = original.poll_send(now).unwrap() {
+        installed |= standby
+            .receive(&wire, now, key, Activity::Advancing, |candidate, _, _| {
+                Ok(candidate.image.clone())
+            })
+            .unwrap()
+            .is_some();
+    }
+    assert!(installed);
+    let mut events = vec![];
+    while let Some(wire) = standby.poll_send(now).unwrap() {
+        events.push(original.receive(&wire, now, host).unwrap());
+    }
+    events
+}
+
+#[test]
+fn original_receives_the_standby_signed_membership_certificate_at_arming_and_every_receipt() {
+    for stop_at_armed in [false, true] {
+        let (descriptor, host, key, mut image, mut original, mut standby, cert0) =
+            armed_actors(stop_at_armed);
+        let root = &descriptor.root;
+        assert_eq!(cert0.receipt.index, 0);
+        assert_eq!(cert0.members.len(), 3);
+        // A membership-changing commit: the bot (player 3) leaves.
+        image.logical_ms += 16;
+        image.members.retain(|m| m.player != 3);
+        image.inputs.remove(&3);
+        image.membership_revision += 1;
+        let mut marks = original.primary().receipt().watermarks.clone();
+        marks.iter_mut().find(|m| m.player == 3).unwrap().retired = true;
+        let events = replicate(&mut original, &mut standby, &key, &host, &image, marks, 16);
+        assert!(matches!(
+            events.first(),
+            Some(Some(PrimaryEvent::Committed { .. }))
+        ));
+        assert!(events[1..].iter().all(Option::is_none));
+        let cert1 = standby.membership_certificate(&key).unwrap();
+        assert_eq!(original.membership_certificate(), Some(&cert1));
+        assert_eq!(&cert1.receipt, original.primary().receipt());
+        assert_eq!(cert1.receipt.index, 1);
+        assert_eq!(cert1.revision, cert0.revision + 1);
+        assert!(cert1.members.iter().all(|m| m.player != 3));
+        cert1.follows(root, &cert0).unwrap();
+        // An ordinary commit also carries the certificate for that receipt,
+        // which a reconnect challenge needs at the current frontier.
+        image.logical_ms += 16;
+        image.game[0] = 7;
+        let marks = original.primary().receipt().watermarks.clone();
+        replicate(&mut original, &mut standby, &key, &host, &image, marks, 32);
+        let cert2 = standby.membership_certificate(&key).unwrap();
+        assert_eq!(cert2.receipt.index, 2);
+        assert_eq!(cert2.members, cert1.members);
+        assert_eq!(original.membership_certificate(), Some(&cert2));
+        assert_eq!(original.primary().membership_certificate(), Some(&cert2));
+    }
+}
+
+/// A raw standby-side channel lets the test choose exactly which signed
+/// records reach the original actor, and in what order.
+struct ManualPair {
+    descriptor: Descriptor,
+    host: Keys,
+    key: Keys,
+    image: SessionImage,
+    seq: Sequencer,
+    original: PrimaryActor,
+    server: Channel,
+}
+impl ManualPair {
+    fn new() -> Self {
+        let (mut descriptor, host, key, _) = descriptor_fixture();
+        descriptor.consent(&key).unwrap();
+        let root = descriptor.root.clone();
+        let image =
+            SessionImage::initial(&root, &[(1, 10), (2, 11), (3, 12)], vec![0], 1, 100).unwrap();
+        let seq = Sequencer::arm_session(root.clone(), image.clone(), &key).unwrap();
+        let primary = Primary::armed(
+            root.context().unwrap(),
+            seq.image().to_vec(),
+            seq.receipt().clone(),
+        )
+        .unwrap();
+        let policy = EndpointPolicy {
+            descriptor: descriptor.clone(),
+            role: LinkRole::Standby,
+            promotion: None,
+            membership: None,
+        };
+        let binding = ConnectionBinding {
+            session: root.session,
+            descriptor: root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Original,
+            server: LinkRole::Standby,
+        };
+        let client = Channel::new(
+            &policy,
+            binding.clone(),
+            ChannelSide::Client,
+            root.standby,
+            [7; 32],
+        )
+        .unwrap();
+        let server =
+            Channel::new(&policy, binding, ChannelSide::Server, root.host, [7; 32]).unwrap();
+        let original =
+            PrimaryActor::new(descriptor.clone(), primary, client, Activity::Idle, 0).unwrap();
+        Self {
+            descriptor,
+            host,
+            key,
+            image,
+            seq,
+            original,
+            server,
+        }
+    }
+    fn root(&self) -> Root {
+        self.descriptor.root.clone()
+    }
+    fn deliver(&mut self, kind: PacketKind, bytes: &[u8]) -> Result<Option<PrimaryEvent>> {
+        self.server.enqueue(kind, bytes).unwrap();
+        let mut last = Ok(None);
+        while let Some(wire) = self.server.poll_send(0).unwrap() {
+            last = self.original.receive(&wire, 0, &self.host);
+        }
+        last
+    }
+    fn certificate(&self) -> MembershipCertificate {
+        self.seq.membership_certificate(&self.key).unwrap()
+    }
+    /// The standby installs the original's next candidate; nothing is sent back.
+    fn install_next(&mut self) -> Receipt {
+        self.image.logical_ms += 16;
+        self.image.game[0] = self.image.game[0].wrapping_add(1);
+        let marks = self.original.primary().receipt().watermarks.clone();
+        self.original
+            .prepare(self.image.clone(), marks, vec![])
+            .unwrap();
+        let context = self.root().context().unwrap();
+        while let Some(wire) = self.original.poll_send(0).unwrap() {
+            if let Some((kind, _, bytes)) = self.server.receive(&wire, 0).unwrap() {
+                assert_eq!(kind, PacketKind::Candidate);
+                let staged = self
+                    .seq
+                    .stage(Candidate::decode(&context, &bytes).unwrap())
+                    .unwrap();
+                self.seq.install(staged, &self.key).unwrap();
+            }
+        }
+        self.seq.receipt().clone()
+    }
+}
+
+/// Re-sign a certificate body (everything before the 64-byte signature) with
+/// an arbitrary key, after an optional edit of the body.
+fn resign(bytes: &[u8], signer: &Keys, edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut body = bytes[..bytes.len() - 64].to_vec();
+    edit(&mut body);
+    let mut h = Sha256::new();
+    h.update(b"fray/migration/control/v1\0");
+    h.update(&body);
+    let digest: [u8; 32] = h.finalize().into();
+    let signature = signer.sign_schnorr(&nostr::secp256k1::Message::from_digest(digest));
+    body.extend(signature.serialize());
+    body
+}
+
+#[test]
+fn original_refuses_forged_uninstalled_replayed_foreign_and_oversized_certificates() {
+    let mut pair = ManualPair::new();
+    let root = pair.root();
+    let context = root.context().unwrap();
+    let cert0 = pair.certificate();
+    let cert0_bytes = cert0.encode(&root).unwrap();
+
+    // A different key over the exact genuine body is refused.
+    for signer in [pair.host.clone(), Keys::generate()] {
+        assert_eq!(
+            pair.deliver(PacketKind::Control, &resign(&cert0_bytes, &signer, |_| {})),
+            Err(Error::Unauthorized)
+        );
+    }
+    let mut flipped = cert0_bytes.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &flipped),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(pair.original.membership_certificate(), None);
+    // Refusal is not latched: the genuine certificate is then accepted.
+    assert_eq!(pair.deliver(PacketKind::Control, &cert0_bytes), Ok(None));
+    assert_eq!(pair.original.membership_certificate(), Some(&cert0));
+    assert_eq!(pair.deliver(PacketKind::Control, &cert0_bytes), Ok(None));
+
+    // A certificate for a receipt the original has not installed.
+    let receipt1 = pair.install_next();
+    let cert1 = pair.certificate();
+    let cert1_bytes = cert1.encode(&root).unwrap();
+    assert_eq!(cert1.receipt, receipt1);
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &cert1_bytes),
+        Err(Error::Gap)
+    );
+    assert_eq!(pair.original.membership_certificate(), Some(&cert0));
+    assert!(matches!(
+        pair.deliver(PacketKind::Receipt, &receipt1.encode(&context).unwrap()),
+        Ok(Some(PrimaryEvent::Committed { .. }))
+    ));
+    // A standby-signed table that differs from the installed image (here a
+    // logical peer) is refused even though its signature is valid.
+    let peer_offset = cert1_bytes.len() - 64 - 4;
+    let mismatched = resign(&cert1_bytes, &pair.key, |body| body[peer_offset] ^= 1);
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &mismatched),
+        Err(Error::Conflict)
+    );
+    // Another key over the installed receipt's genuine body.
+    let forged = resign(&cert1_bytes, &pair.host, |_| {});
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &forged),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(pair.original.membership_certificate(), Some(&cert0));
+    assert_eq!(pair.deliver(PacketKind::Control, &cert1_bytes), Ok(None));
+    assert_eq!(pair.original.membership_certificate(), Some(&cert1));
+
+    // Replays: the current one is an idempotent no-op; an older one is stale.
+    assert_eq!(pair.deliver(PacketKind::Control, &cert1_bytes), Ok(None));
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &cert0_bytes),
+        Err(Error::Stale)
+    );
+    assert_eq!(pair.original.membership_certificate(), Some(&cert1));
+
+    // Another session's genuine certificate, and a term-1 prefix.
+    let (mut other, _, other_key, _) = descriptor_fixture();
+    other.consent(&other_key).unwrap();
+    let other_image =
+        SessionImage::initial(&other.root, &[(1, 10), (2, 11), (3, 12)], vec![0], 1, 100).unwrap();
+    let foreign = Sequencer::arm_session(other.root.clone(), other_image, &other_key)
+        .unwrap()
+        .membership_certificate(&other_key)
+        .unwrap()
+        .encode(&other.root)
+        .unwrap();
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &foreign),
+        Err(Error::Invalid("session/version binding"))
+    );
+    let term_offset = 1 + 16 + 32;
+    let term1 = resign(&cert1_bytes, &pair.key, |body| {
+        body[term_offset..term_offset + 8].copy_from_slice(&1u64.to_be_bytes())
+    });
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &term1),
+        Err(Error::Invalid("membership control frontier"))
+    );
+
+    // Oversized: over the certificate's 2048-byte bound, within the channel's.
+    let mut oversized = cert1_bytes.clone();
+    oversized.resize(3000, 0);
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &oversized),
+        Err(Error::Bounds)
+    );
+    assert_eq!(pair.original.membership_certificate(), Some(&cert1));
+    assert!(pair.original.failure().is_none());
+
+    // A standby contradiction at a remembered sequence faults the shared ledger.
+    let contradiction = resign(&cert1_bytes, &pair.key, |body| body[peer_offset] ^= 2);
+    assert_ne!(contradiction, cert1_bytes);
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &contradiction),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        pair.deliver(PacketKind::Control, &cert1_bytes),
+        Err(Error::Closed)
+    );
+}
+
+#[test]
+fn a_membership_certificate_from_the_original_is_a_non_latching_standby_frame_fault() {
+    let (descriptor, host, key, player, mut image, mut source, mut sink) = activation_wire_pair(1);
+    let root = &descriptor.root;
+    let initial = source.initial_hash().unwrap();
+    for (id, signer) in [(1, &host), (2, &player)] {
+        source
+            .acknowledge(
+                CapabilityAck::sign(root, id, initial, 1, signer).unwrap(),
+                0,
+            )
+            .unwrap();
+    }
+    while let Some(wire) = source.poll_send(0).unwrap() {
+        sink.receive(&wire, 0).unwrap();
+    }
+    let (seq, _, mut server) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+    while let Some(wire) = server.poll_send(0).unwrap() {
+        source.receive(&wire, 0).unwrap();
+    }
+    let cert0 = source.membership_certificate().unwrap().clone();
+    let (primary, mut client) = source.finish(0).unwrap();
+    client
+        .enqueue(PacketKind::Control, &cert0.encode(root).unwrap())
+        .unwrap();
+    let mut original =
+        PrimaryActor::new(descriptor.clone(), primary, client, Activity::Idle, 0).unwrap();
+    let mut replica = StandbyActor::new(descriptor.clone(), seq, server, 0).unwrap();
+    let wire = original.poll_send(0).unwrap().unwrap();
+    assert_eq!(
+        replica.receive_classified(&wire, 0, &key, Activity::Idle, |_, _, _| {
+            panic!("a certificate cannot restore")
+        }),
+        Err(StandbyFault::Frame(Error::Unauthorized))
+    );
+    assert!(replica.failure().is_none());
+    image.logical_ms += 16;
+    let marks = original.primary().receipt().watermarks.clone();
+    replicate(&mut original, &mut replica, &key, &host, &image, marks, 16);
+    assert_eq!(
+        original.membership_certificate(),
+        Some(&replica.membership_certificate(&key).unwrap())
+    );
+}
+
+#[test]
+fn activation_source_refuses_certificates_before_armed_or_contradicting_the_initial_image() {
+    for case in ["early", "forged", "mismatch"] {
+        let (descriptor, host, key, player, _, mut source, mut sink) = activation_wire_pair(1);
+        let root = &descriptor.root;
+        let initial = source.initial_hash().unwrap();
+        for (id, signer) in [(1, &host), (2, &player)] {
+            source
+                .acknowledge(
+                    CapabilityAck::sign(root, id, initial, 1, signer).unwrap(),
+                    0,
+                )
+                .unwrap();
+        }
+        while let Some(wire) = source.poll_send(0).unwrap() {
+            sink.receive(&wire, 0).unwrap();
+        }
+        let (seq, armed, server) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+        drop(server);
+        let cert0 = seq
+            .membership_certificate(&key)
+            .unwrap()
+            .encode(root)
+            .unwrap();
+        // A fresh raw standby link to the source carries chosen records.
+        let policy = EndpointPolicy {
+            descriptor: descriptor.clone(),
+            role: LinkRole::Standby,
+            promotion: None,
+            membership: None,
+        };
+        let binding = ConnectionBinding {
+            session: root.session,
+            descriptor: root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Original,
+            server: LinkRole::Standby,
+        };
+        let mut raw =
+            Channel::new(&policy, binding, ChannelSide::Server, root.host, [7; 32]).unwrap();
+        let send = |raw: &mut Channel, source: &mut ActivationSource, bytes: &[u8]| {
+            raw.enqueue(PacketKind::Control, bytes).unwrap();
+            let mut last = Ok(false);
+            while let Some(wire) = raw.poll_send(0).unwrap() {
+                last = source.receive(&wire, 0);
+            }
+            last
+        };
+        if case == "early" {
+            assert_eq!(send(&mut raw, &mut source, &cert0), Err(Error::Gap));
+            assert_eq!(source.membership_certificate(), None);
+            continue;
+        }
+        let armed_bytes = armed.encode(&root.context().unwrap()).unwrap();
+        assert_eq!(send(&mut raw, &mut source, &armed_bytes), Ok(true));
+        if case == "forged" {
+            assert_eq!(
+                send(&mut raw, &mut source, &resign(&cert0, &host, |_| {})),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(send(&mut raw, &mut source, &cert0), Ok(false));
+            assert!(source.membership_certificate().is_some());
+            assert!(source.finish(0).is_ok());
+            continue;
+        }
+        let peer_offset = cert0.len() - 64 - 4;
+        let mismatched = resign(&cert0, &key, |body| body[peer_offset] ^= 1);
+        assert_eq!(
+            send(&mut raw, &mut source, &mismatched),
+            Err(Error::Conflict)
+        );
+        assert_eq!(source.membership_certificate(), None);
+        // A standby-signed contradiction of the frozen image ends activation.
+        assert!(source.finish(0).is_err());
+    }
+}
+
+/// Review F1: a local seat on the original device shares the original's
+/// ledger and records cert0 before the pair-link copy is pumped. The pair-link
+/// certificate is still accepted and exposed, and reported as an update.
+#[test]
+fn a_local_seat_recording_cert0_first_does_not_block_the_pair_link_certificate() {
+    let (descriptor, host, key, player, _image, mut source, mut sink) = activation_wire_pair(1);
+    let root = descriptor.root.clone();
+    let initial = source.initial_hash().unwrap();
+    let host_ack = CapabilityAck::sign(&root, 1, initial, 1, &host).unwrap();
+    source.acknowledge(host_ack.clone(), 0).unwrap();
+    source
+        .acknowledge(
+            CapabilityAck::sign(&root, 2, initial, 1, &player).unwrap(),
+            0,
+        )
+        .unwrap();
+    while let Some(wire) = source.poll_send(0).unwrap() {
+        sink.receive(&wire, 0).unwrap();
+    }
+    let (seq, armed, mut server) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+    let mut rest = vec![];
+    while let Some(wire) = server.poll_send(0).unwrap() {
+        if source.armed().is_some() {
+            rest.push(wire);
+        } else {
+            source.receive(&wire, 0).unwrap();
+        }
+    }
+    assert!(!rest.is_empty());
+    let (primary, client) = source.finish(0).unwrap();
+    assert_eq!(primary.membership_certificate(), None);
+    let cert0 = seq.membership_certificate(&key).unwrap();
+    let policy = EndpointPolicy {
+        descriptor: descriptor.clone(),
+        role: LinkRole::Original,
+        promotion: None,
+        membership: Some(cert0.clone()),
+    };
+    let binding = ConnectionBinding {
+        session: root.session,
+        descriptor: root.digest().unwrap(),
+        term: 0,
+        client: LinkRole::Player,
+        server: LinkRole::Original,
+    };
+    let near = Channel::new_bound(
+        &policy,
+        binding,
+        ChannelSide::Client,
+        root.host,
+        root.host,
+        [9; 32],
+    )
+    .unwrap();
+    let _seat = PlayerEndpoint::new_with_sender(
+        descriptor.clone(),
+        &armed,
+        &host_ack,
+        cert0.clone(),
+        near,
+        host.clone(),
+        primary.sender_sequence(),
+    )
+    .unwrap();
+    let mut original =
+        PrimaryActor::new(descriptor.clone(), primary, client, Activity::Idle, 0).unwrap();
+    let mut updates = vec![];
+    for wire in rest {
+        updates.push(original.receive_update(&wire, 0, &host).unwrap());
+    }
+    assert_eq!(
+        updates.last(),
+        Some(&Some(PrimaryUpdate::Membership(cert0.clone())))
+    );
+    assert_eq!(original.membership_certificate(), Some(&cert0));
+    drop(StandbyActor::new(descriptor, seq, server, 0).unwrap());
+}
+
+/// Review F2: `Committed` for receipt N is followed by `Membership` for N.
+#[test]
+fn membership_update_follows_committed_for_the_same_receipt() {
+    let (_, host, key, mut image, mut original, mut standby, _) = armed_actors(false);
+    for change in [true, false] {
+        image.logical_ms += 16;
+        let mut marks = original.primary().receipt().watermarks.clone();
+        if change {
+            image.members.retain(|m| m.player != 3);
+            image.inputs.remove(&3);
+            image.membership_revision += 1;
+            marks.iter_mut().find(|m| m.player == 3).unwrap().retired = true;
+        } else {
+            image.game[0] = 9;
+        }
+        let now = image.logical_ms;
+        original.prepare(image.clone(), marks, vec![]).unwrap();
+        while let Some(wire) = original.poll_send(now).unwrap() {
+            standby
+                .receive(&wire, now, &key, Activity::Advancing, |candidate, _, _| {
+                    Ok(candidate.image.clone())
+                })
+                .unwrap();
+        }
+        let mut updates = vec![];
+        while let Some(wire) = standby.poll_send(now).unwrap() {
+            if let Some(update) = original.receive_update(&wire, now, &host).unwrap() {
+                updates.push(update);
+            }
+        }
+        let certificate = standby.membership_certificate(&key).unwrap();
+        let [PrimaryUpdate::Event(PrimaryEvent::Committed { receipt, .. }), PrimaryUpdate::Membership(membership)] =
+            &updates[..]
+        else {
+            panic!("expected Committed then Membership, got {updates:?}");
+        };
+        assert_eq!(receipt, &certificate.receipt);
+        assert_eq!(membership, &certificate);
+        assert_eq!(original.membership_certificate(), Some(&certificate));
+        assert!(certificate.members.iter().all(|m| m.player != 3));
+    }
+}
+
+/// Review F3: a flood of identical delta retries coalesces onto one queued
+/// reply and never faults the standby; the retry reply carries the
+/// certificate as well as the receipt.
+#[test]
+fn identical_retry_floods_coalesce_and_the_retry_reply_carries_the_certificate() {
+    let (_, host, key, mut image, mut original, mut standby, cert0) =
+        armed_actors_sized(8 * 1024, false);
+    image.logical_ms += 16;
+    image.game[0] = 1;
+    let marks = original.primary().receipt().watermarks.clone();
+    original.prepare(image.clone(), marks, vec![]).unwrap();
+    let now = 16;
+    let mut kinds = vec![];
+    while let Some(wire) = original.poll_send(now).unwrap() {
+        kinds.push(Frame::decode(&wire).unwrap().kind);
+        standby
+            .receive(&wire, now, &key, Activity::Advancing, |candidate, _, _| {
+                Ok(candidate.image.clone())
+            })
+            .unwrap();
+    }
+    assert!(!kinds.is_empty());
+    assert!(kinds.iter().all(|kind| *kind == PacketKind::Delta));
+    // The first reply is lost.
+    while standby.poll_send(now).unwrap().is_some() {}
+    assert_eq!(original.membership_certificate(), Some(&cert0));
+    // Far more retries than the 64 KiB priority queue could hold uncoalesced.
+    let mut delivered = 0;
+    for at in now + 1..=now + 200 {
+        original.retry().unwrap();
+        while let Some(wire) = original.poll_send(at).unwrap() {
+            assert!(standby
+                .receive_classified(&wire, at, &key, Activity::Advancing, |_, _, _| {
+                    panic!("an identical delta retry is not restored again")
+                })
+                .unwrap()
+                .is_some());
+            delivered += 1;
+        }
+    }
+    assert_eq!(delivered, 200, "every retry reached the standby");
+    assert!(standby.failure().is_none());
+    let mut messages = std::collections::BTreeMap::new();
+    let flooded = now + 200;
+    let mut first = vec![];
+    while let Some(wire) = standby.poll_send(flooded).unwrap() {
+        let frame = Frame::decode(&wire).unwrap();
+        messages.insert(frame.transfer, frame.kind);
+        first.push(wire);
+    }
+    assert_eq!(
+        messages.values().copied().collect::<Vec<_>>(),
+        vec![PacketKind::Receipt, PacketKind::Control],
+        "one coalesced reply: receipt then certificate"
+    );
+    // Once that reply has gone, a later retry queues a fresh one.
+    let later = flooded + 100;
+    original.retry().unwrap();
+    let mut retried = false;
+    while let Some(wire) = original.poll_send(later).unwrap() {
+        retried |= standby
+            .receive(&wire, later, &key, Activity::Advancing, |_, _, _| {
+                panic!("no restore")
+            })
+            .unwrap()
+            .is_some();
+    }
+    assert!(retried);
+    let mut second = vec![];
+    while let Some(wire) = standby.poll_send(later).unwrap() {
+        second.push(wire);
+    }
+    assert!(second.len() >= 2);
+    let mut updates = vec![];
+    for wire in &first {
+        if let Some(update) = original.receive_update(wire, flooded, &host).unwrap() {
+            updates.push(update);
+        }
+    }
+    let certificate = standby.membership_certificate(&key).unwrap();
+    assert!(
+        matches!(
+            &updates[..],
+            [PrimaryUpdate::Event(PrimaryEvent::Committed { .. }), PrimaryUpdate::Membership(m)]
+                if m == &certificate
+        ),
+        "{updates:?}"
+    );
+    assert_eq!(original.membership_certificate(), Some(&certificate));
+    for wire in &second {
+        assert_eq!(original.receive_update(wire, later, &host).unwrap(), None);
+    }
+}
+
+/// Review F5: an unsigned certificate whose table fails before its signature
+/// is checked (duplicate member keys) is refused but does not end activation.
+#[test]
+fn an_unsigned_duplicate_key_certificate_does_not_latch_activation() {
+    let (descriptor, host, key, player, _, mut source, mut sink) = activation_wire_pair(1);
+    let root = &descriptor.root;
+    let initial = source.initial_hash().unwrap();
+    for (id, signer) in [(1, &host), (2, &player)] {
+        source
+            .acknowledge(
+                CapabilityAck::sign(root, id, initial, 1, signer).unwrap(),
+                0,
+            )
+            .unwrap();
+    }
+    while let Some(wire) = source.poll_send(0).unwrap() {
+        sink.receive(&wire, 0).unwrap();
+    }
+    let (seq, armed, _) = sink.arm(&key, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+    let cert0 = seq
+        .membership_certificate(&key)
+        .unwrap()
+        .encode(root)
+        .unwrap();
+    let host_key = host.public_key().to_bytes();
+    let player_key = player.public_key().to_bytes();
+    let at = cert0
+        .windows(32)
+        .position(|w| w == player_key)
+        .expect("player key in certificate");
+    let mut duplicate = cert0.clone();
+    duplicate[at..at + 32].copy_from_slice(&host_key);
+    assert_eq!(
+        MembershipCertificate::decode(root, &duplicate),
+        Err(Error::Conflict)
+    );
+    let policy = EndpointPolicy {
+        descriptor: descriptor.clone(),
+        role: LinkRole::Standby,
+        promotion: None,
+        membership: None,
+    };
+    let binding = ConnectionBinding {
+        session: root.session,
+        descriptor: root.digest().unwrap(),
+        term: 0,
+        client: LinkRole::Original,
+        server: LinkRole::Standby,
+    };
+    let mut raw = Channel::new(&policy, binding, ChannelSide::Server, root.host, [7; 32]).unwrap();
+    let mut send = |source: &mut ActivationSource, bytes: &[u8]| {
+        raw.enqueue(PacketKind::Control, bytes).unwrap();
+        let mut last = Ok(false);
+        while let Some(wire) = raw.poll_send(0).unwrap() {
+            last = source.receive(&wire, 0);
+        }
+        last
+    };
+    let armed_bytes = armed.encode(&root.context().unwrap()).unwrap();
+    assert_eq!(send(&mut source, &armed_bytes), Ok(true));
+    assert_eq!(send(&mut source, &duplicate), Err(Error::Conflict));
+    assert_eq!(send(&mut source, &cert0), Ok(false));
+    assert!(source.membership_certificate().is_some());
+    let (primary, _) = source.finish(0).unwrap();
+    assert!(primary.membership_certificate().is_some());
+}
+
+/// The reply to one identical delta retry, after the first reply was lost,
+/// carries the certificate as well as the receipt.
+#[test]
+fn a_single_retried_reply_still_carries_its_certificate() {
+    let (_, host, key, mut image, mut original, mut standby, _) =
+        armed_actors_sized(8 * 1024, false);
+    image.logical_ms += 16;
+    image.game[0] = 1;
+    let marks = original.primary().receipt().watermarks.clone();
+    original.prepare(image.clone(), marks, vec![]).unwrap();
+    while let Some(wire) = original.poll_send(16).unwrap() {
+        assert_eq!(Frame::decode(&wire).unwrap().kind, PacketKind::Delta);
+        standby
+            .receive(&wire, 16, &key, Activity::Advancing, |candidate, _, _| {
+                Ok(candidate.image.clone())
+            })
+            .unwrap();
+    }
+    while standby.poll_send(16).unwrap().is_some() {}
+    original.retry().unwrap();
+    while let Some(wire) = original.poll_send(17).unwrap() {
+        standby
+            .receive(&wire, 17, &key, Activity::Advancing, |_, _, _| {
+                panic!("no restore")
+            })
+            .unwrap();
+    }
+    let mut updates = vec![];
+    while let Some(wire) = standby.poll_send(17).unwrap() {
+        if let Some(update) = original.receive_update(&wire, 17, &host).unwrap() {
+            updates.push(update);
+        }
+    }
+    let certificate = standby.membership_certificate(&key).unwrap();
+    assert_eq!(
+        updates,
+        vec![
+            PrimaryUpdate::Event(PrimaryEvent::Committed {
+                receipt: certificate.receipt.clone(),
+                outputs: vec![],
+            }),
+            PrimaryUpdate::Membership(certificate.clone()),
+        ]
+    );
+}

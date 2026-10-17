@@ -40,6 +40,91 @@ The game must keep all ordinary game, UI and loopback effects frozen until that
 barrier completes. The Fray activation actors cannot freeze an external game
 object themselves.
 
+## Membership certificates on the pair link
+
+Only the standby can sign a `MembershipCertificate`, but the original needs one
+for `attach_player`, the games' player hosts, reconnect challenges and
+`update_session_membership`. The standby therefore sends its installed
+certificate to the original over the pair link as a Standby-to-Original
+`Control` record (control kind 9). This record is an addition to the
+unreleased migration v1 protocol; every existing record keeps its bytes.
+
+When it is sent: `ActivationSink::arm` queues the index-0 certificate directly
+after `Armed`, and `StandbyActor` queues the certificate for the exact receipt
+directly after every `Receipt` it sends, including an identical retry. The
+receipt and its certificate are queued together, all or nothing. It travels
+with every receipt, not only membership changes, because a reconnect challenge
+needs a certificate whose receipt is the original's current committed frontier.
+Receipt and Control share the priority queue, so the certificate always follows
+its own receipt.
+
+Identical retries coalesce: while the reply (receipt and certificate) for a
+receipt is still queued, a retry of the same candidate queues nothing more, so
+a retry flood cannot fill the standby's 64 KiB priority queue. If a reply still
+does not fit, the queue was filled by the original's traffic, so the refusal is
+a non-latching `StandbyFault::Frame`; an install that already happened stands,
+and the original's next retry resends the reply.
+
+Wire fields (the existing canonical certificate encoding, unchanged):
+
+| Field | Size |
+|---|---|
+| version | u8 = 1 |
+| session, descriptor digest | 16 + 32 bytes |
+| term | u64 = the receipt's term |
+| control kind | u8 = 9 |
+| sequence | u64 = receipt sequence + 1 |
+| receipt | u32 length + canonical receipt bytes, at most 1024 |
+| revision, next player | u64 + u64 |
+| members | u32 count (at most 8), then per member: u64 player, u8 seat, u8 key flag (+ 32-byte key), u32 logical peer |
+| signature | 64-byte standby Schnorr signature over the preceding bytes |
+
+The whole record is at most 2048 bytes. Installing a receipt already reserves
+two standby sequence numbers; the certificate uses the second, so sending it
+allocates nothing and moves no other record's sequence.
+
+`ActivationSource` (after `Armed`) and `PrimaryActor` accept it only when:
+decode authenticates the standby's signature, root binding, term/sequence
+frontier and size; its receipt equals the installed receipt (the armed receipt,
+or the primary's current receipt); and its revision, next player and member
+table equal the installed image's. A later certificate must also `follow` the
+previous one. Only after all of that does the shared replay ledger record the
+certificate and its embedded receipt under the standby key, like every other
+pair-link record. A certificate that another consumer of the same ledger (for
+example a local seat built on `Primary::sender_sequence`) already recorded is
+still accepted and exposed, without being recorded twice; different bytes at
+that sequence still conflict. An exact retry of the current certificate is a
+no-op. `ActivationSource::finish` moves an index-0 certificate into the
+`Primary`; one that arrives after the handoff is accepted by `PrimaryActor`.
+`Primary::membership_certificate` and `PrimaryActor::membership_certificate`
+expose the newest verified certificate.
+
+`PrimaryActor::receive_update` reports each newly accepted certificate as
+`PrimaryUpdate::Membership(certificate)`, and every other result as
+`PrimaryUpdate::Event(PrimaryEvent)`. The order is fixed: `Committed` for
+receipt N, then `Membership` for N on the following frame. Act on membership
+(attaching a player, a reconnect challenge, `update_session_membership`) when
+`Membership` arrives, not on `Committed`. `PrimaryActor::receive` keeps its
+signature and `PrimaryEvent` keeps its variants, so existing exhaustive matches
+still compile; through `receive`, an accepted certificate is exposed but
+reported as `None`. An index-0 certificate taken by `ActivationSource` produces
+no update; read it from the finished `Primary`.
+
+Refusals: another signer or a bad signature (`Unauthorized`); another session
+or term (decode refusal); over 2048 bytes (`Bounds`); a receipt not yet
+installed (`Gap`), an older one (`Stale`) or a different same-index one
+(`Conflict`); a table that differs from the installed image (`Conflict`); a
+replay of an older certificate (`Stale`); one before `Armed` (`Gap`). These are
+returned errors and record nothing; the same actor still accepts the genuine
+record. Two exceptions latch, following the existing rules: different bytes at
+a remembered standby sequence fault the shared replay session, and, during
+activation, a certificate whose standby signature verifies but which
+contradicts the armed receipt, the frozen initial image or the ledger ends the
+activation. A certificate refused before its signature is checked (for
+example, one with duplicate member keys) never ends the activation. A kind-9 record sent by the original to the standby is a
+`StandbyFault::Frame` and leaves the standby usable. The original does not
+apply certificates to its replay ledger's issuer roster; that remains as before.
+
 ## Normal inputs and publication
 
 `PrimaryActor` and `StandbyActor` own the replication/publication boundary. Stage
