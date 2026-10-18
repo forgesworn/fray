@@ -7045,6 +7045,52 @@ impl PrimaryAlive {
     }
 }
 
+/// A gap between two consecutive samples of a failure watch longer than this
+/// is the watcher's own stall, not silence from the peer.
+pub const STALL_GAP_MS: u64 = 100;
+
+/// "A local stall is not peer silence" (`docs/migration-v1.md`, "Local stalls
+/// and the failure watches"). Answers to probes sent before a watcher stall are
+/// read after it, too late for their 200 ms window. After a sampling gap over
+/// [`STALL_GAP_MS`] that began within 200 ms of the watcher's last probe, the
+/// watch reports no silence until a probe sent at the end of the gap has had
+/// its full 200 ms answer window. One deferral per fresh progress or answer,
+/// so a watcher that keeps stalling is still detected.
+#[derive(Clone, Copy, Debug)]
+struct StallGrace {
+    until: Option<u64>,
+    armed: bool,
+}
+impl StallGrace {
+    fn new() -> Self {
+        Self {
+            until: None,
+            armed: true,
+        }
+    }
+    /// One watch sample at `now_ms`; `last_ms` is the previous sample and
+    /// `fresh_ms` the last fresh evidence. Only a watcher that probed within
+    /// the answer window before the gap can have lost an answer to its stall,
+    /// and only a watch still live when the gap began is deferred: silence
+    /// already due stays due until fresh evidence arrives.
+    fn sample(&mut self, last_ms: u64, now_ms: u64, last_probe: Option<u64>, fresh_ms: u64) {
+        let probing = last_probe.is_some_and(|probe| last_ms - probe < 200);
+        let live = last_ms - fresh_ms < 200;
+        if self.armed && probing && live && now_ms - last_ms > STALL_GAP_MS {
+            self.until = Some(now_ms.saturating_add(200));
+            self.armed = false;
+        }
+    }
+    /// Fresh progress or a valid probe answer restores the allowance.
+    fn fresh(&mut self) {
+        self.until = None;
+        self.armed = true;
+    }
+    fn holds(&self, now_ms: u64) -> bool {
+        self.until.is_some_and(|until| now_ms < until)
+    }
+}
+
 /// Standby-side suspicion uses fresh challenges or newly installed proposals.
 /// The caller closes the very same sequencer on expiry; a response cannot
 /// reopen it and a duplicate proposal cannot keep it alive indefinitely.
@@ -7058,6 +7104,7 @@ pub struct PrimaryWatch {
     last_probe: Option<u64>,
     pending: VecDeque<(u64, PulseProbe)>,
     last_response: u64,
+    grace: StallGrace,
 }
 impl PrimaryWatch {
     pub fn new(root: Root, current: &Sequencer, tls: [u8; 32], now_ms: u64) -> Result<Self> {
@@ -7074,12 +7121,15 @@ impl PrimaryWatch {
             last_probe: None,
             pending: VecDeque::new(),
             last_response: 0,
+            grace: StallGrace::new(),
         })
     }
     fn advance(&mut self, now_ms: u64) -> Result<()> {
         if now_ms < self.last_ms {
             return Err(Error::Invalid("backwards primary watch clock"));
         }
+        self.grace
+            .sample(self.last_ms, now_ms, self.last_probe, self.fresh_ms);
         self.last_ms = now_ms;
         Ok(())
     }
@@ -7153,6 +7203,7 @@ impl PrimaryWatch {
         self.pending.remove(matched.ok_or(Error::Stale)?);
         self.last_response = response.sequence;
         self.fresh_ms = now_ms;
+        self.grace.fresh();
         Ok(())
     }
     /// Invoke only after installation, never after decoding/validating a proposal.
@@ -7165,13 +7216,14 @@ impl PrimaryWatch {
         if current.receipt().index > self.index {
             self.index = current.receipt().index;
             self.fresh_ms = now_ms;
+            self.grace.fresh();
         }
         Ok(())
     }
     pub fn expired(&mut self, current: &Sequencer, now_ms: u64) -> Result<bool> {
         self.advance(now_ms)?;
         self.current(current)?;
-        Ok(now_ms - self.fresh_ms >= 200)
+        Ok(now_ms - self.fresh_ms >= 200 && !self.grace.holds(now_ms))
     }
 }
 /// Client-side freshness; a valid pulse during play cannot conceal a stopped
@@ -7190,6 +7242,10 @@ pub struct ProgressWatch {
     last_pulse: u64,
     recovery: Option<u64>,
     promotion: Option<Promotion>,
+    grace: StallGrace,
+    // An idle Pulse refreshed the window since the last Idle -> Advancing
+    // refresh; each idle answer funds at most one.
+    idle_refresh: bool,
 }
 impl ProgressWatch {
     pub fn new(
@@ -7217,12 +7273,16 @@ impl ProgressWatch {
             last_pulse: 0,
             recovery: None,
             promotion: None,
+            grace: StallGrace::new(),
+            idle_refresh: false,
         })
     }
     fn advance(&mut self, now_ms: u64) -> Result<()> {
         if now_ms < self.last_ms {
             return Err(Error::Invalid("backwards liveness clock"));
         }
+        self.grace
+            .sample(self.last_ms, now_ms, self.last_probe, self.progress_ms);
         self.last_ms = now_ms;
         Ok(())
     }
@@ -7234,7 +7294,7 @@ impl ProgressWatch {
             } else {
                 WatchStatus::Recovering
             }
-        } else if now_ms - self.progress_ms >= 200 {
+        } else if now_ms - self.progress_ms >= 200 && !self.grace.holds(now_ms) {
             WatchStatus::Paused
         } else {
             WatchStatus::Live
@@ -7243,6 +7303,19 @@ impl ProgressWatch {
     pub fn set_activity(&mut self, activity: Activity) -> Result<()> {
         if activity == Activity::Recovering {
             return Err(Error::Invalid("recovery requires signed promotion"));
+        }
+        // Play resuming after an idle phase starts a fresh no-progress window
+        // at the watch's latest sample, so the first batch is not convicted
+        // at once. This is local, not peer evidence: no stall deferral is
+        // restored. One refresh per idle answer, and only while still live,
+        // so toggling activity can neither sustain nor withdraw silence.
+        if self.activity == Activity::Idle
+            && activity == Activity::Advancing
+            && self.idle_refresh
+            && self.last_ms - self.progress_ms < 200
+        {
+            self.progress_ms = self.last_ms;
+            self.idle_refresh = false;
         }
         self.activity = activity;
         Ok(())
@@ -7314,6 +7387,7 @@ impl ProgressWatch {
         let progress = self.accept_frontier(frontier)?;
         if progress {
             self.progress_ms = now_ms;
+            self.grace.fresh();
         }
         Ok(())
     }
@@ -7332,8 +7406,13 @@ impl ProgressWatch {
         }
         let matched = matched.ok_or(Error::Stale)?;
         let progress = self.accept_frontier(&pulse.frontier)?;
-        if progress || (self.activity == Activity::Idle && pulse.activity == Activity::Idle) {
+        let idle = self.activity == Activity::Idle && pulse.activity == Activity::Idle;
+        if progress || idle {
             self.progress_ms = now_ms;
+            self.grace.fresh();
+        }
+        if idle {
+            self.idle_refresh = true;
         }
         self.pending.remove(matched);
         self.last_pulse = pulse.sequence;
@@ -7395,6 +7474,7 @@ impl ProgressWatch {
         self.accept_frontier(&resume.membership.receipt)?;
         self.recovery = None;
         self.progress_ms = now_ms;
+        self.grace.fresh();
         Ok(())
     }
 }

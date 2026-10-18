@@ -169,6 +169,83 @@ operations privately and reduce the selected prefix if native reply expansion
 would exceed a complete candidate's bounds. Local UI mutations must use the same
 journal and publication boundary as remote commands.
 
+## Local stalls and the failure watches
+
+Two watches decide that the peer is gone. `PrimaryWatch` is the standby's watch
+on the original. Its `expired` leads to term close and promotion, which cannot
+be undone. `ProgressWatch` is the original's watch on the standby. Its `status`
+reports `Paused`, which pauses the armed room. Both declare silence 200 ms
+after the last fresh evidence. For `PrimaryWatch` that is a newly installed
+proposal or a valid `PrimaryAlive`. For `ProgressWatch` it is a commit that
+advances the game clock, or an idle Pulse while both sides are idle. A probe
+answer counts only within 200 ms of its probe, and probes are paced 50 ms
+apart.
+
+**A local stall is not peer silence.** Under CPU load a watcher can go 100 to
+300 ms between frames. The peer answers the probes the watcher sent before the
+stall, but the watcher reads those answers after it, more than 200 ms after the
+probe, and refuses them. Without a rule for this, the watcher would declare a
+healthy peer silent. That would mean a false pause, or a false takeover.
+
+Each watch therefore notes the gap between consecutive samples. Every call
+that passes the runner's clock to the watch is a sample: `expired` or
+`status`, `probe`, an answer, a commit or installation, and the actors' frame
+intake. The rule:
+
+- A gap over `STALL_GAP_MS` (100 ms) is a stall if the watcher sent a probe
+  within the 200 ms answer window before the gap began, and the watch was
+  still live then (less than 200 ms since fresh evidence). A watch that was
+  not probing could not have lost an answer to its stall. A watch that had
+  already reported silence keeps reporting it until fresh evidence arrives: a
+  stall never withdraws an expiry or a `Paused`.
+- After such a stall, the watch reports neither expiry nor `Paused` before
+  `gap_end + 200 ms`. Here `gap_end` is the first sample after the gap. This
+  gives a probe sent at the end of the stall its full answer window.
+- The watch grants at most one deferral per piece of fresh evidence, as listed
+  above. Fresh evidence restores the allowance. A valid Pulse during play that
+  does not advance the game clock is not fresh, and it does not restore the
+  allowance either.
+
+The threshold, the probe pacing, the answer window and what counts as fresh
+are as before. With no gap over 100 ms between samples, behaviour is identical
+to before. A runner that samples sparsely, with gaps over 100 ms (for example
+at about 10 Hz), has every such gap treated as a stall, and so detects silence
+up to 200 ms later.
+
+**Worst-case added detection latency.** Let `F` be the last fresh evidence and
+`S` the first sample after the first qualifying gap since `F`. Silence is
+reported at the first sample at or after `max(F + 200, S + 200)`. The added
+latency is at most 200 ms plus one sampling gap. A peer that goes silent across
+a single stall is detected 200 ms after the watcher's first post-stall sample.
+A watcher that keeps stalling never gets fresh answers, because every answer is
+read more than 200 ms after its probe, so it still detects silence. With
+samples every 250 ms after `F`, the first gap defers to `F + 450` and the
+second sample, at `F + 500`, reports silence (today: `F + 250`).
+
+The gap is measured between samples, so runners must sample every frame, as
+the game runtimes do with `poll`, `expired` and `status`. A runner that
+samples rarely turns each jump of its clock into a stall. If it was probing
+just before the jump, the jump defers silence by up to 200 ms. Tests that jump
+the clock to simulate elapsed time either sample every frame up to the jump or
+do not probe just before it.
+
+The deferral ends 200 ms after the first sample after the gap, whether or not
+a probe went out. Runners must therefore probe in the same poll in which they
+sample. A probe sent later in the deferral has less than its full answer window
+before the deferral ends.
+
+**Play resuming after idle.** `ProgressWatch::set_activity` going from `Idle`
+to `Advancing` starts a fresh no-progress window at the watch's latest sample.
+Without it, the first staged batch after a long idle phase (lobby, results, a
+switch window) would be judged against idle evidence that was up to one probe
+interval old. This is a local event, not peer evidence, so it does not restore
+the stall deferral. Each idle answer funds at most one such refresh, and only
+while the watch is still live. Toggling `Idle` and `Advancing` therefore
+cannot keep a dead standby live: silence is reported at most 400 ms after the
+last idle answer. A watch that is already `Paused` does not turn `Live` at
+match start. `PrimaryWatch` has no activity state; the standby's watch
+needs no such rule.
+
 ## Replacement connections and recovery
 
 After cohort sealing, typed recovery enters the mandatory `Security` phase.

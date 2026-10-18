@@ -2624,6 +2624,7 @@ fn idle_liveness_requires_fresh_challenges_on_the_current_tls_connection() {
     forged.activity = Activity::Advancing;
     assert!(watch.pulse(&forged, 60).is_err());
     watch.pulse(&pulse, 60).unwrap();
+    tick_progress(&mut watch, 60, 259);
     assert_eq!(watch.status(259).unwrap(), WatchStatus::Live);
     assert!(watch.pulse(&pulse, 260).is_err());
     assert_eq!(watch.status(260).unwrap(), WatchStatus::Paused);
@@ -2636,6 +2637,7 @@ fn idle_liveness_requires_fresh_challenges_on_the_current_tls_connection() {
     assert_eq!(watch.status(262).unwrap(), WatchStatus::Live);
     let late_probe = watch.probe(312).unwrap();
     let late = Pulse::respond(&root, &seq, &late_probe, [9; 32], Activity::Idle, 3, &key).unwrap();
+    tick_progress(&mut watch, 312, 512);
     assert!(watch.pulse(&late, 512).is_err());
     assert_eq!(watch.status(512).unwrap(), WatchStatus::Paused);
     assert!(watch.status(511).is_err());
@@ -2669,6 +2671,7 @@ fn live_pulses_and_ack_only_commits_cannot_mask_an_active_game_stall() {
     let staged = seq.stage(candidate).unwrap();
     seq.install(staged, &key).unwrap();
     watch.committed(seq.receipt(), 201).unwrap();
+    tick_progress(&mut watch, 201, 400);
     assert_eq!(watch.status(400).unwrap(), WatchStatus::Live);
     watch.committed(seq.receipt(), 401).unwrap();
     assert_eq!(watch.status(401).unwrap(), WatchStatus::Paused);
@@ -2757,6 +2760,7 @@ fn standby_primary_watch_accepts_fresh_responses_but_replay_cannot_delay_fencing
     watch.probe(50).unwrap();
     watch.probe(100).unwrap();
     watch.response(&seq, &response, 150).unwrap();
+    tick_primary(&mut watch, &seq, 150, 349);
     assert!(!watch.expired(&seq, 349).unwrap());
     assert!(watch.response(&seq, &response, 350).is_err());
     assert!(watch.expired(&seq, 350).unwrap());
@@ -11276,4 +11280,359 @@ fn a_probe_flood_that_fills_the_send_queue_is_a_frame_fault_and_the_retry_is_ans
             PrimaryUpdate::Membership(certificate),
         ]
     );
+}
+
+/// The 50 ms sample times strictly between `from` and `to`. A runner samples
+/// its failure watch every frame; a test clock that jumps further than
+/// `STALL_GAP_MS` between samples models a watcher stall instead.
+fn frames(from: u64, to: u64) -> impl Iterator<Item = u64> {
+    (from + 50..to).step_by(50)
+}
+fn tick_progress(watch: &mut ProgressWatch, from: u64, to: u64) {
+    for now in frames(from, to) {
+        watch.status(now).unwrap();
+    }
+}
+fn tick_primary(watch: &mut PrimaryWatch, seq: &Sequencer, from: u64, to: u64) {
+    for now in frames(from, to) {
+        watch.expired(seq, now).unwrap();
+    }
+}
+fn tick_standby(standby: &mut StandbyActor, from: u64, to: u64) {
+    for now in frames(from, to) {
+        standby.expired(now).unwrap();
+    }
+}
+fn tick_original(original: &mut PrimaryActor, from: u64, to: u64) {
+    for now in frames(from, to) {
+        original.status(now).unwrap();
+    }
+}
+
+// "A local stall is not peer silence" (docs/migration-v1.md, "Local stalls and
+// the failure watches"). The watcher stalls from 100 ms to 400 ms.
+
+fn idle_answer(root: &Root, seq: &Sequencer, key: &Keys, probe: &PulseProbe, n: u64) -> Pulse {
+    Pulse::respond(root, seq, probe, [9; 32], Activity::Idle, n, key).unwrap()
+}
+
+/// The original's watch on the standby, fresh at 60 ms, probing at 100 ms
+/// just before its stall.
+fn stalled_progress_watch() -> (Root, Sequencer, Keys, ProgressWatch, PulseProbe) {
+    let (root, seq, key, mut watch) = pulse_fixture(Activity::Idle);
+    let first = watch.probe(50).unwrap();
+    watch
+        .pulse(&idle_answer(&root, &seq, &key, &first, 1), 60)
+        .unwrap();
+    let before = watch.probe(100).unwrap();
+    (root, seq, key, watch, before)
+}
+
+fn primary_watch_fixture() -> (Root, Sequencer, Primary, Keys, PrimaryWatch) {
+    let (descriptor, host_key, standby_key, _) = descriptor_fixture();
+    let root = descriptor.root;
+    let seq = Sequencer::arm(
+        root.context().unwrap(),
+        vec![0],
+        100,
+        marks(0, 0),
+        &standby_key,
+    )
+    .unwrap();
+    let primary = Primary::armed(
+        root.context().unwrap(),
+        seq.image().to_vec(),
+        seq.receipt().clone(),
+    )
+    .unwrap();
+    let watch = PrimaryWatch::new(root.clone(), &seq, [3; 32], 0).unwrap();
+    (root, seq, primary, host_key, watch)
+}
+
+/// The standby's watch on the original, fresh at 10 ms, probing at 100 ms
+/// just before its stall.
+fn stalled_primary_watch() -> (Root, Sequencer, Primary, Keys, PrimaryWatch, PulseProbe) {
+    let (root, seq, primary, host, mut watch) = primary_watch_fixture();
+    let first = watch.probe(0).unwrap();
+    let alive = PrimaryAlive::respond(&root, &primary, &first, [3; 32], 1, &host).unwrap();
+    watch.response(&seq, &alive, 10).unwrap();
+    tick_primary(&mut watch, &seq, 10, 100);
+    let before = watch.probe(100).unwrap();
+    (root, seq, primary, host, watch, before)
+}
+
+#[test]
+fn progress_watch_stall_with_a_live_standby_does_not_pause() {
+    let (root, seq, key, mut watch, before) = stalled_progress_watch();
+    // Answered during the stall, read after it: 300 ms after the probe.
+    let late = idle_answer(&root, &seq, &key, &before, 2);
+    assert_eq!(watch.pulse(&late, 400), Err(Error::Stale));
+    assert_eq!(watch.status(400).unwrap(), WatchStatus::Live);
+    let after = watch.probe(400).unwrap();
+    assert_eq!(watch.status(420).unwrap(), WatchStatus::Live);
+    watch
+        .pulse(&idle_answer(&root, &seq, &key, &after, 3), 420)
+        .unwrap();
+    tick_progress(&mut watch, 420, 619);
+    assert_eq!(watch.status(619).unwrap(), WatchStatus::Live);
+    // The fresh answer restored ordinary detection: no deferral is left over.
+    assert_eq!(watch.status(620).unwrap(), WatchStatus::Paused);
+}
+
+#[test]
+fn progress_watch_stall_with_a_silent_standby_pauses_one_window_after_the_stall() {
+    // No stall: Paused exactly 200 ms after the last fresh answer, as before.
+    let (_, _, _, mut steady, _) = stalled_progress_watch();
+    tick_progress(&mut steady, 100, 260);
+    assert_eq!(steady.status(259).unwrap(), WatchStatus::Live);
+    assert_eq!(steady.status(260).unwrap(), WatchStatus::Paused);
+
+    let (_, _, _, mut watch, _) = stalled_progress_watch();
+    assert_eq!(watch.status(400).unwrap(), WatchStatus::Live);
+    for now in frames(399, 600) {
+        watch.probe(now).unwrap();
+        assert_eq!(watch.status(now).unwrap(), WatchStatus::Live);
+    }
+    assert_eq!(watch.status(599).unwrap(), WatchStatus::Live);
+    assert_eq!(watch.status(600).unwrap(), WatchStatus::Paused);
+}
+
+#[test]
+fn progress_watch_that_keeps_stalling_still_pauses_for_a_silent_standby() {
+    let (_, _, _, mut watch, _) = stalled_progress_watch();
+    // Fresh at 60 ms, then samples 250 ms apart. The first gap defers to
+    // 510 ms; the second gap has no deferral left: Paused at 560 ms.
+    assert_eq!(watch.status(310).unwrap(), WatchStatus::Live);
+    watch.probe(310).unwrap();
+    assert_eq!(watch.status(560).unwrap(), WatchStatus::Paused);
+    watch.probe(560).unwrap();
+    assert_eq!(watch.status(810).unwrap(), WatchStatus::Paused);
+}
+
+#[test]
+fn primary_watch_stall_with_a_live_original_does_not_expire() {
+    let (root, seq, primary, host, mut watch, before) = stalled_primary_watch();
+    let late = PrimaryAlive::respond(&root, &primary, &before, [3; 32], 2, &host).unwrap();
+    assert_eq!(watch.response(&seq, &late, 400), Err(Error::Stale));
+    assert!(!watch.expired(&seq, 400).unwrap());
+    let after = watch.probe(400).unwrap();
+    assert!(!watch.expired(&seq, 420).unwrap());
+    let alive = PrimaryAlive::respond(&root, &primary, &after, [3; 32], 3, &host).unwrap();
+    watch.response(&seq, &alive, 420).unwrap();
+    tick_primary(&mut watch, &seq, 420, 619);
+    assert!(!watch.expired(&seq, 619).unwrap());
+    assert!(watch.expired(&seq, 620).unwrap());
+}
+
+#[test]
+fn primary_watch_stall_with_a_silent_original_expires_one_window_after_the_stall() {
+    let (_, seq, _, _, mut steady, _) = stalled_primary_watch();
+    tick_primary(&mut steady, &seq, 100, 210);
+    assert!(!steady.expired(&seq, 209).unwrap());
+    assert!(steady.expired(&seq, 210).unwrap());
+
+    let (_, seq, _, _, mut watch, _) = stalled_primary_watch();
+    assert!(!watch.expired(&seq, 400).unwrap());
+    for now in frames(399, 600) {
+        watch.probe(now).unwrap();
+        assert!(!watch.expired(&seq, now).unwrap());
+    }
+    assert!(!watch.expired(&seq, 599).unwrap());
+    assert!(watch.expired(&seq, 600).unwrap());
+}
+
+#[test]
+fn primary_watch_that_keeps_stalling_still_expires_for_a_silent_original() {
+    let (_, seq, _, _, mut watch) = primary_watch_fixture();
+    // Fresh at creation (0 ms) and probing, then samples 250 ms apart:
+    // deferred to 450 ms at the first, expired at the second (500 ms).
+    watch.probe(0).unwrap();
+    assert!(!watch.expired(&seq, 250).unwrap());
+    watch.probe(250).unwrap();
+    assert!(watch.expired(&seq, 500).unwrap());
+}
+
+fn original_to_standby(
+    original: &mut PrimaryActor,
+    standby: &mut StandbyActor,
+    key: &Keys,
+    sent: u64,
+    read: u64,
+) -> Vec<Result<Option<Receipt>>> {
+    let mut results = Vec::new();
+    while let Some(wire) = original.poll_send(sent).unwrap() {
+        results.push(
+            standby.receive(&wire, read, key, Activity::Idle, |_, _, _| {
+                panic!("liveness traffic cannot restore")
+            }),
+        );
+    }
+    results
+}
+fn standby_to_original(
+    standby: &mut StandbyActor,
+    original: &mut PrimaryActor,
+    host: &Keys,
+    sent: u64,
+    read: u64,
+) -> Vec<Result<Option<PrimaryUpdate>>> {
+    let mut results = Vec::new();
+    while let Some(wire) = standby.poll_send(sent).unwrap() {
+        results.push(original.receive_update(&wire, read, host));
+    }
+    results
+}
+
+#[test]
+fn actor_stall_with_a_live_peer_neither_promotes_nor_pauses() {
+    // The standby stalls: its pre-stall probe's answer is read 300 ms late.
+    let (_, host, key, mut original, mut standby, _) = replication_actors();
+    standby.probe(0).unwrap();
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 0, 5)
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert!(
+        original_to_standby(&mut original, &mut standby, &key, 5, 10)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_standby(&mut standby, 10, 100);
+    standby.probe(100).unwrap();
+    standby_to_original(&mut standby, &mut original, &host, 100, 105);
+    let late = original_to_standby(&mut original, &mut standby, &key, 110, 400);
+    assert_eq!(late, vec![Err(Error::Stale)]);
+    assert!(!standby.expired(400).unwrap());
+    standby.probe(400).unwrap();
+    standby_to_original(&mut standby, &mut original, &host, 400, 405);
+    assert!(
+        original_to_standby(&mut original, &mut standby, &key, 410, 420)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_standby(&mut standby, 420, 619);
+    assert!(!standby.expired(619).unwrap());
+    let refused = standby.begin_recovery(&key, 619, false);
+    assert!(matches!(refused, Err(Error::Stale)));
+
+    // The original stalls: its pre-stall probe's Pulse is read 300 ms late.
+    let (_, host, key, mut original, mut standby, _) = replication_actors();
+    original.set_activity(Activity::Idle).unwrap();
+    original.probe(0).unwrap();
+    original_to_standby(&mut original, &mut standby, &key, 0, 5);
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 5, 10)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_original(&mut original, 10, 100);
+    assert_eq!(original.status(100).unwrap(), WatchStatus::Live);
+    original.probe(100).unwrap();
+    original_to_standby(&mut original, &mut standby, &key, 100, 105);
+    let late = standby_to_original(&mut standby, &mut original, &host, 110, 400);
+    assert_eq!(late, vec![Err(Error::Stale)]);
+    assert_eq!(original.status(400).unwrap(), WatchStatus::Live);
+    original.probe(400).unwrap();
+    original_to_standby(&mut original, &mut standby, &key, 400, 405);
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 410, 420)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_original(&mut original, 420, 619);
+    assert_eq!(original.status(619).unwrap(), WatchStatus::Live);
+    assert_eq!(original.status(620).unwrap(), WatchStatus::Paused);
+}
+
+#[test]
+fn resuming_play_after_a_long_idle_phase_starts_a_fresh_progress_window() {
+    let (root, mut seq, key, mut watch) = pulse_fixture(Activity::Idle);
+    let mut answered = 0;
+    let mut pending = None;
+    // Idle for 1 s: a probe every 100 ms, answered 20 ms later; the last idle
+    // answer is at 920 ms. Sampled every 10 ms throughout.
+    for now in (0..=1150).step_by(10) {
+        if now < 1000 && now % 100 == 0 {
+            pending = Some(watch.probe(now).unwrap());
+        }
+        if now < 1000 && now % 100 == 20 {
+            answered += 1;
+            let probe = pending.take().unwrap();
+            watch
+                .pulse(&idle_answer(&root, &seq, &key, &probe, answered), now)
+                .unwrap();
+        }
+        if now == 1000 {
+            watch.set_activity(Activity::Advancing).unwrap();
+        }
+        if now == 1150 {
+            // The first batch of play, answered 150 ms after the switch.
+            let candidate = seq.next(vec![1], 116, marks(0, 0), vec![]).unwrap();
+            let staged = seq.stage(candidate).unwrap();
+            seq.install(staged, &key).unwrap();
+            watch.committed(seq.receipt(), now).unwrap();
+        }
+        assert_eq!(watch.status(now).unwrap(), WatchStatus::Live, "at {now} ms");
+    }
+    // Without further batches play still pauses 200 ms after the batch.
+    tick_progress(&mut watch, 1150, 1350);
+    assert_eq!(watch.status(1349).unwrap(), WatchStatus::Live);
+    assert_eq!(watch.status(1350).unwrap(), WatchStatus::Paused);
+}
+
+#[test]
+fn a_stall_after_reported_silence_cannot_withdraw_it() {
+    // The original reports Paused at 260 ms, then stalls from 300 to 450 ms.
+    let (_, _, _, mut watch, _) = stalled_progress_watch();
+    for now in (150..=300).step_by(50) {
+        watch.probe(now).unwrap();
+        let expected = if now < 260 {
+            WatchStatus::Live
+        } else {
+            WatchStatus::Paused
+        };
+        assert_eq!(watch.status(now).unwrap(), expected);
+    }
+    assert_eq!(watch.status(450).unwrap(), WatchStatus::Paused);
+    for now in frames(449, 700) {
+        watch.probe(now).unwrap();
+        assert_eq!(watch.status(now).unwrap(), WatchStatus::Paused);
+    }
+
+    // The standby's watch expired at 250 ms stays expired across a stall.
+    let (_, seq, _, _, mut watch, _) = stalled_primary_watch();
+    for now in (150..=250).step_by(50) {
+        watch.probe(now).unwrap();
+        assert_eq!(watch.expired(&seq, now).unwrap(), now >= 210);
+    }
+    assert!(watch.expired(&seq, 400).unwrap());
+    watch.probe(400).unwrap();
+    assert!(watch.expired(&seq, 450).unwrap());
+}
+
+#[test]
+fn toggling_activity_cannot_keep_a_dead_standby_live() {
+    // The last idle answer is at 60 ms; then the standby is dead. The original
+    // toggles Idle/Advancing every 10 ms: one refresh, to its latest sample
+    // (100 ms), then Paused at 300 ms. Bound: last idle answer + 400 ms.
+    let (_, _, _, mut watch, _) = stalled_progress_watch();
+    for now in (110..=1000).step_by(10) {
+        watch.set_activity(Activity::Idle).unwrap();
+        watch.set_activity(Activity::Advancing).unwrap();
+        let expected = if now < 300 {
+            WatchStatus::Live
+        } else {
+            WatchStatus::Paused
+        };
+        assert_eq!(watch.status(now).unwrap(), expected, "at {now} ms");
+    }
+
+    // A watch already Paused in Idle does not flip Live at match start.
+    let (_, _, _, mut watch, _) = stalled_progress_watch();
+    tick_progress(&mut watch, 100, 300);
+    assert_eq!(watch.status(300).unwrap(), WatchStatus::Paused);
+    watch.set_activity(Activity::Advancing).unwrap();
+    assert_eq!(watch.status(300).unwrap(), WatchStatus::Paused);
+    assert_eq!(watch.status(310).unwrap(), WatchStatus::Paused);
 }
