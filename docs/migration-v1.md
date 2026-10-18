@@ -246,6 +246,16 @@ last idle answer. A watch that is already `Paused` does not turn `Live` at
 match start. `PrimaryWatch` has no activity state; the standby's watch
 needs no such rule.
 
+**The survivor collection window.** `Recovery` collects survivors for 250 ms
+from promotion. The same rule applies to it, because a survivor turned away
+there becomes a departure. Every `Recovery` call that takes the clock is a
+sample. A gap over `STALL_GAP_MS` that began while the window was open and a
+resume challenge was unanswered holds the window open (`challenge`, `accept`
+and `seal`) until `gap_end + 200 ms`, once per recovery. Without a stall, a
+proof read at 250 ms or later is still refused. Local members (restored bots
+and the standby's own seat) are not reached over a control path, so
+`retain_local` has no time limit; it only has to come before `seal`.
+
 ### Late frames that are ignored
 
 Two kinds of late frame are harmless. They are ignored and counted, and the

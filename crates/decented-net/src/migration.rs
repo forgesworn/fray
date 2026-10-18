@@ -4593,6 +4593,8 @@ pub struct Recovery {
     started: u64,
     security_anchor: u64,
     last_ms: u64,
+    /// Holds the survivor collection window open across one local stall.
+    grace: StallGrace,
     applications: usize,
     departed: bool,
 }
@@ -4673,6 +4675,7 @@ impl Recovery {
             started: now_ms,
             security_anchor: now_ms,
             last_ms: now_ms,
+            grace: StallGrace::new(),
             applications: 0,
             departed: false,
         })
@@ -4723,12 +4726,25 @@ impl Recovery {
         if now_ms < self.last_ms {
             return Err(Error::Invalid("backwards recovery wall clock"));
         }
+        // A local stall is not peer silence: proofs that arrived during it
+        // are read after it. Only a stall that began while the window was
+        // open and a challenge was unanswered can have hidden one. The
+        // window then stays open until 200 ms after the stall, once.
+        if self.phase == RecoveryPhase::Collecting && self.collecting(self.last_ms) {
+            let probe = (!self.gate.pending.is_empty()).then_some(self.last_ms);
+            self.grace.sample(self.last_ms, now_ms, probe, self.last_ms);
+        }
         self.last_ms = now_ms;
         if self.phase != RecoveryPhase::Ready && now_ms.saturating_sub(self.started) >= 5000 {
             self.phase = RecoveryPhase::Failed;
             return Err(Error::Invalid("recovery deadline"));
         }
         Ok(())
+    }
+    /// The 250 ms survivor collection window from promotion, extended
+    /// across at most one local stall.
+    fn collecting(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.started) < 250 || self.grace.holds(now_ms)
     }
     fn require(&self, phase: RecoveryPhase) -> Result<()> {
         self.sequencer.sender.replay.live()?;
@@ -4749,7 +4765,7 @@ impl Recovery {
     ) -> Result<ResumeChallenge> {
         self.poll(now_ms)?;
         self.require(RecoveryPhase::Collecting)?;
-        if now_ms.saturating_sub(self.started) >= 250 {
+        if !self.collecting(now_ms) {
             return Err(Error::Closed);
         }
         self.gate
@@ -4764,7 +4780,7 @@ impl Recovery {
     ) -> Result<()> {
         self.poll(now_ms)?;
         self.require(RecoveryPhase::Collecting)?;
-        if now_ms.saturating_sub(self.started) >= 250 {
+        if !self.collecting(now_ms) {
             return Err(Error::Closed);
         }
         self.gate
@@ -4774,6 +4790,9 @@ impl Recovery {
         Ok(())
     }
     /// Only restored bots or this standby's retained player can be local.
+    /// They are not reached over a control path, so no peer can be late and
+    /// the collection window does not apply: retain them any time before
+    /// `seal`.
     pub fn retain_local(
         &mut self,
         player: u64,
@@ -4783,9 +4802,6 @@ impl Recovery {
     ) -> Result<()> {
         self.poll(now_ms)?;
         self.require(RecoveryPhase::Collecting)?;
-        if now_ms.saturating_sub(self.started) >= 250 {
-            return Err(Error::Closed);
-        }
         let key = resume_member(&self.descriptor.root, self.gate.membership.as_ref(), player)?.key;
         if key.is_some_and(|key| key != self.descriptor.root.standby) {
             return Err(Error::Unauthorized);
@@ -4829,8 +4845,7 @@ impl Recovery {
     pub fn seal(&mut self, now_ms: u64) -> Result<bool> {
         self.poll(now_ms)?;
         self.require(RecoveryPhase::Collecting)?;
-        if self.survivors.len() != self.histories.len() && now_ms.saturating_sub(self.started) < 250
-        {
+        if self.survivors.len() != self.histories.len() && self.collecting(now_ms) {
             return Ok(false);
         }
         for &player in self.histories.keys() {
@@ -11936,6 +11951,18 @@ mod raw_recovery_engine_tests {
         )
     }
     fn recovery_fixture(tail: u64, initial_outputs: bool) -> (Recovery, Descriptor, Keys, Keys) {
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(initial_outputs);
+        let challenge = recovery
+            .challenge(20, [2; 32], 2, player.public_key().to_bytes(), &standby, 0)
+            .unwrap();
+        let proof =
+            ResumeProof::sign(&descriptor.root, &challenge, [2; 32], 0, tail, 1, &player).unwrap();
+        recovery.accept(20, [2; 32], &proof, 0).unwrap();
+        recovery.retain_local(3, 0, 0, 0).unwrap();
+        (recovery, descriptor, standby, player)
+    }
+    /// A recovery promoted at 0 that has collected nobody yet.
+    fn collecting_fixture(initial_outputs: bool) -> (Recovery, Descriptor, Keys, Keys) {
         let (mut descriptor, _host, standby, player) = descriptor_fixture();
         descriptor.consent(&standby).unwrap();
         let marks = descriptor
@@ -11983,15 +12010,8 @@ mod raw_recovery_engine_tests {
             .iter()
             .map(|m| (m.player, HandledInputs::default()))
             .collect();
-        let mut recovery =
+        let recovery =
             Recovery::begin(descriptor.clone(), sequencer, histories, &standby, 0).unwrap();
-        let challenge = recovery
-            .challenge(20, [2; 32], 2, player.public_key().to_bytes(), &standby, 0)
-            .unwrap();
-        let proof =
-            ResumeProof::sign(&descriptor.root, &challenge, [2; 32], 0, tail, 1, &player).unwrap();
-        recovery.accept(20, [2; 32], &proof, 0).unwrap();
-        recovery.retain_local(3, 0, 0, 0).unwrap();
         (recovery, descriptor, standby, player)
     }
     #[test]
@@ -12122,6 +12142,80 @@ mod raw_recovery_engine_tests {
                 cuts
             );
         }
+    }
+    /// Challenge player 2 at `at` and sign its proof, as the survivor would.
+    fn challenge_survivor(
+        recovery: &mut Recovery,
+        descriptor: &Descriptor,
+        standby: &Keys,
+        player: &Keys,
+        at: u64,
+    ) -> ResumeProof {
+        let challenge = recovery
+            .challenge(20, [2; 32], 2, player.public_key().to_bytes(), standby, at)
+            .unwrap();
+        ResumeProof::sign(&descriptor.root, &challenge, [2; 32], 0, 0, 1, player).unwrap()
+    }
+    #[test]
+    fn a_survivor_proof_read_after_a_local_stall_is_retained() {
+        // The proof arrives at about 60 ms, but the standby stalls from 10 ms
+        // to 300 ms and only reads it then. A local stall is not peer silence.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 10);
+        assert_eq!(recovery.accept(20, [2; 32], &proof, 300), Ok(()));
+        assert!(recovery.survivors.contains_key(&2));
+        recovery.retain_local(3, 0, 0, 300).unwrap();
+        // The dead host never answers, so the extended window runs out.
+        assert!(!recovery.seal(300).unwrap());
+        assert!(recovery.seal(500).unwrap());
+        assert_eq!(
+            recovery.survivors.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+    #[test]
+    fn local_members_are_retained_when_the_first_drive_is_late() {
+        // The standby samples every frame, but its first drive after
+        // promotion reaches the local bot only at 300 ms.
+        let (mut recovery, _descriptor, _standby, _player) = collecting_fixture(false);
+        for now in (50..=300).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
+        assert_eq!(recovery.retain_local(3, 0, 0, 300), Ok(()));
+        assert_eq!(recovery.seal(300), Ok(true));
+        assert_ne!(recovery.phase(), RecoveryPhase::Failed);
+        assert_eq!(
+            recovery.survivors.keys().copied().collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+    #[test]
+    fn a_survivor_proof_that_arrives_after_the_window_is_refused() {
+        // No local stall: the standby samples every 50 ms and the proof is
+        // simply late.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 0);
+        for now in (50..=200).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
+        assert_eq!(
+            recovery.accept(20, [2; 32], &proof, 250),
+            Err(Error::Closed)
+        );
+        assert!(!recovery.survivors.contains_key(&2));
+    }
+    #[test]
+    fn the_collection_window_extends_for_one_local_stall_only() {
+        // A first stall from 10 to 300 holds the window open until 500. A
+        // second stall, from 400 to 520, is not deferred again.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 10);
+        recovery.poll(300).unwrap();
+        recovery.poll(400).unwrap();
+        assert_eq!(
+            recovery.accept(20, [2; 32], &proof, 520),
+            Err(Error::Closed)
+        );
     }
     #[test]
     fn recovery_seals_survivors_replays_then_drains_stable_ids_before_missing_host_departure() {
