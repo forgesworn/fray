@@ -99,6 +99,9 @@ pub(crate) struct Shared {
     app_tag: String,
     pending_handshakes: AtomicUsize,
     generation: AtomicU64,
+    /// The generation, published when the pin bumps it: a pending ordinary
+    /// handshake watches it and is closed as a closed room once it changes.
+    generation_tx: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     before_registration: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Each connected peer's identity key (for the kick deny-list).
@@ -434,6 +437,7 @@ where
         app_tag,
         pending_handshakes: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
+        generation_tx: tokio::sync::watch::Sender::new(0),
         #[cfg(test)]
         before_registration: Mutex::new(None),
         peer_keys: Mutex::new(HashMap::new()),
@@ -514,6 +518,13 @@ impl HostHandle {
 
     /// Pin the original host after the arming runner freezes and detaches
     /// ordinary connections. Every replacement link must prove the root/role.
+    ///
+    /// A seated ordinary peer refuses the pin: the game closes stragglers
+    /// first. Pending ordinary handshakes (not yet seated, unauthenticated or
+    /// awaiting Identify) do not: the pin closes each one as a closed room
+    /// (`CLOSED`) and frees its slot, since pinning closes the room to
+    /// ordinary joins anyway. Otherwise any LAN host could hold the pin off
+    /// by opening a bare QUIC connection every few seconds.
     pub fn pin_session(&self, descriptor: crate::migration::Descriptor) -> Result<(), String> {
         if self.shared.path_override == Some(PathKind::Virtual) {
             return Err("virtual migration is unsupported".into());
@@ -532,10 +543,8 @@ impl HostHandle {
             )
             .map_err(|e| e.to_string())?;
         let peers = self.shared.peers.lock().map_err(|_| "host peer lock")?;
-        if !peers.is_empty() || self.shared.pending_handshakes.load(Ordering::Acquire) != 0 {
-            return Err(
-                "ordinary connections and pending handshakes must drain before pinning".into(),
-            );
+        if !peers.is_empty() {
+            return Err("ordinary connections must drain before pinning".into());
         }
         let mut current = self
             .shared
@@ -548,11 +557,15 @@ impl HostHandle {
             }
             return Err("session policy already pinned".into());
         }
-        self.shared
+        let previous = self
+            .shared
             .generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| g.checked_add(1))
             .map_err(|_| "host generation exhausted")?;
         *current = Some(policy);
+        // Under the peer lock, as every handshake registers: one registered
+        // before this sees the change and is closed; one after sees the pin.
+        self.shared.generation_tx.send_replace(previous + 1);
         self.shared.open.store(false, Ordering::Relaxed);
         let _ = self.cmd_tx.send(Cmd::SetOpen(false));
         Ok(())
@@ -1536,8 +1549,9 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         }
     }
     // Register every handshake in the same lock order as pin_session. A pin
-    // cannot leave ordinary-generation handshakes running outside its limits.
-    let (policy, generation, slot) = {
+    // cannot leave ordinary-generation handshakes running outside its limits:
+    // it closes them (`preempted` below).
+    let (policy, generation, slot, mut generation_rx) = {
         let Ok(_peers) = shared.peers.lock() else {
             incoming.refuse();
             return;
@@ -1559,8 +1573,12 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             policy,
             shared.generation.load(Ordering::Acquire),
             PendingSlot(shared.clone()),
+            shared.generation_tx.subscribe(),
         )
     };
+    // The accepted connection, so a pin can close a pending ordinary
+    // handshake with a code (dropping it would close it without one).
+    let accepted: Mutex<Option<quinn::Connection>> = Mutex::new(None);
     // Shown as IPv4 when the joiner is IPv4 (it arrives v4-mapped).
     let remote = crate::nat::addr::canonical(incoming.remote_address());
     let setup = async {
@@ -1569,6 +1587,9 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             .map_err(|e| e.to_string())?
             .await
             .map_err(|e| e.to_string())?;
+        if let Ok(mut accepted) = accepted.lock() {
+            *accepted = Some(conn.clone());
+        }
         let refuse = |conn: &quinn::Connection, code: u32, why: String| {
             conn.close(code.into(), why.as_bytes());
             Err(why)
@@ -1672,27 +1693,43 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         }
         Ok((conn, send, recv, hello, pk, attestation, inbox_relays, peer))
     };
-    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer) =
-        match tokio::time::timeout(
-            if policy.is_some() {
-                quic::SESSION_HANDSHAKE_DEADLINE
-            } else {
-                quic::HANDSHAKE_TIMEOUT
-            },
-            setup,
-        )
-        .await
-        {
-            Ok(Ok(x)) => x,
-            Ok(Err(e)) => {
-                log::info!("[host] {remote}: handshake failed: {e}");
-                return;
+    // An ordinary handshake ends when the pin bumps the generation; a
+    // session-bound one is never preempted.
+    let ordinary = policy.is_none();
+    let preempted = async {
+        if !ordinary || generation_rx.wait_for(|g| *g != generation).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let timed = tokio::time::timeout(
+        if policy.is_some() {
+            quic::SESSION_HANDSHAKE_DEADLINE
+        } else {
+            quic::HANDSHAKE_TIMEOUT
+        },
+        setup,
+    );
+    let outcome = tokio::select! {
+        outcome = timed => outcome,
+        () = preempted => {
+            if let Some(conn) = accepted.lock().ok().and_then(|mut c| c.take()) {
+                conn.close(close::CLOSED.into(), b"room closed");
             }
-            Err(_) => {
-                log::info!("[host] {remote}: handshake timed out");
-                return;
-            }
-        };
+            log::info!("[host] {remote}: pending handshake closed by the session pin");
+            return;
+        }
+    };
+    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer) = match outcome {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
+            log::info!("[host] {remote}: handshake failed: {e}");
+            return;
+        }
+        Err(_) => {
+            log::info!("[host] {remote}: handshake timed out");
+            return;
+        }
+    };
 
     drop(slot);
     // Seat under the lock so two simultaneous joiners can't both take the last seat.
@@ -1868,8 +1905,8 @@ mod migration_transition_tests {
         descriptor
     }
     #[test]
-    fn pin_waits_for_ordinary_handshakes_then_fences_detached_pumps_and_queued_events() {
-        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-pin-test").lan_only();
+    fn pin_closes_pending_ordinary_handshakes_as_a_closed_room() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-pin-preempt").lan_only();
         cfg.lan_port = 0;
         let original = Identity::ephemeral();
         let standby = Identity::ephemeral();
@@ -1889,11 +1926,17 @@ mod migration_transition_tests {
         );
         let descriptor = descriptor(&h, &cfg, &original, &standby, &player);
         let token: [u8; 32] = hex::decode(h.lan_token()).unwrap().try_into().unwrap();
-        // Real QUIC barrier: Opened has received its verified welcome, but has
-        // deliberately not sent Identify, so the host is awaiting frame3.
-        let (endpoint, opened) = crate::runtime().block_on(async {
+        // Two real QUIC handshakes hold slots on the unpinned listener: a bare
+        // connection with no hello and no token, and one that has its verified
+        // welcome but deliberately never sends Identify.
+        let (endpoint, bare, opened) = crate::runtime().block_on(async {
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
             let endpoint = quic::client_endpoint(socket, &cfg.app_tag).unwrap();
+            let bare = endpoint
+                .connect(addr, quic::SERVER_NAME)
+                .unwrap()
+                .await
+                .unwrap();
             let conn = endpoint
                 .connect(addr, quic::SERVER_NAME)
                 .unwrap()
@@ -1903,13 +1946,44 @@ mod migration_transition_tests {
             let opened = quic::client_open(&conn, None, PathKind::Lan, &[token], &check)
                 .await
                 .unwrap();
-            (endpoint, opened)
+            (endpoint, bare, opened)
         });
-        assert!(h.pin_session(descriptor.clone()).is_err());
-        opened.conn.close(close::LEAVE.into(), b"barrier release");
+        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 2);
+        h.pin_session(descriptor.clone()).unwrap();
+        let closed_room = |conn: &quinn::Connection| {
+            matches!(
+                conn.close_reason(),
+                Some(quinn::ConnectionError::ApplicationClosed(ref c))
+                    if c.error_code == quinn::VarInt::from_u32(close::CLOSED)
+            )
+        };
+        wait_until(|| closed_room(&bare) && closed_room(&opened.conn));
+        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 0);
+        assert!(h.poll().is_none(), "a preempted handshake was seated");
         drop(opened);
         drop(endpoint);
-        wait_until(|| h.shared.pending_handshakes.load(Ordering::Acquire) == 0);
+    }
+    #[test]
+    fn pin_fences_detached_pumps_and_queued_events() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-pin-test").lan_only();
+        cfg.lan_port = 0;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let player = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            h.local_addr().unwrap().port(),
+        );
+        let descriptor = descriptor(&h, &cfg, &original, &standby, &player);
         let client = crate::join_addr(&cfg, &player, addr, &h.lan_token());
         wait_until(|| matches!(client.poll(), Some(crate::ClientEvent::Connected { .. })));
         let mut peer = None;

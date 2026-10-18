@@ -208,6 +208,15 @@ retries with backoff. A retry just after a joiner-side expiry can briefly get
 `FULL` while the host detaches the seated peer.
 Ordinary lobby joins keep their per-stage timeouts.
 
+`HostHandle::pin_session` refuses while an ordinary peer is still seated: the
+game closes stragglers first. Pending ordinary handshakes do not hold it off.
+Pinning closes the room to ordinary joins, so the pin closes every handshake
+still in progress on the unpinned listener (a bare QUIC connection that has
+sent no hello included) as a closed room (`CLOSED`) and frees its slot. Without
+this, any host on the LAN could block the pin by opening a connection every
+few seconds, since an ordinary handshake holds its slot for up to 8 s before
+any admission check.
+
 A matching runtime key and transport handshake do not prove retained client
 state. Normal TLS replacement uses `PlayerQueue::begin_reconnect`, then the
 retained `PlayerEndpoint::reconnect`, followed by the queue's `finish_reconnect`.
