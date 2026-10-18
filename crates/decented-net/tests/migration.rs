@@ -1667,6 +1667,10 @@ fn forgotten_restored_bot_cannot_be_treated_as_a_departed_remote_player() {
         .map(|m| (m.player, HandledInputs::default()))
         .collect();
     let mut recovery = Recovery::begin(descriptor, sequencer, histories, &key, 0).unwrap();
+    // Sample every frame: a clock jump would count as a local stall.
+    for now in (50..250).step_by(50) {
+        recovery.poll(now).unwrap();
+    }
     assert!(recovery.seal(250).is_err());
     assert_eq!(recovery.phase(), RecoveryPhase::Failed);
 }
@@ -2503,6 +2507,10 @@ fn recovery_uses_committed_membership_for_later_humans_and_restored_bots() {
         proof
     );
     recovery.accept(4, [4; 32], &proof, 0).unwrap();
+    // Sample every frame: a clock jump would count as a local stall.
+    for now in (50..250).step_by(50) {
+        recovery.poll(now).unwrap();
+    }
     recovery.seal(250).unwrap();
     recovery
         .revalidate_security(&key, 250, |bytes, _| Ok(bytes.to_vec()))
@@ -9288,6 +9296,10 @@ fn retained_player_recovery_moves_real_journals_and_warm_framing_through_every_b
         replies
     );
     recovery.retain_local(3, 0, 0, 0).unwrap();
+    // Sample every frame: a clock jump would count as a local stall.
+    for now in (50..250).step_by(50) {
+        recovery.poll(now).unwrap();
+    }
     recovery.seal(250).unwrap();
     recovery
         .revalidate_security(&key, 250, |bytes, _| Ok(bytes.to_vec()))
@@ -9826,6 +9838,10 @@ fn retained_recovery_streams_512_originals_under_retries_and_interleaved_output_
             .accept(2, tls, &ResumeProof::decode(&root, &proof[0]).unwrap(), 0)
             .unwrap();
         recovery.retain_local(3, 0, 0, 0).unwrap();
+        // Sample every frame: a clock jump would count as a local stall.
+        for now in (50..250).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         recovery.seal(250).unwrap();
         recovery
             .revalidate_security(&key, 250, |bytes, _| Ok(bytes.to_vec()))
@@ -10074,6 +10090,10 @@ fn retained_player_waiting_for_clock() -> (
         .accept(2, tls, &ResumeProof::decode(&root, &replies[0]).unwrap(), 0)
         .unwrap();
     recovery.retain_local(3, 0, 0, 0).unwrap();
+    // Sample every frame: a clock jump would count as a local stall.
+    for now in (50..250).step_by(50) {
+        recovery.poll(now).unwrap();
+    }
     recovery.seal(250).unwrap();
     recovery
         .revalidate_security(&key, 250, |bytes, _| Ok(bytes.to_vec()))

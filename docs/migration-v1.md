@@ -248,11 +248,13 @@ needs no such rule.
 
 **The survivor collection window.** `Recovery` collects survivors for 250 ms
 from promotion. The same rule applies to it, because a survivor turned away
-there becomes a departure. Every `Recovery` call that takes the clock is a
-sample. A gap over `STALL_GAP_MS` that began while the window was open and a
-resume challenge was unanswered holds the window open (`challenge`, `accept`
-and `seal`) until `gap_end + 200 ms`, once per recovery. Without a stall, a
-proof read at 250 ms or later is still refused. Local members (restored bots
+there becomes a departure. Promotion and every `Recovery` call that takes the
+clock are samples. A gap over `STALL_GAP_MS` that began while the window was
+open, such as a long first frame after promotion, holds the window open
+(`challenge`, `accept` and `seal`) until `gap_end + 200 ms`, once per
+recovery. The window is still measured from promotion. Without a stall, a
+proof read at 250 ms or later is still refused, and tests that jump the clock
+past the window sample it every frame up to the jump. Local members (restored bots
 and the standby's own seat) are not reached over a control path, so
 `retain_local` has no time limit; it only has to come before `seal`.
 

@@ -4726,13 +4726,13 @@ impl Recovery {
         if now_ms < self.last_ms {
             return Err(Error::Invalid("backwards recovery wall clock"));
         }
-        // A local stall is not peer silence: proofs that arrived during it
-        // are read after it. Only a stall that began while the window was
-        // open and a challenge was unanswered can have hidden one. The
-        // window then stays open until 200 ms after the stall, once.
+        // A local stall is not peer silence: survivors cannot be challenged,
+        // and their proofs are not read, until it ends. A stall that began
+        // while the window was open, promotion included, holds the window
+        // open until 200 ms after the stall, once per recovery.
         if self.phase == RecoveryPhase::Collecting && self.collecting(self.last_ms) {
-            let probe = (!self.gate.pending.is_empty()).then_some(self.last_ms);
-            self.grace.sample(self.last_ms, now_ms, probe, self.last_ms);
+            let sample = self.last_ms;
+            self.grace.sample(sample, now_ms, Some(sample), sample);
         }
         self.last_ms = now_ms;
         if self.phase != RecoveryPhase::Ready && now_ms.saturating_sub(self.started) >= 5000 {
@@ -12018,6 +12018,10 @@ mod raw_recovery_engine_tests {
     fn contradictory_pending_or_handled_recovery_originals_fault_before_more_game_work() {
         for handled in [false, true] {
             let (mut recovery, _, key, _) = recovery_fixture(1, false);
+            // Sample every frame: a clock jump would count as a local stall.
+            for now in (50..250).step_by(50) {
+                recovery.poll(now).unwrap();
+            }
             recovery.seal(250).unwrap();
             recovery.begin_round().unwrap();
             recovery.seal_inputs_inner(2, 1).unwrap();
@@ -12065,6 +12069,10 @@ mod raw_recovery_engine_tests {
                     Sequencer::arm_session(descriptor.root.clone(), image, &key).unwrap();
                 recovery = Recovery::begin_session(descriptor.clone(), sequencer, &key, 0).unwrap();
                 recovery.retain_local(3, 0, 0, 0).unwrap();
+            }
+            // Sample every frame: a clock jump would count as a local stall.
+            for now in (50..250).step_by(50) {
+                recovery.poll(now).unwrap();
             }
             recovery.seal(250).unwrap();
             if recovery.phase() == RecoveryPhase::Security {
@@ -12174,6 +12182,21 @@ mod raw_recovery_engine_tests {
         );
     }
     #[test]
+    fn survivors_challenged_by_a_late_first_drive_are_retained() {
+        // The heavy takeover frame after promotion at 0 ends at 300 ms; only
+        // then does the first drive challenge the survivor and read its proof.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 300);
+        assert_eq!(recovery.accept(20, [2; 32], &proof, 360), Ok(()));
+        recovery.retain_local(3, 0, 0, 360).unwrap();
+        assert!(!recovery.seal(360).unwrap());
+        assert!(recovery.seal(500).unwrap());
+        assert_eq!(
+            recovery.survivors.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+    #[test]
     fn local_members_are_retained_when_the_first_drive_is_late() {
         // The standby samples every frame, but its first drive after
         // promotion reaches the local bot only at 300 ms.
@@ -12222,6 +12245,10 @@ mod raw_recovery_engine_tests {
         let (mut recovery, _descriptor, key, _player) = recovery_fixture(2, true);
         assert!(recovery.replay().is_err());
         assert!(recovery.absent().is_err());
+        // Sample every frame: a clock jump would count as a local stall.
+        for now in (50..250).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         assert!(!recovery.seal(249).unwrap());
         assert!(recovery.seal(250).unwrap());
         assert!(recovery.retain_local(3, 0, 0, 250).is_err());
@@ -12339,6 +12366,10 @@ mod raw_recovery_engine_tests {
     fn recovery_retries_the_exact_authority_batch_once_and_never_skips_a_persistent_fault() {
         for succeeds in [true, false] {
             let (mut recovery, _, key, _) = recovery_fixture(1, false);
+            // Sample every frame: a clock jump would count as a local stall.
+            for now in (50..250).step_by(50) {
+                recovery.poll(now).unwrap();
+            }
             recovery.seal(250).unwrap();
             recovery.begin_round().unwrap();
             recovery.seal_inputs_inner(2, 1).unwrap();
@@ -12374,6 +12405,10 @@ mod raw_recovery_engine_tests {
     #[test]
     fn missing_recovery_journal_gap_stays_paused_and_wall_timeout_cannot_advance_game_time() {
         let (mut recovery, _, key, _) = recovery_fixture(2, false);
+        // Sample every frame: a clock jump would count as a local stall.
+        for now in (50..250).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         recovery.seal(250).unwrap();
         recovery.begin_round().unwrap();
         recovery.seal_inputs_inner(2, 2).unwrap();
@@ -12397,6 +12432,10 @@ mod raw_recovery_engine_tests {
     #[test]
     fn recovery_application_bound_is_checked_before_another_effect_batch() {
         let (mut recovery, _, key, _) = recovery_fixture(17, false);
+        // Sample every frame: a clock jump would count as a local stall.
+        for now in (50..250).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         recovery.seal(250).unwrap();
         recovery.begin_round().unwrap();
         recovery.seal_inputs_inner(2, 17).unwrap();
@@ -12479,6 +12518,10 @@ mod raw_recovery_engine_tests {
                 recovery.accept(id, tls, &proof, 0).unwrap();
             }
             recovery.retain_local(3, 0, 0, 0).unwrap();
+            // Sample every frame: a clock jump would count as a local stall.
+            for now in (50..250).step_by(50) {
+                recovery.poll(now).unwrap();
+            }
             recovery.seal(250).unwrap();
             recovery.begin_round().unwrap();
             if all_survive {
@@ -12586,6 +12629,10 @@ mod raw_recovery_engine_tests {
             .map(|m| (m.player, HandledInputs::default()))
             .collect();
         let mut recovery = Recovery::begin(descriptor, sequencer, histories, &key, 0).unwrap();
+        // Sample every frame: a clock jump would count as a local stall.
+        for now in (50..250).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         assert!(!recovery.seal(249).unwrap());
         recovery.seal(250).unwrap();
         assert!(recovery.replay().unwrap().is_empty());
