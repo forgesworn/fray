@@ -11843,3 +11843,405 @@ fn a_late_primary_alive_with_an_older_frontier_is_still_ignored() {
     assert_eq!(late, vec![Ok(None)]);
     assert_eq!(standby.late_answers(), 1);
 }
+
+/// Eight humans each attached to the armed host's Primary, for receive-path
+/// cost checks. Returns the root, standby keys, Primary, member keys and
+/// their attached queues (player IDs 1..=8).
+fn eight_member_queues() -> (
+    Root,
+    Keys,
+    Sequencer,
+    Primary,
+    MembershipCertificate,
+    Vec<(Keys, PlayerQueue)>,
+) {
+    let host = Keys::generate();
+    let standby = Keys::generate();
+    let players: Vec<Keys> = (0..8).map(|_| Keys::generate()).collect();
+    let root = Root {
+        session: fresh_session().unwrap(),
+        app: "migration-test".into(),
+        transport_version: 7,
+        game_version: 13,
+        checkpoint_version: 1,
+        host: host.public_key().to_bytes(),
+        standby: standby.public_key().to_bytes(),
+        controller: host.public_key().to_bytes(),
+        code: room_code_hash("ABCDEF").unwrap(),
+        created_day: 20741,
+        roster_revision: 1,
+        members: players
+            .iter()
+            .enumerate()
+            .map(|(i, keys)| Member {
+                player: i as u64 + 1,
+                seat: i as u8,
+                key: Some(keys.public_key().to_bytes()),
+            })
+            .collect(),
+        config: [11; 32],
+        content: [12; 32],
+        limits: ResourceLimits::default(),
+    };
+    let mut descriptor = Descriptor::offer(root.clone(), &host).unwrap();
+    descriptor.consent(&standby).unwrap();
+    let routes: Vec<(u64, u32)> = (1..=8).map(|p| (p, 9 + p as u32)).collect();
+    let image = SessionImage::initial(&root, &routes, vec![0], 1, 100).unwrap();
+    let mut seq = Sequencer::arm_session(root.clone(), image.clone(), &standby).unwrap();
+    let mut primary = Primary::armed(
+        root.context().unwrap(),
+        image.encode(&root).unwrap(),
+        seq.receipt().clone(),
+    )
+    .unwrap();
+    let certificate = seq.membership_certificate(&standby).unwrap();
+    let queues = players
+        .into_iter()
+        .enumerate()
+        .map(|(i, keys)| {
+            let policy = EndpointPolicy {
+                descriptor: descriptor.clone(),
+                role: LinkRole::Original,
+                promotion: None,
+                membership: Some(certificate.clone()),
+            };
+            let channel = Channel::new(
+                &policy,
+                ConnectionBinding {
+                    session: root.session,
+                    descriptor: root.digest().unwrap(),
+                    term: 0,
+                    client: LinkRole::Player,
+                    server: LinkRole::Original,
+                },
+                ChannelSide::Server,
+                keys.public_key().to_bytes(),
+                [i as u8 + 1; 32],
+            )
+            .unwrap();
+            let queue = primary
+                .attach_player(&channel, certificate.clone())
+                .unwrap();
+            (keys, queue)
+        })
+        .collect();
+    (root, standby, seq, primary, certificate, queues)
+}
+
+/// Release-only cost check: 8 humans streaming signed lossy views, as the armed
+/// host sees them at 60 Hz. Each control must be verified once, against the
+/// already trusted membership certificate, within 250 us on average.
+#[test]
+#[ignore]
+fn player_queue_receive_costs_at_most_250_us_per_control_with_eight_members() {
+    if cfg!(debug_assertions) {
+        eprintln!("skipped: run with --release");
+        return;
+    }
+    let (root, _standby, _seq, primary, certificate, mut queues) = eight_member_queues();
+    const ROUNDS: u64 = 250;
+    let mut wires = Vec::new();
+    for round in 1..=ROUNDS {
+        for (i, (keys, _)) in queues.iter().enumerate() {
+            let control = PlayerControl::sign(
+                &root,
+                &certificate,
+                0,
+                round,
+                i as u64 + 1,
+                [i as u8 + 1; 32],
+                PlayerAction::Lossy {
+                    number: round,
+                    bytes: vec![round as u8; 48],
+                },
+                keys,
+            )
+            .unwrap();
+            wires.push((i, control.encode(&root).unwrap()));
+        }
+    }
+    let started = std::time::Instant::now();
+    for (i, wire) in &wires {
+        assert!(queues[*i].1.receive(wire, &primary).unwrap());
+    }
+    let elapsed = started.elapsed();
+    let per_control_us = elapsed.as_secs_f64() * 1e6 / wires.len() as f64;
+    eprintln!(
+        "player_queue_receive: {} controls, 8 members, {:.1} us per control",
+        wires.len(),
+        per_control_us
+    );
+    for (_, queue) in &queues {
+        assert_eq!(queue.lossy().unwrap().0, ROUNDS);
+    }
+    assert!(
+        per_control_us <= 250.0,
+        "receive cost {per_control_us:.1} us per control exceeds 250 us"
+    );
+}
+
+/// Re-sign an encoded player control's body with arbitrary keys, as an
+/// attacker holding a key outside the membership certificate would.
+fn resign_control(wire: &[u8], keys: &Keys) -> Vec<u8> {
+    use sha2::{Digest as _, Sha256};
+    let body = &wire[..wire.len() - 64];
+    let mut h = Sha256::new();
+    h.update(b"fray/migration/control/v1\0");
+    h.update(body);
+    let digest: [u8; 32] = h.finalize().into();
+    let signature = keys
+        .sign_schnorr(&nostr::secp256k1::Message::from_digest(digest))
+        .serialize();
+    let mut out = body.to_vec();
+    out.extend(signature);
+    out
+}
+
+/// One signature verification per control must still refuse forged
+/// signatures, non-member signers and replays on the armed host's queue.
+#[test]
+fn player_queue_single_verification_refuses_forgery_non_members_and_replay() {
+    let (root, _standby, _seq, primary, certificate, mut queues) = eight_member_queues();
+    let other_member = queues[1].0.clone();
+    let lossy = |n: u64| PlayerAction::Lossy {
+        number: n,
+        bytes: vec![n as u8; 8],
+    };
+    let signed = |keys: &Keys, sequence, action| {
+        PlayerControl::sign(&root, &certificate, 0, sequence, 1, [1; 32], action, keys)
+            .unwrap()
+            .encode(&root)
+            .unwrap()
+    };
+    let (keys, queue) = &mut queues[0];
+    let first = signed(keys, 1, lossy(1));
+    assert!(queue.receive(&first, &primary).unwrap());
+
+    // Forged signatures: a flipped signature byte or a flipped payload byte.
+    let genuine = signed(keys, 2, lossy(2));
+    let mut bad_sig = genuine.clone();
+    *bad_sig.last_mut().unwrap() ^= 1;
+    assert_eq!(queue.receive(&bad_sig, &primary), Err(Error::Unauthorized));
+    let mut bad_body = genuine.clone();
+    let payload_at = bad_body.len() - 65;
+    bad_body[payload_at] ^= 1;
+    assert_eq!(queue.receive(&bad_body, &primary), Err(Error::Unauthorized));
+
+    // Signers outside the certificate, or another member's key for this seat.
+    let outsider = Keys::generate();
+    assert_eq!(
+        queue.receive(&resign_control(&genuine, &outsider), &primary),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        queue.receive(&resign_control(&genuine, &other_member), &primary),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(queue.lossy().unwrap().0, 1);
+
+    // Refused forgeries consumed nothing: the genuine control still lands.
+    assert!(queue.receive(&genuine, &primary).unwrap());
+    assert_eq!(queue.lossy().unwrap().0, 2);
+
+    // Replay: the same bytes are a no-op; a different signed body reusing
+    // the sequence is a conflict that closes the route.
+    assert!(!queue.receive(&genuine, &primary).unwrap());
+    assert!(!queue.receive(&first, &primary).unwrap());
+    assert_eq!(
+        queue.receive(&signed(keys, 2, lossy(3)), &primary),
+        Err(Error::Conflict)
+    );
+    assert!(queue.receive(&signed(keys, 4, lossy(4)), &primary).is_err());
+}
+
+fn player_inbox_fixture() -> (
+    Root,
+    Keys,
+    Keys,
+    Sequencer,
+    SessionImage,
+    MembershipCertificate,
+    Channel,
+) {
+    let (mut descriptor, _host, key, player) = descriptor_fixture();
+    descriptor.consent(&key).unwrap();
+    let root = descriptor.root.clone();
+    let image =
+        SessionImage::initial(&root, &[(1, 10), (2, 11), (3, 12)], vec![0], 1, 100).unwrap();
+    let seq = Sequencer::arm_session(root.clone(), image.clone(), &key).unwrap();
+    let certificate = seq.membership_certificate(&key).unwrap();
+    let policy = EndpointPolicy {
+        descriptor: descriptor.clone(),
+        role: LinkRole::Original,
+        promotion: None,
+        membership: Some(certificate.clone()),
+    };
+    let server = Channel::new(
+        &policy,
+        ConnectionBinding {
+            session: root.session,
+            descriptor: root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        },
+        ChannelSide::Server,
+        player.public_key().to_bytes(),
+        [7; 32],
+    )
+    .unwrap();
+    (root, key, player, seq, image, certificate, server)
+}
+
+/// Certificates are trusted only after full verification: a forged one is
+/// refused at every entry point, and cannot authorise a control.
+#[test]
+fn forged_membership_certificates_cannot_authorise_player_controls() {
+    let (root, _key, player, _seq, _image, certificate, server) = player_inbox_fixture();
+    let outsider = Keys::generate();
+    // Player 3 holds no key; the forgery hands that seat to the outsider in a
+    // well-formed next revision but keeps the standby's signature over the
+    // genuine table, so only the certificate signature can catch it.
+    let mut forged = certificate.clone();
+    forged.revision += 1;
+    forged
+        .members
+        .iter_mut()
+        .find(|m| m.player == 3)
+        .unwrap()
+        .key = Some(outsider.public_key().to_bytes());
+    assert_eq!(forged.verify(&root), Err(Error::Unauthorized));
+    assert_eq!(
+        PlayerInbox::new(&server, forged.clone()).err(),
+        Some(Error::Unauthorized)
+    );
+
+    let genuine = PlayerControl::sign(
+        &root,
+        &certificate,
+        0,
+        1,
+        2,
+        [7; 32],
+        PlayerAction::Lossy {
+            number: 1,
+            bytes: vec![1],
+        },
+        &player,
+    )
+    .unwrap();
+    // An outsider control for seat 3 against the forged table is refused.
+    let mut seat3 = genuine.clone();
+    seat3.player = 3;
+    let seat3 = resign_control(&seat3.encode(&root).unwrap(), &outsider);
+    let seat3 = PlayerControl::decode(&root, &seat3).unwrap();
+    assert_eq!(
+        seat3.verify(&root, &forged, 3, [7; 32], 0),
+        Err(Error::Unauthorized)
+    );
+
+    let mut inbox = PlayerInbox::new(&server, certificate.clone()).unwrap();
+    assert_eq!(
+        inbox.update_membership(forged),
+        Err(Error::Unauthorized),
+        "an unverified certificate must never replace the trusted one"
+    );
+    assert_eq!(
+        inbox.receive(&genuine.encode(&root).unwrap()).unwrap(),
+        Some(genuine)
+    );
+}
+
+/// After a membership update the new certificate is trusted for controls, the
+/// old one cannot be reinstalled, and a retirement closes the route.
+#[test]
+fn membership_update_switches_trusted_certificate_and_retirement_closes_route() {
+    let (root, key, player, mut seq, image, certificate, server) = player_inbox_fixture();
+    let mut inbox = PlayerInbox::new(&server, certificate.clone()).unwrap();
+    let control = |membership: &MembershipCertificate, sequence: u64| {
+        PlayerControl::sign(
+            &root,
+            membership,
+            0,
+            sequence,
+            2,
+            [7; 32],
+            PlayerAction::Lossy {
+                number: sequence,
+                bytes: vec![sequence as u8],
+            },
+            &player,
+        )
+        .unwrap()
+        .encode(&root)
+        .unwrap()
+    };
+    let first = control(&certificate, 1);
+    assert!(inbox.receive(&first).unwrap().is_some());
+
+    // A commit with unchanged membership issues a new certificate.
+    let token = seq
+        .stage(
+            seq.next(
+                image.encode(&root).unwrap(),
+                100,
+                seq.receipt().watermarks.clone(),
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    seq.install(token, &key).unwrap();
+    let next = seq.membership_certificate(&key).unwrap();
+    assert_ne!(next, certificate);
+    inbox.update_membership(next.clone()).unwrap();
+    assert!(inbox.receive(&control(&next, 2)).unwrap().is_some());
+    assert_eq!(
+        inbox.update_membership(certificate.clone()),
+        Err(Error::Stale)
+    );
+    assert!(inbox.receive(&control(&next, 3)).unwrap().is_some());
+    assert_eq!(inbox.receive(&first).unwrap(), None);
+
+    // Retirement: the old certificates' controls no longer reach the game.
+    let mut post = image;
+    post.members.retain(|m| m.player != 2);
+    post.inputs.remove(&2);
+    post.membership_revision += 1;
+    let mut marks = seq.receipt().watermarks.clone();
+    marks.iter_mut().find(|m| m.player == 2).unwrap().retired = true;
+    let token = seq
+        .stage(
+            seq.next(post.encode(&root).unwrap(), 100, marks, vec![])
+                .unwrap(),
+        )
+        .unwrap();
+    seq.install(token, &key).unwrap();
+    assert_eq!(
+        inbox.update_membership(seq.membership_certificate(&key).unwrap()),
+        Err(Error::Closed)
+    );
+    assert_eq!(inbox.receive(&control(&next, 4)), Err(Error::Closed));
+    assert_eq!(inbox.receive(&control(&certificate, 5)), Err(Error::Closed));
+}
+
+/// The refresh fast path is taken only for the identical receipt: a different
+/// standby-signed receipt at the same index is still refused as a conflict.
+#[test]
+fn player_queue_refresh_refuses_a_different_receipt_at_the_same_index() {
+    let (root, standby, _seq, primary, _certificate, mut queues) = eight_member_queues();
+    let (_, queue) = &mut queues[0];
+    queue.refresh(&primary).unwrap();
+    let routes: Vec<(u64, u32)> = (1..=8).map(|p| (p, 9 + p as u32)).collect();
+    let image = SessionImage::initial(&root, &routes, vec![0], 1, 101).unwrap();
+    let other = Sequencer::arm_session(root.clone(), image.clone(), &standby).unwrap();
+    assert_eq!(other.receipt().index, primary.receipt().index);
+    assert_ne!(other.receipt(), primary.receipt());
+    let forked = Primary::armed(
+        root.context().unwrap(),
+        image.encode(&root).unwrap(),
+        other.receipt().clone(),
+    )
+    .unwrap();
+    assert_eq!(queue.refresh(&forked), Err(Error::Conflict));
+}

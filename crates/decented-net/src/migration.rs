@@ -9506,6 +9506,20 @@ impl PlayerControl {
         term: u64,
     ) -> Result<()> {
         membership.verify(root)?;
+        self.verify_member_signature(root, membership, player, tls, term)
+    }
+    /// Binding, membership and signature checks against a certificate the
+    /// caller has ALREADY fully verified (`MembershipCertificate::verify`).
+    /// Never call it with an unverified certificate: it does not re-check the
+    /// certificate's own standby signature or its receipt binding.
+    fn verify_member_signature(
+        &self,
+        root: &Root,
+        membership: &MembershipCertificate,
+        player: u64,
+        tls: [u8; 32],
+        term: u64,
+    ) -> Result<()> {
         if self.term != term
             || self.tls != tls
             || self.player != player
@@ -9513,7 +9527,11 @@ impl PlayerControl {
         {
             return Err(Error::Unauthorized);
         }
-        let key = resume_member(root, Some(membership), player)?
+        let key = membership
+            .members
+            .iter()
+            .find(|m| m.player == player)
+            .ok_or(Error::Unauthorized)?
             .key
             .ok_or(Error::Unauthorized)?;
         verify(key, self.digest(root)?, self.signature)
@@ -9572,6 +9590,19 @@ impl PlayerControl {
     }
 }
 
+/// A player control whose signature was verified once by a `PlayerInbox`,
+/// bound to that route (player, TLS exporter, term) and to the digest of the
+/// trusted membership certificate it was checked against. Only `authenticate`
+/// constructs it; `admit` refuses it on any other route or certificate.
+struct VerifiedControl {
+    record: PlayerControl,
+    digest: Hash,
+    membership: Hash,
+    player: u64,
+    tls: [u8; 32],
+    term: u64,
+}
+
 /// Authenticated per-connection control replay guard. It emits ordered runner
 /// events, never mutates the authority or committed ACK/input watermarks. The
 /// owning runner admits only actions valid in its current normal/recovery phase.
@@ -9579,6 +9610,10 @@ impl PlayerControl {
 pub struct PlayerInbox {
     root: Root,
     membership: MembershipCertificate,
+    /// Digest of the certificate in `membership` as of its last full
+    /// `MembershipCertificate::verify`. Per-control checks trust the
+    /// certificate only while its digest still equals this value.
+    trusted: Hash,
     player: u64,
     key: RuntimeKey,
     tls: [u8; 32],
@@ -9624,9 +9659,11 @@ impl PlayerInbox {
         {
             return Err(Error::Unauthorized);
         }
+        let trusted = membership.digest(&root)?;
         Ok(Self {
             root,
             membership,
+            trusted,
             player,
             key: channel.remote_key,
             tls: channel.tls,
@@ -9646,6 +9683,7 @@ impl PlayerInbox {
         if self.closed {
             return Err(Error::Closed);
         }
+        // follows() fully verifies both certificates, so `next` is trusted.
         next.follows(&self.root, &self.membership)?;
         if next.receipt.term > self.term {
             return Err(Error::Unauthorized);
@@ -9658,6 +9696,7 @@ impl PlayerInbox {
             self.closed = true;
             return Err(Error::Closed);
         }
+        self.trusted = next.digest(&self.root)?;
         self.membership = next;
         Ok(())
     }
@@ -9665,15 +9704,64 @@ impl PlayerInbox {
         if self.closed {
             return Err(Error::Closed);
         }
+        let verified = self.authenticate(bytes)?;
+        self.admit(verified)
+    }
+    /// Trust the installed certificate by identity. A certificate fully
+    /// verified at `new`/`update_membership` is not re-verified per control;
+    /// any other certificate is verified fully once before being trusted.
+    fn trust_membership(&mut self) -> Result<Hash> {
+        let digest = self.membership.digest(&self.root)?;
+        if digest != self.trusted {
+            self.membership.verify(&self.root)?;
+            if !self
+                .membership
+                .members
+                .iter()
+                .any(|m| m.player == self.player && m.key == Some(self.key))
+            {
+                return Err(Error::Unauthorized);
+            }
+            self.trusted = digest;
+        }
+        Ok(digest)
+    }
+    /// Decode and authenticate one control exactly once: the trusted
+    /// certificate, this route's player/TLS/term binding, signer membership
+    /// and the signature. Replay state is not touched; see `admit`.
+    fn authenticate(&mut self, bytes: &[u8]) -> Result<VerifiedControl> {
         let record = PlayerControl::decode(&self.root, bytes)?;
-        record.verify(
+        let membership = self.trust_membership()?;
+        record.verify_member_signature(
             &self.root,
             &self.membership,
             self.player,
             self.tls,
             self.term,
         )?;
-        let digest = hash(b"fray/migration/received-control/v1\0", bytes);
+        Ok(VerifiedControl {
+            digest: hash(b"fray/migration/received-control/v1\0", bytes),
+            record,
+            membership,
+            player: self.player,
+            tls: self.tls,
+            term: self.term,
+        })
+    }
+    /// Sequence/replay admission of a control authenticated for this exact
+    /// route and trusted certificate.
+    fn admit(&mut self, verified: VerifiedControl) -> Result<Option<PlayerControl>> {
+        if self.closed {
+            return Err(Error::Closed);
+        }
+        if verified.membership != self.trusted
+            || verified.player != self.player
+            || verified.tls != self.tls
+            || verified.term != self.term
+        {
+            return Err(Error::Unauthorized);
+        }
+        let VerifiedControl { record, digest, .. } = verified;
         if !self.remember_control(record.sequence, digest)? {
             return Ok(None);
         }
@@ -11037,6 +11125,10 @@ pub struct PlayerQueue {
     closed: bool,
     reconnect: Option<PendingReconnect>,
     reconnect_ms: Option<u64>,
+    /// True once `accepted`/`pending`/`applied` were rebuilt from the image
+    /// committed under `base`. A receipt binds its image (`receipt.state ==
+    /// state_hash(image)`), so an equal receipt means an identical image.
+    refreshed: bool,
 }
 impl PlayerQueue {
     fn from_channel(
@@ -11067,6 +11159,7 @@ impl PlayerQueue {
             closed: false,
             reconnect: None,
             reconnect_ms: None,
+            refreshed: false,
         };
         queue.refresh(primary)?;
         Ok(queue)
@@ -11135,6 +11228,15 @@ impl PlayerQueue {
         {
             return Err(Error::Stale);
         }
+        if self.refreshed && primary.receipt == self.base {
+            // Same signed receipt, so the same committed image: decoding it and
+            // re-recording `pending` would reproduce the current state exactly.
+            // Only the Primary-side output ceiling is re-checked.
+            if self.applied > primary.output_ceiling(self.inbox.player, Delivery::Reliable) {
+                return Err(Error::Conflict);
+            }
+            return Ok(());
+        }
         if primary.receipt.index == self.base.index
             && primary.receipt.digest(&context)? != self.base.digest(&context)?
         {
@@ -11186,6 +11288,7 @@ impl PlayerQueue {
         self.bytes = bytes;
         self.applied = applied;
         self.base = primary.receipt.clone();
+        self.refreshed = true;
         Ok(())
     }
     fn reconnect_clock(&mut self, now_ms: u64) -> Result<()> {
@@ -11331,15 +11434,12 @@ impl PlayerQueue {
     /// retains the client's original journal for retry or fresh reconnect.
     pub fn receive(&mut self, bytes: &[u8], primary: &Primary) -> Result<bool> {
         self.refresh(primary)?;
+        // The one signature verification on this path; the result is carried
+        // into the cloned inbox's replay admission below.
+        let verified = self.inbox.authenticate(bytes)?;
         let mut inbox = self.inbox.clone();
-        let parsed = PlayerControl::decode(&self.inbox.root, bytes)?;
-        parsed.verify(
-            &self.inbox.root,
-            &self.inbox.membership,
-            self.inbox.player,
-            self.inbox.tls,
-            self.inbox.term,
-        )?;
+        let parsed = &verified.record;
+        let sequence = parsed.sequence;
         let known_original = if let PlayerAction::Intent { number, bytes } = &parsed.action {
             if *number <= self.accepted.handled() {
                 self.accepted.check(*number, bytes).map_err(|error| {
@@ -11356,12 +11456,12 @@ impl PlayerQueue {
         } else {
             false
         };
-        let received = inbox.receive(bytes);
+        let received = inbox.admit(verified);
         if known_original && matches!(received, Err(Error::Stale)) {
             primary
                 .sender
                 .replay
-                .begin(self.inbox.key, parsed.sequence, bytes, true)?
+                .begin(self.inbox.key, sequence, bytes, true)?
                 .commit()?;
             return Ok(false);
         }
@@ -11374,7 +11474,7 @@ impl PlayerQueue {
         })?;
         let incoming = primary.sender.replay.begin(
             self.inbox.key,
-            parsed.sequence,
+            sequence,
             bytes,
             record.is_none() || known_original,
         )?;
@@ -12419,3 +12519,142 @@ mod raw_recovery_engine_tests {
 
 mod recovery_player;
 pub use recovery_player::{PlayerRecovery, RecoveryPlayerEvent};
+
+#[cfg(test)]
+mod control_trust_tests {
+    use super::*;
+
+    /// An inbox for player 2 on term 0, plus its keys and a second valid
+    /// certificate for the same membership at a later receipt.
+    fn fixture() -> (Root, PlayerInbox, Keys, MembershipCertificate) {
+        let host = Keys::generate();
+        let standby = Keys::generate();
+        let player = Keys::generate();
+        let root = Root {
+            session: fresh_session().unwrap(),
+            app: "migration-test".into(),
+            transport_version: 7,
+            game_version: 13,
+            checkpoint_version: 1,
+            host: host.public_key().to_bytes(),
+            standby: standby.public_key().to_bytes(),
+            controller: host.public_key().to_bytes(),
+            code: room_code_hash("ABCDEF").unwrap(),
+            created_day: 20741,
+            roster_revision: 1,
+            members: vec![
+                Member {
+                    player: 1,
+                    seat: 0,
+                    key: Some(host.public_key().to_bytes()),
+                },
+                Member {
+                    player: 2,
+                    seat: 1,
+                    key: Some(player.public_key().to_bytes()),
+                },
+            ],
+            config: [11; 32],
+            content: [12; 32],
+            limits: ResourceLimits::default(),
+        };
+        let image = SessionImage::initial(&root, &[(1, 10), (2, 11)], vec![0], 1, 100).unwrap();
+        let mut seq = Sequencer::arm_session(root.clone(), image.clone(), &standby).unwrap();
+        let first = seq.membership_certificate(&standby).unwrap();
+        let candidate = seq
+            .next(
+                image.encode(&root).unwrap(),
+                100,
+                seq.receipt().watermarks.clone(),
+                vec![],
+            )
+            .unwrap();
+        let token = seq.stage(candidate).unwrap();
+        seq.install(token, &standby).unwrap();
+        let second = seq.membership_certificate(&standby).unwrap();
+        let inbox = PlayerInbox {
+            trusted: first.digest(&root).unwrap(),
+            root: root.clone(),
+            membership: first,
+            player: 2,
+            key: player.public_key().to_bytes(),
+            tls: [7; 32],
+            term: 0,
+            last: 0,
+            recent: VecDeque::new(),
+            lossy_number: 0,
+            closed: false,
+        };
+        (root, inbox, player, second)
+    }
+
+    fn control(root: &Root, sequence: u64, keys: &Keys) -> Vec<u8> {
+        let mut record = PlayerControl {
+            term: 0,
+            sequence,
+            player: 2,
+            tls: [7; 32],
+            action: PlayerAction::Lossy {
+                number: sequence,
+                bytes: vec![1],
+            },
+            signature: [0; 64],
+        };
+        record.signature = sign(keys, record.digest(root).unwrap());
+        record.encode(root).unwrap()
+    }
+
+    /// A certificate that did not pass full verification is never trusted
+    /// by digest: swapping one in re-verifies it before any control.
+    #[test]
+    fn untrusted_certificate_digest_forces_full_verification() {
+        let (root, mut inbox, player, second) = fixture();
+        let outsider = Keys::generate();
+        let trusted = inbox.trusted;
+        assert!(inbox
+            .receive(&control(&root, 1, &player))
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            inbox.receive(&control(&root, 2, &outsider)),
+            Err(Error::Unauthorized)
+        );
+
+        // Forged table handing seat 2 to the outsider, old standby signature.
+        let genuine = inbox.membership.clone();
+        let mut forged = genuine.clone();
+        forged.revision += 1;
+        forged.members[1].key = Some(outsider.public_key().to_bytes());
+        inbox.membership = forged;
+        assert_eq!(
+            inbox.receive(&control(&root, 2, &outsider)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(inbox.trusted, trusted, "a forged digest is never cached");
+
+        // A genuine but different certificate is verified once, then trusted.
+        inbox.membership = second.clone();
+        assert!(inbox
+            .receive(&control(&root, 3, &player))
+            .unwrap()
+            .is_some());
+        assert_eq!(inbox.trusted, second.digest(&root).unwrap());
+    }
+
+    /// A verified control is admitted only by the route and certificate it
+    /// was authenticated against.
+    #[test]
+    fn verified_control_is_bound_to_its_route_and_certificate() {
+        let (root, mut inbox, player, second) = fixture();
+        let verified = inbox.authenticate(&control(&root, 1, &player)).unwrap();
+        let mut other = inbox.clone();
+        other.tls = [8; 32];
+        assert_eq!(other.admit(verified), Err(Error::Unauthorized));
+        let verified = inbox.authenticate(&control(&root, 1, &player)).unwrap();
+        let mut moved = inbox.clone();
+        moved.trusted = second.digest(&root).unwrap();
+        assert_eq!(moved.admit(verified), Err(Error::Unauthorized));
+        let verified = inbox.authenticate(&control(&root, 1, &player)).unwrap();
+        assert!(inbox.admit(verified).unwrap().is_some());
+    }
+}
