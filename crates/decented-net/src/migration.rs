@@ -2041,6 +2041,7 @@ pub struct PacketReceiver {
     queued_bytes: usize,
     completed: VecDeque<(u64, PacketKind, Hash, u32, u32, Option<CandidateManifest>)>,
     highest: u64,
+    late_chunks: u64,
 }
 impl PacketReceiver {
     pub fn new(session: SessionId, term: u64) -> Result<Self> {
@@ -2054,6 +2055,7 @@ impl PacketReceiver {
             queued_bytes: 0,
             completed: VecDeque::new(),
             highest: 0,
+            late_chunks: 0,
         })
     }
     pub fn advance_term(&mut self, term: u64) -> Result<()> {
@@ -2093,9 +2095,15 @@ impl PacketReceiver {
             Err(Error::Stale)
         }
     }
-    /// Expired partial transfers are dropped first. The arriving frame is
-    /// refused as `Stale` only when it belongs to one of them; any other
-    /// valid frame is processed normally.
+    /// Chunks ignored because their transfer was dropped as expired by the
+    /// same call that received them (see [`Self::receive`]).
+    pub fn late_chunks(&self) -> u64 {
+        self.late_chunks
+    }
+    /// Expired partial transfers are dropped first. A chunk of a transfer
+    /// just dropped is late but harmless: it is ignored (`Ok(None)`), counted
+    /// in [`Self::late_chunks`] and never assembled. Any other valid frame is
+    /// processed normally.
     pub fn receive(
         &mut self,
         bytes: &[u8],
@@ -2107,7 +2115,8 @@ impl PacketReceiver {
             return Err(Error::Invalid("frame session/term"));
         }
         if expired.contains(&frame.transfer) {
-            return Err(Error::Stale);
+            self.late_chunks = self.late_chunks.saturating_add(1);
+            return Ok(None);
         }
         if let Some((_, kind, digest, length, count, candidate)) =
             self.completed.iter().find(|(id, ..)| *id == frame.transfer)
@@ -6687,6 +6696,11 @@ impl Channel {
     pub fn expire(&mut self, now_ms: u64) -> Result<()> {
         self.receiver.expire(now_ms)
     }
+    /// Late chunks of expired transfers this channel ignored
+    /// ([`PacketReceiver::late_chunks`]).
+    pub fn late_chunks(&self) -> u64 {
+        self.receiver.late_chunks()
+    }
     /// A warm control link keeps its TLS identity/exporter. Only the signed
     /// fixed-pair promotion changes its packet term and publication direction.
     pub fn promote(&mut self, promotion: &Promotion) -> Result<()> {
@@ -7091,6 +7105,55 @@ impl StallGrace {
     }
 }
 
+/// How many probes a watch remembers after they leave the 200 ms answer
+/// window unanswered. An answer to one of them is late, not forged.
+const RETIRED_PROBES: usize = 64;
+
+/// Move probes that left the 200 ms answer window from `pending` to
+/// `retired`, keeping at most [`RETIRED_PROBES`] digests.
+fn retire_probes(
+    root: &Root,
+    pending: &mut VecDeque<(u64, PulseProbe)>,
+    retired: &mut VecDeque<Hash>,
+    now_ms: u64,
+) -> Result<()> {
+    while let Some((sent, probe)) = pending.front() {
+        if now_ms - *sent < 200 {
+            break;
+        }
+        let digest = probe.digest(root)?;
+        pending.pop_front();
+        if retired.len() == RETIRED_PROBES {
+            retired.pop_front();
+        }
+        retired.push_back(digest);
+    }
+    Ok(())
+}
+
+/// After no in-window probe matched: true, and forget the probe, when
+/// `challenge` answers a probe this watch sent whose window has passed
+/// (still pending or retired). A probe already answered, or never sent by
+/// this watch on this connection, matches nothing.
+fn take_late_probe(
+    root: &Root,
+    pending: &mut VecDeque<(u64, PulseProbe)>,
+    retired: &mut VecDeque<Hash>,
+    challenge: &Hash,
+) -> Result<bool> {
+    for (index, (_, probe)) in pending.iter().enumerate() {
+        if *challenge == probe.digest(root)? {
+            pending.remove(index);
+            return Ok(true);
+        }
+    }
+    if let Some(index) = retired.iter().position(|digest| digest == challenge) {
+        retired.remove(index);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Standby-side suspicion uses fresh challenges or newly installed proposals.
 /// The caller closes the very same sequencer on expiry; a response cannot
 /// reopen it and a duplicate proposal cannot keep it alive indefinitely.
@@ -7103,7 +7166,9 @@ pub struct PrimaryWatch {
     fresh_ms: u64,
     last_probe: Option<u64>,
     pending: VecDeque<(u64, PulseProbe)>,
+    retired: VecDeque<Hash>,
     last_response: u64,
+    late_answers: u64,
     grace: StallGrace,
 }
 impl PrimaryWatch {
@@ -7120,7 +7185,9 @@ impl PrimaryWatch {
             fresh_ms: now_ms,
             last_probe: None,
             pending: VecDeque::new(),
+            retired: VecDeque::new(),
             last_response: 0,
+            late_answers: 0,
             grace: StallGrace::new(),
         })
     }
@@ -7159,6 +7226,7 @@ impl PrimaryWatch {
             return Err(Error::Stale);
         }
         let next = sequence.checked_add(1).ok_or(Error::Bounds)?;
+        retire_probes(&self.root, &mut self.pending, &mut self.retired, now_ms)?;
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| Error::Invalid("primary probe RNG"))?;
         let probe = PulseProbe {
@@ -7169,7 +7237,6 @@ impl PrimaryWatch {
         };
         self.next = next;
         self.last_probe = Some(now_ms);
-        self.pending.retain(|(sent, _)| now_ms - *sent < 200);
         self.pending.push_back((now_ms, probe.clone()));
         Ok(probe)
     }
@@ -7200,7 +7267,23 @@ impl PrimaryWatch {
                 break;
             }
         }
-        self.pending.remove(matched.ok_or(Error::Stale)?);
+        let Some(matched) = matched else {
+            // A valid answer to one of this watch's probes, read after its
+            // window: harmless. It is ignored and counted, never fresh; its
+            // sequence is consumed so a replay of it still fails above.
+            if take_late_probe(
+                &self.root,
+                &mut self.pending,
+                &mut self.retired,
+                &response.challenge,
+            )? {
+                self.last_response = response.sequence;
+                self.late_answers = self.late_answers.saturating_add(1);
+                return Ok(());
+            }
+            return Err(Error::Stale);
+        };
+        self.pending.remove(matched);
         self.last_response = response.sequence;
         self.fresh_ms = now_ms;
         self.grace.fresh();
@@ -7225,6 +7308,12 @@ impl PrimaryWatch {
         self.current(current)?;
         Ok(now_ms - self.fresh_ms >= 200 && !self.grace.holds(now_ms))
     }
+    /// Valid `PrimaryAlive` answers ignored because they arrived after their
+    /// probe's 200 ms window ([`Self::response`] returned `Ok` without
+    /// recording freshness).
+    pub fn late_answers(&self) -> u64 {
+        self.late_answers
+    }
 }
 /// Client-side freshness; a valid pulse during play cannot conceal a stopped
 /// game clock. Promotion always freezes until the separate recovery barrier.
@@ -7239,7 +7328,9 @@ pub struct ProgressWatch {
     progress_ms: u64,
     last_probe: Option<u64>,
     pending: VecDeque<(u64, PulseProbe)>,
+    retired: VecDeque<Hash>,
     last_pulse: u64,
+    late_answers: u64,
     recovery: Option<u64>,
     promotion: Option<Promotion>,
     grace: StallGrace,
@@ -7270,7 +7361,9 @@ impl ProgressWatch {
             progress_ms: now_ms,
             last_probe: None,
             pending: VecDeque::new(),
+            retired: VecDeque::new(),
             last_pulse: 0,
+            late_answers: 0,
             recovery: None,
             promotion: None,
             grace: StallGrace::new(),
@@ -7342,6 +7435,7 @@ impl ProgressWatch {
             return Err(Error::Stale);
         }
         let next = sequence.checked_add(1).ok_or(Error::Bounds)?;
+        retire_probes(&self.root, &mut self.pending, &mut self.retired, now_ms)?;
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| Error::Invalid("probe RNG"))?;
         let probe = PulseProbe {
@@ -7352,11 +7446,11 @@ impl ProgressWatch {
         };
         self.next = next;
         self.last_probe = Some(now_ms);
-        self.pending.retain(|(sent, _)| now_ms - *sent < 200);
         self.pending.push_back((now_ms, probe.clone()));
         Ok(probe)
     }
-    fn accept_frontier(&mut self, frontier: &Receipt) -> Result<bool> {
+    /// Every refusal [`Self::accept_frontier`] makes, without adopting it.
+    fn check_frontier(&self, frontier: &Receipt) -> Result<()> {
         frontier.verify(&self.root.context()?)?;
         if frontier.term > self.term
             || frontier.term < self.frontier.term
@@ -7371,12 +7465,19 @@ impl ProgressWatch {
             {
                 return Err(Error::Conflict);
             }
-            return Ok(false);
+            return Ok(());
         }
         if self.frontier.index.checked_add(1) == Some(frontier.index)
             && frontier.parent != self.frontier.digest(&self.root.context()?)?
         {
             return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    fn accept_frontier(&mut self, frontier: &Receipt) -> Result<bool> {
+        self.check_frontier(frontier)?;
+        if frontier.index == self.frontier.index {
+            return Ok(false);
         }
         let progress = frontier.logical_ms > self.frontier.logical_ms;
         self.frontier = frontier.clone();
@@ -7404,7 +7505,24 @@ impl ProgressWatch {
                 break;
             }
         }
-        let matched = matched.ok_or(Error::Stale)?;
+        let Some(matched) = matched else {
+            // A valid answer to one of this watch's probes, read after its
+            // window: harmless. Its frontier is checked but not adopted, it is
+            // never fresh, and its sequence is consumed so a replay of it
+            // still fails above.
+            if take_late_probe(
+                &self.root,
+                &mut self.pending,
+                &mut self.retired,
+                &pulse.challenge,
+            )? {
+                self.check_frontier(&pulse.frontier)?;
+                self.last_pulse = pulse.sequence;
+                self.late_answers = self.late_answers.saturating_add(1);
+                return Ok(());
+            }
+            return Err(Error::Stale);
+        };
         let progress = self.accept_frontier(&pulse.frontier)?;
         let idle = self.activity == Activity::Idle && pulse.activity == Activity::Idle;
         if progress || idle {
@@ -7418,6 +7536,11 @@ impl ProgressWatch {
         self.last_pulse = pulse.sequence;
         Ok(())
     }
+    /// Valid Pulses ignored because they arrived after their probe's 200 ms
+    /// window ([`Self::pulse`] returned `Ok` without recording freshness).
+    pub fn late_answers(&self) -> u64 {
+        self.late_answers
+    }
     pub fn promote(&mut self, promotion: &Promotion, now_ms: u64) -> Result<()> {
         self.advance(now_ms)?;
         promotion.verify(&self.root.context()?)?;
@@ -7427,6 +7550,7 @@ impl ProgressWatch {
         self.accept_frontier(&promotion.final_receipt)?;
         self.term = 1;
         self.pending.clear();
+        self.retired.clear();
         self.recovery = Some(now_ms);
         self.promotion = Some(promotion.clone());
         Ok(())
@@ -7698,6 +7822,15 @@ impl StandbyActor {
     }
     pub fn receipt(&self) -> &Receipt {
         self.sequencer.receipt()
+    }
+    /// Valid `PrimaryAlive` answers ignored as late ([`PrimaryWatch::late_answers`]).
+    pub fn late_answers(&self) -> u64 {
+        self.watch.late_answers()
+    }
+    /// Late chunks of expired transfers ignored on the pair link
+    /// ([`Channel::late_chunks`]).
+    pub fn late_chunks(&self) -> u64 {
+        self.channel.late_chunks()
     }
     pub fn failure(&self) -> Option<&Error> {
         self.failed.as_ref()
@@ -8149,6 +8282,15 @@ impl PrimaryActor {
     /// [`Primary::membership_certificate`].
     pub fn membership_certificate(&self) -> Option<&MembershipCertificate> {
         self.primary.membership_certificate()
+    }
+    /// Valid Pulses ignored as late ([`ProgressWatch::late_answers`]).
+    pub fn late_answers(&self) -> u64 {
+        self.watch.late_answers()
+    }
+    /// Late chunks of expired transfers ignored on the pair link
+    /// ([`Channel::late_chunks`]).
+    pub fn late_chunks(&self) -> u64 {
+        self.channel.late_chunks()
     }
     pub fn failure(&self) -> Option<&Error> {
         self.failed.as_ref()

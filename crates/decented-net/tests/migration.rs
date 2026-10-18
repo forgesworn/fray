@@ -612,7 +612,7 @@ fn an_expired_partial_transfer_does_not_refuse_the_next_valid_frame() {
 }
 
 #[test]
-fn a_late_chunk_of_an_expired_transfer_is_still_refused() {
+fn a_late_chunk_of_an_expired_transfer_is_ignored_counted_and_never_assembled() {
     let (context, _) = pair();
     let partial = Frame::split(
         context.session,
@@ -627,11 +627,15 @@ fn a_late_chunk_of_an_expired_transfer_is_still_refused() {
         .receive(&partial[0].encode().unwrap(), 0)
         .unwrap()
         .is_none());
+    assert_eq!(receiver.late_chunks(), 0);
+    // Late but harmless: ignored and counted, not refused as `Stale`.
     assert_eq!(
         receiver.receive(&partial[1].encode().unwrap(), 500),
-        Err(Error::Stale)
+        Ok(None)
     );
-    // Its first chunk was dropped with it; nothing is left pending.
+    assert_eq!(receiver.late_chunks(), 1);
+    // Its first chunk was dropped with it; nothing is left pending, so the
+    // transfer was never assembled.
     assert_eq!(receiver.expire(10_000), Ok(()));
 }
 
@@ -2292,11 +2296,15 @@ fn deferred_ingress_does_not_extend_the_existing_transfer_deadline() {
     let before = queue.queued_bytes();
     assert_eq!(queue.poll(|wire| sink.receive(wire, 0)), Ok(None));
     assert_eq!(queue.queued_bytes(), before);
+    // The queued chunk belongs to the transfer just dropped: it is ignored,
+    // never assembled.
     let result = queue.poll(|wire| sink.receive(wire, 501));
-    assert!(
-        result.is_err(),
+    assert_eq!(
+        result,
+        Ok(Some(false)),
         "a queued chunk revived an expired transfer: {result:?}"
     );
+    assert!(!sink.ready());
     assert!(
         SessionImage::decode(&descriptor.root, &image.encode(&descriptor.root).unwrap()).is_ok()
     );
@@ -2638,7 +2646,9 @@ fn idle_liveness_requires_fresh_challenges_on_the_current_tls_connection() {
     let late_probe = watch.probe(312).unwrap();
     let late = Pulse::respond(&root, &seq, &late_probe, [9; 32], Activity::Idle, 3, &key).unwrap();
     tick_progress(&mut watch, 312, 512);
-    assert!(watch.pulse(&late, 512).is_err());
+    // Valid but late: ignored and counted, and it refreshes nothing.
+    assert_eq!(watch.pulse(&late, 512), Ok(()));
+    assert_eq!(watch.late_answers(), 1);
     assert_eq!(watch.status(512).unwrap(), WatchStatus::Paused);
     assert!(watch.status(511).is_err());
 }
@@ -11366,7 +11376,8 @@ fn progress_watch_stall_with_a_live_standby_does_not_pause() {
     let (root, seq, key, mut watch, before) = stalled_progress_watch();
     // Answered during the stall, read after it: 300 ms after the probe.
     let late = idle_answer(&root, &seq, &key, &before, 2);
-    assert_eq!(watch.pulse(&late, 400), Err(Error::Stale));
+    assert_eq!(watch.pulse(&late, 400), Ok(()));
+    assert_eq!(watch.late_answers(), 1);
     assert_eq!(watch.status(400).unwrap(), WatchStatus::Live);
     let after = watch.probe(400).unwrap();
     assert_eq!(watch.status(420).unwrap(), WatchStatus::Live);
@@ -11413,7 +11424,8 @@ fn progress_watch_that_keeps_stalling_still_pauses_for_a_silent_standby() {
 fn primary_watch_stall_with_a_live_original_does_not_expire() {
     let (root, seq, primary, host, mut watch, before) = stalled_primary_watch();
     let late = PrimaryAlive::respond(&root, &primary, &before, [3; 32], 2, &host).unwrap();
-    assert_eq!(watch.response(&seq, &late, 400), Err(Error::Stale));
+    assert_eq!(watch.response(&seq, &late, 400), Ok(()));
+    assert_eq!(watch.late_answers(), 1);
     assert!(!watch.expired(&seq, 400).unwrap());
     let after = watch.probe(400).unwrap();
     assert!(!watch.expired(&seq, 420).unwrap());
@@ -11502,7 +11514,8 @@ fn actor_stall_with_a_live_peer_neither_promotes_nor_pauses() {
     standby.probe(100).unwrap();
     standby_to_original(&mut standby, &mut original, &host, 100, 105);
     let late = original_to_standby(&mut original, &mut standby, &key, 110, 400);
-    assert_eq!(late, vec![Err(Error::Stale)]);
+    assert_eq!(late, vec![Ok(None)]);
+    assert_eq!(standby.late_answers(), 1);
     assert!(!standby.expired(400).unwrap());
     standby.probe(400).unwrap();
     standby_to_original(&mut standby, &mut original, &host, 400, 405);
@@ -11531,7 +11544,8 @@ fn actor_stall_with_a_live_peer_neither_promotes_nor_pauses() {
     original.probe(100).unwrap();
     original_to_standby(&mut original, &mut standby, &key, 100, 105);
     let late = standby_to_original(&mut standby, &mut original, &host, 110, 400);
-    assert_eq!(late, vec![Err(Error::Stale)]);
+    assert_eq!(late, vec![Ok(None)]);
+    assert_eq!(original.late_answers(), 1);
     assert_eq!(original.status(400).unwrap(), WatchStatus::Live);
     original.probe(400).unwrap();
     original_to_standby(&mut original, &mut standby, &key, 400, 405);
@@ -11635,4 +11649,197 @@ fn toggling_activity_cannot_keep_a_dead_standby_live() {
     watch.set_activity(Activity::Advancing).unwrap();
     assert_eq!(watch.status(300).unwrap(), WatchStatus::Paused);
     assert_eq!(watch.status(310).unwrap(), WatchStatus::Paused);
+}
+
+// Harmless late frames (docs/migration-v1.md, "Late frames that are ignored"):
+// a valid probe answer read after its window, and a late chunk of a transfer
+// just dropped as expired, are ignored and counted. Every other `Stale`
+// stays a refusal.
+
+fn no_liveness_restore(_: &Candidate, _: &SessionImage, _: &SessionImage) -> Result<Vec<u8>> {
+    panic!("liveness traffic cannot restore")
+}
+
+#[test]
+fn a_late_primary_alive_on_the_standby_is_ignored_and_counted_without_freshness() {
+    let (_, host, key, mut original, mut standby, _) = replication_actors();
+    standby.probe(0).unwrap();
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 0, 5)
+            .iter()
+            .all(Result::is_ok)
+    );
+    // Fresh at 10 ms.
+    assert!(
+        original_to_standby(&mut original, &mut standby, &key, 5, 10)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_standby(&mut standby, 10, 100);
+    standby.probe(100).unwrap();
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 100, 105)
+            .iter()
+            .all(Result::is_ok)
+    );
+    // Sampled every 50 ms, so no stall: silence is due 200 ms after 10 ms.
+    tick_standby(&mut standby, 100, 300);
+    assert!(standby.expired(250).unwrap());
+    assert_eq!(standby.late_answers(), 0);
+    // The answer to the 100 ms probe is read 200 ms after it.
+    let mut late = Vec::new();
+    while let Some(wire) = original.poll_send(110).unwrap() {
+        late.push(standby.receive_classified(
+            &wire,
+            300,
+            &key,
+            Activity::Idle,
+            no_liveness_restore,
+        ));
+    }
+    assert_eq!(late, vec![Ok(None)]);
+    assert_eq!(standby.late_answers(), 1);
+    // It proved nothing: still expired, and the actor is not faulted.
+    assert!(standby.expired(300).unwrap());
+    assert!(standby.failure().is_none());
+}
+
+#[test]
+fn a_late_answer_does_not_excuse_replays_or_answers_to_unknown_probes() {
+    let (root, seq, primary, host, mut watch) = primary_watch_fixture();
+    let first = watch.probe(0).unwrap();
+    let late = PrimaryAlive::respond(&root, &primary, &first, [3; 32], 1, &host).unwrap();
+    tick_primary(&mut watch, &seq, 0, 250);
+    assert_eq!(watch.response(&seq, &late, 250), Ok(()));
+    assert_eq!(watch.late_answers(), 1);
+    // A replay of the late answer fails the sequence check as before.
+    assert_eq!(watch.response(&seq, &late, 260), Err(Error::Stale));
+    // So does a second answer to the same, already ignored probe.
+    let again = PrimaryAlive::respond(&root, &primary, &first, [3; 32], 2, &host).unwrap();
+    assert_eq!(watch.response(&seq, &again, 270), Err(Error::Stale));
+    // An answer to a probe this watch never sent is still refused.
+    let (_, _, _, _, mut other) = primary_watch_fixture();
+    let foreign = other.probe(0).unwrap();
+    let unknown = PrimaryAlive::respond(&root, &primary, &foreign, [3; 32], 3, &host).unwrap();
+    assert_eq!(watch.response(&seq, &unknown, 280), Err(Error::Stale));
+    // An answer bound to another TLS connection matches no probe either.
+    let probe = watch.probe(290).unwrap();
+    let mut elsewhere = probe.clone();
+    elsewhere.tls = [4; 32];
+    let wrong_tls = PrimaryAlive::respond(&root, &primary, &elsewhere, [4; 32], 4, &host).unwrap();
+    assert_eq!(watch.response(&seq, &wrong_tls, 295), Err(Error::Stale));
+    assert_eq!(watch.late_answers(), 1);
+    assert!(watch.expired(&seq, 295).unwrap());
+}
+
+#[test]
+fn a_late_pulse_on_the_original_is_ignored_and_counted_without_freshness() {
+    let (_, host, key, mut original, mut standby, _) = replication_actors();
+    original.set_activity(Activity::Idle).unwrap();
+    original.probe(0).unwrap();
+    original_to_standby(&mut original, &mut standby, &key, 0, 5);
+    // Fresh at 10 ms: an idle Pulse while both sides are idle.
+    assert!(
+        standby_to_original(&mut standby, &mut original, &host, 5, 10)
+            .iter()
+            .all(Result::is_ok)
+    );
+    tick_original(&mut original, 10, 100);
+    original.probe(100).unwrap();
+    original_to_standby(&mut original, &mut standby, &key, 100, 105);
+    tick_original(&mut original, 100, 300);
+    assert_eq!(original.status(250).unwrap(), WatchStatus::Paused);
+    let late = standby_to_original(&mut standby, &mut original, &host, 110, 300);
+    assert_eq!(late, vec![Ok(None)]);
+    assert_eq!(original.late_answers(), 1);
+    assert_eq!(original.status(300).unwrap(), WatchStatus::Paused);
+    assert!(original.failure().is_none());
+}
+
+#[test]
+fn a_candidate_with_a_wrong_index_or_parent_is_still_a_stale_frame_fault() {
+    let (root, _, key, _, mut standby, _, _, mut raw) = replication_actors_with_raw_original();
+    let context = root.context().unwrap();
+    let receipt = standby.receipt().clone();
+    let base = Candidate {
+        sequence: 1_000_000,
+        term: 0,
+        index: receipt.index + 1,
+        parent: receipt.digest(&context).unwrap(),
+        logical_ms: receipt.logical_ms + 16,
+        image: standby.image().to_vec(),
+        watermarks: receipt.watermarks.clone(),
+        outputs: vec![],
+    };
+    let wrong_index = Candidate {
+        index: receipt.index + 2,
+        ..base.clone()
+    };
+    let wrong_parent = Candidate {
+        sequence: 1_000_001,
+        parent: [9; 32],
+        ..base
+    };
+    for candidate in [wrong_index, wrong_parent] {
+        raw.enqueue(PacketKind::Candidate, &candidate.encode(&context).unwrap())
+            .unwrap();
+        let mut results = Vec::new();
+        while let Some(wire) = raw.poll_send(0).unwrap() {
+            results.push(standby.receive_classified(
+                &wire,
+                0,
+                &key,
+                Activity::Advancing,
+                |_, _, _| panic!("a stale base cannot restore"),
+            ));
+        }
+        assert_eq!(results.pop(), Some(Err(StandbyFault::Frame(Error::Stale))));
+        assert!(results.iter().all(|r| *r == Ok(None)));
+        assert_eq!(standby.receipt(), &receipt);
+        assert_eq!((standby.late_answers(), standby.late_chunks()), (0, 0));
+    }
+}
+
+#[test]
+fn a_late_primary_alive_with_an_older_frontier_is_still_ignored() {
+    // Batches keep committing while the answer is in flight, so the late
+    // answer's frontier is behind the standby's installed receipt.
+    let (_, host, key, mut original, mut standby, mut image) = replication_actors();
+    standby.probe(0).unwrap();
+    standby_to_original(&mut standby, &mut original, &host, 0, 5);
+    original_to_standby(&mut original, &mut standby, &key, 5, 10);
+    tick_standby(&mut standby, 10, 100);
+    standby.probe(100).unwrap();
+    standby_to_original(&mut standby, &mut original, &host, 100, 105);
+    let mut held = Vec::new();
+    while let Some(wire) = original.poll_send(105).unwrap() {
+        held.push(wire);
+    }
+    assert_eq!(held.len(), 1, "the answer is one frame");
+    let before = standby.receipt().clone();
+    image.logical_ms += 16;
+    image.game[0] = 1;
+    original
+        .prepare(image.clone(), before.watermarks.clone(), vec![])
+        .unwrap();
+    let mut installed = false;
+    while let Some(wire) = original.poll_send(150).unwrap() {
+        installed |= standby
+            .receive(&wire, 150, &key, Activity::Advancing, |candidate, _, _| {
+                Ok(candidate.image.clone())
+            })
+            .unwrap()
+            .is_some();
+    }
+    assert!(installed);
+    assert!(standby.receipt().index > before.index);
+    tick_standby(&mut standby, 150, 300);
+    let late: Vec<_> = held
+        .iter()
+        .map(|wire| {
+            standby.receive_classified(wire, 300, &key, Activity::Idle, no_liveness_restore)
+        })
+        .collect();
+    assert_eq!(late, vec![Ok(None)]);
+    assert_eq!(standby.late_answers(), 1);
 }

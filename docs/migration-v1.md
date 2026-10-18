@@ -184,7 +184,7 @@ apart.
 **A local stall is not peer silence.** Under CPU load a watcher can go 100 to
 300 ms between frames. The peer answers the probes the watcher sent before the
 stall, but the watcher reads those answers after it, more than 200 ms after the
-probe, and refuses them. Without a rule for this, the watcher would declare a
+probe, and ignores them (see "Late frames that are ignored" below). Without a rule for this, the watcher would declare a
 healthy peer silent. That would mean a false pause, or a false takeover.
 
 Each watch therefore notes the gap between consecutive samples. Every call
@@ -245,6 +245,36 @@ cannot keep a dead standby live: silence is reported at most 400 ms after the
 last idle answer. A watch that is already `Paused` does not turn `Live` at
 match start. `PrimaryWatch` has no activity state; the standby's watch
 needs no such rule.
+
+### Late frames that are ignored
+
+Two kinds of late frame are harmless. They are ignored and counted, and the
+call returns `Ok(None)` instead of `Error::Stale`, so a game can treat every
+`Stale` it does see as a real refusal.
+
+- **A late probe answer.** A `PrimaryAlive` read by the standby, or a `Pulse`
+  read by the original, that answers one of the watch's own probes after that
+  probe's 200 ms window. The probe may still be pending, or retired: each
+  watch remembers the last 64 probes that left the window unanswered. Such an
+  answer proves nothing and records no freshness: it neither refreshes the
+  watch nor restores the stall deferral. A late `Pulse`'s frontier is checked
+  as usual but not adopted. The answer's sequence is consumed and the probe is
+  forgotten, so a replay of it, or a second answer to the same probe, is still
+  `Stale`. Counted by `PrimaryWatch::late_answers` and
+  `StandbyActor::late_answers` on the standby, and by
+  `ProgressWatch::late_answers` and `PrimaryActor::late_answers` on the
+  original.
+- **A late chunk of an expired transfer.** See "Framing and ingress". Counted
+  by `PacketReceiver::late_chunks`, `Channel::late_chunks` and the actors'
+  `late_chunks`.
+
+Every other check keeps its result. An answer must still pass its signature,
+sequence and frontier checks, and an answer to a probe the watch never sent,
+or sent on another TLS connection, is `Stale` as before. All other `Stale`
+results stay refusals as before, in particular a candidate or delta whose
+index or parent does not follow the installed receipt (a
+`StandbyFault::Frame(Stale)` on the standby), and receipt or frontier
+problems.
 
 ## Replacement connections and recovery
 
@@ -374,9 +404,10 @@ a cached receive timestamp when retrying queued frames.
 
 At that deadline the part-received transfer is dropped; transfers still within
 their own deadline are kept. `Channel::expire` returns `Error::Stale` when it
-drops any. `Channel::receive` drops expired transfers first, then returns
-`Error::Stale` only for a chunk of a transfer it just dropped. Any other valid
-frame arriving then is processed normally.
+drops any. `Channel::receive` drops expired transfers first. A chunk of a
+transfer it just dropped is late but harmless: it is ignored (`Ok(None)`),
+counted by `Channel::late_chunks` and never assembled. Any other valid frame
+arriving then is processed normally.
 
 Move the retained receive queue together with its channel when activation
 hands off to normal actors. Bytes already accepted from the transport remain
