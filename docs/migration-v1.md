@@ -295,6 +295,12 @@ Deferred ingress does not renew a started transfer's 500 ms deadline. As with
 Activation and recovery retain their separate five-second deadlines. Do not pass
 a cached receive timestamp when retrying queued frames.
 
+At that deadline the part-received transfer is dropped; transfers still within
+their own deadline are kept. `Channel::expire` returns `Error::Stale` when it
+drops any. `Channel::receive` drops expired transfers first, then returns
+`Error::Stale` only for a chunk of a transfer it just dropped. Any other valid
+frame arriving then is processed normally.
+
 Move the retained receive queue together with its channel when activation
 hands off to normal actors. Bytes already accepted from the transport remain
 ordered even when the per-poll work limit or ingress rate defers their parsing.

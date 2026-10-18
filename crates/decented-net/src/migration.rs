@@ -2067,27 +2067,47 @@ impl PacketReceiver {
         self.highest = 0;
         Ok(())
     }
-    pub fn expire(&mut self, now_ms: u64) -> Result<()> {
-        if self.pending.values().any(|p| {
-            now_ms
+    /// Drop every part-received transfer at least 500 ms old (or started in
+    /// the future), and return their ids. Live partials are kept.
+    fn drop_expired(&mut self, now_ms: u64) -> Vec<u64> {
+        let mut dropped = Vec::new();
+        let mut freed = 0;
+        self.pending.retain(|id, p| {
+            let expired = now_ms
                 .checked_sub(p.started_ms)
-                .is_none_or(|age| age >= 500)
-        }) {
-            self.pending.clear();
-            self.queued_bytes = 0;
-            return Err(Error::Stale);
-        }
-        Ok(())
+                .is_none_or(|age| age >= 500);
+            if expired {
+                dropped.push(*id);
+                freed += p.transfer.length;
+            }
+            !expired
+        });
+        self.queued_bytes -= freed;
+        dropped
     }
+    /// Drop expired partial transfers; `Stale` reports that any were dropped.
+    pub fn expire(&mut self, now_ms: u64) -> Result<()> {
+        if self.drop_expired(now_ms).is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Stale)
+        }
+    }
+    /// Expired partial transfers are dropped first. The arriving frame is
+    /// refused as `Stale` only when it belongs to one of them; any other
+    /// valid frame is processed normally.
     pub fn receive(
         &mut self,
         bytes: &[u8],
         now_ms: u64,
     ) -> Result<Option<(PacketKind, u64, Vec<u8>)>> {
-        self.expire(now_ms)?;
+        let expired = self.drop_expired(now_ms);
         let frame = Frame::decode(bytes)?;
         if frame.session != self.session || frame.term != self.term {
             return Err(Error::Invalid("frame session/term"));
+        }
+        if expired.contains(&frame.transfer) {
+            return Err(Error::Stale);
         }
         if let Some((_, kind, digest, length, count, candidate)) =
             self.completed.iter().find(|(id, ..)| *id == frame.transfer)

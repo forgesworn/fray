@@ -564,6 +564,78 @@ fn fragment_headers_timeouts_term_changes_and_pressure_are_bounded() {
 }
 
 #[test]
+fn an_expired_partial_transfer_does_not_refuse_the_next_valid_frame() {
+    let (context, _) = pair();
+    let partial = Frame::split(
+        context.session,
+        0,
+        u64::MAX - 1,
+        PacketKind::Control,
+        &vec![1; CHUNK_PAYLOAD + 1],
+    )
+    .unwrap();
+    let live = Frame::split(
+        context.session,
+        0,
+        u64::MAX - 3,
+        PacketKind::Control,
+        &vec![3; CHUNK_PAYLOAD + 1],
+    )
+    .unwrap();
+    let control =
+        Frame::split(context.session, 0, u64::MAX - 2, PacketKind::Control, b"go").unwrap();
+    assert_eq!(control.len(), 1);
+    let mut receiver = PacketReceiver::new(context.session, 0).unwrap();
+    assert!(receiver
+        .receive(&partial[0].encode().unwrap(), 0)
+        .unwrap()
+        .is_none());
+    assert!(receiver
+        .receive(&live[0].encode().unwrap(), 300)
+        .unwrap()
+        .is_none());
+    // The first partial is past its 500 ms deadline; the single-chunk
+    // control arriving now is still delivered.
+    assert_eq!(
+        receiver.receive(&control[0].encode().unwrap(), 600),
+        Ok(Some((PacketKind::Control, u64::MAX - 2, b"go".to_vec())))
+    );
+    // The live partial survived that expiry and completes.
+    assert_eq!(
+        receiver.receive(&live[1].encode().unwrap(), 700),
+        Ok(Some((
+            PacketKind::Control,
+            u64::MAX - 3,
+            vec![3; CHUNK_PAYLOAD + 1]
+        )))
+    );
+}
+
+#[test]
+fn a_late_chunk_of_an_expired_transfer_is_still_refused() {
+    let (context, _) = pair();
+    let partial = Frame::split(
+        context.session,
+        0,
+        u64::MAX - 1,
+        PacketKind::Control,
+        &vec![1; CHUNK_PAYLOAD + 1],
+    )
+    .unwrap();
+    let mut receiver = PacketReceiver::new(context.session, 0).unwrap();
+    assert!(receiver
+        .receive(&partial[0].encode().unwrap(), 0)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        receiver.receive(&partial[1].encode().unwrap(), 500),
+        Err(Error::Stale)
+    );
+    // Its first chunk was dropped with it; nothing is left pending.
+    assert_eq!(receiver.expire(10_000), Ok(()));
+}
+
+#[test]
 fn primary_cannot_publish_speculative_state_or_use_an_unrelated_receipt() {
     let (mut standby, key) = armed();
     let mut primary = Primary::armed(
