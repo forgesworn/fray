@@ -3642,9 +3642,16 @@ impl ActivationSource {
         ticket.commit()?;
         Ok(())
     }
+    /// Once `Armed` and the index-0 certificate are both in, activation is
+    /// complete: a later frame (such as the standby's first probe) is left
+    /// unread with `RateLimited`, so a [`ReceiveQueue`] keeps it for the armed
+    /// primary, which answers it on the same `Channel`.
     pub fn receive(&mut self, wire: &[u8], now_ms: u64) -> Result<bool> {
         self.replay.live()?;
         self.clock.advance(now_ms)?;
+        if self.armed.is_some() && self.membership.is_some() {
+            return Err(Error::RateLimited);
+        }
         let Some((kind, _, bytes)) = self.channel.receive(wire, now_ms)? else {
             return Ok(false);
         };

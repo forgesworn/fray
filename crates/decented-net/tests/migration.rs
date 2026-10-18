@@ -3810,6 +3810,93 @@ fn authority_and_human_sender_ids_share_activation_links_and_promotion_without_r
     );
 }
 
+// The standby probes the original from its first poll, so the probe can reach
+// the original in the same drain as `Armed` and the index-0 certificate, while
+// the original is still in activation. Once both are in, activation leaves
+// later frames queued (not consumed) for the armed primary, which answers the
+// probe; it must not refuse the probe as a foreign control.
+#[test]
+fn completed_activation_leaves_a_queued_probe_for_the_armed_primary() {
+    let (fixture, host, standby, player) = descriptor_fixture();
+    let root = fixture.root;
+    let mut descriptor = Descriptor::offer(root.clone(), &host).unwrap();
+    descriptor.consent(&standby).unwrap();
+    let policy = EndpointPolicy {
+        descriptor: descriptor.clone(),
+        role: LinkRole::Standby,
+        promotion: None,
+        membership: None,
+    };
+    let binding = ConnectionBinding {
+        session: root.session,
+        descriptor: root.digest().unwrap(),
+        term: 0,
+        client: LinkRole::Original,
+        server: LinkRole::Standby,
+    };
+    let client = Channel::new(
+        &policy,
+        binding.clone(),
+        ChannelSide::Client,
+        root.standby,
+        [7; 32],
+    )
+    .unwrap();
+    let server = Channel::new(&policy, binding, ChannelSide::Server, root.host, [7; 32]).unwrap();
+    let image =
+        SessionImage::initial(&root, &[(1, 10), (2, 11), (3, 12)], vec![0], 1, 100).unwrap();
+    let mut source = ActivationSource::new(descriptor.clone(), image, client, 0).unwrap();
+    let mut sink = ActivationSink::new(descriptor.clone(), server, 0).unwrap();
+    let initial = source.initial_hash().unwrap();
+    source
+        .acknowledge(CapabilityAck::sign(&root, 1, initial, 7, &host).unwrap(), 0)
+        .unwrap();
+    source
+        .acknowledge(CapabilityAck::sign(&root, 2, initial, 1, &player).unwrap(), 0)
+        .unwrap();
+    while let Some(wire) = source.poll_send(0).unwrap() {
+        sink.receive(&wire, 0).unwrap();
+    }
+    let (seq, _, mut server) = sink.arm(&standby, 0, |bytes| Ok(bytes.to_vec())).unwrap();
+    // `Armed`, the index-0 certificate and the first probe all reach the
+    // original's ingress before it drains any of them.
+    let mut queue = ReceiveQueue::default();
+    while let Some(wire) = server.poll_send(0).unwrap() {
+        queue.enqueue(wire).unwrap();
+    }
+    let mut replica = StandbyActor::new(descriptor.clone(), seq, server, 0).unwrap();
+    replica.probe(0).unwrap();
+    let probe = replica.poll_send(0).unwrap().unwrap();
+    assert!(replica.poll_send(0).unwrap().is_none());
+    queue.enqueue(probe.clone()).unwrap();
+    let mut armed = false;
+    while let Some(ready) = queue.poll(|wire| source.receive(wire, 0)).unwrap() {
+        armed |= ready;
+    }
+    assert!(armed);
+    assert!(source.membership_certificate().is_some());
+    // Not consumed: the probe is still queued, and a direct call agrees.
+    assert_eq!(queue.queued_bytes(), probe.len());
+    assert_eq!(source.receive(&probe, 0), Err(Error::RateLimited));
+    let (primary, client) = source.finish(0).unwrap();
+    let mut original =
+        PrimaryActor::new(descriptor, primary, client, Activity::Idle, 0).unwrap();
+    assert!(queue
+        .poll(|wire| original.receive(wire, 0, &host))
+        .unwrap()
+        .is_some());
+    assert_eq!(queue.queued_bytes(), 0);
+    let alive = original.poll_send(0).unwrap().unwrap();
+    assert!(original.poll_send(0).unwrap().is_none());
+    PrimaryAlive::decode(&root, &Frame::decode(&alive).unwrap().payload).unwrap();
+    replica
+        .receive(&alive, 0, &standby, Activity::Idle, |_, _, _| {
+            panic!("probe is not a game batch")
+        })
+        .unwrap();
+    assert!(replica.failure().is_none());
+}
+
 #[test]
 fn paced_out_probes_burn_no_sender_sequence_on_either_side() {
     let (root, _, _, mut original, mut standby, _) = replication_actors();
