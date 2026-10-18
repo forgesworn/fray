@@ -4593,7 +4593,8 @@ pub struct Recovery {
     started: u64,
     security_anchor: u64,
     last_ms: u64,
-    /// Holds the survivor collection window open across one local stall.
+    /// Holds the survivor collection window open across a local stall;
+    /// promotion and each challenge arm it once.
     grace: StallGrace,
     applications: usize,
     departed: bool,
@@ -4729,7 +4730,8 @@ impl Recovery {
         // A local stall is not peer silence: survivors cannot be challenged,
         // and their proofs are not read, until it ends. A stall that began
         // while the window was open, promotion included, holds the window
-        // open until 200 ms after the stall, once per recovery.
+        // open until 200 ms after the stall. One extension per stall: once
+        // spent, only a new challenge re-arms it.
         if self.phase == RecoveryPhase::Collecting && self.collecting(self.last_ms) {
             let sample = self.last_ms;
             self.grace.sample(sample, now_ms, Some(sample), sample);
@@ -4742,7 +4744,7 @@ impl Recovery {
         Ok(())
     }
     /// The 250 ms survivor collection window from promotion, extended
-    /// across at most one local stall.
+    /// across a local stall once per promotion or challenge.
     fn collecting(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.started) < 250 || self.grace.holds(now_ms)
     }
@@ -4768,8 +4770,12 @@ impl Recovery {
         if !self.collecting(now_ms) {
             return Err(Error::Closed);
         }
-        self.gate
-            .issue(connection, tls, player, key, &self.sequencer, now_ms, keys)
+        let challenge =
+            self.gate
+                .issue(connection, tls, player, key, &self.sequencer, now_ms, keys)?;
+        // A new challenge can lose its proof to the next stall.
+        self.grace.rearm();
+        Ok(challenge)
     }
     pub fn accept(
         &mut self,
@@ -7113,6 +7119,10 @@ impl StallGrace {
     /// Fresh progress or a valid probe answer restores the allowance.
     fn fresh(&mut self) {
         self.until = None;
+        self.armed = true;
+    }
+    /// Restore the allowance without ending a deferral already running.
+    fn rearm(&mut self) {
         self.armed = true;
     }
     fn holds(&self, now_ms: u64) -> bool {
@@ -12190,6 +12200,11 @@ mod raw_recovery_engine_tests {
         assert_eq!(recovery.accept(20, [2; 32], &proof, 360), Ok(()));
         recovery.retain_local(3, 0, 0, 360).unwrap();
         assert!(!recovery.seal(360).unwrap());
+        // Sample every frame: the challenge re-armed the extension, so a
+        // clock jump would count as another local stall.
+        for now in (400..500).step_by(50) {
+            recovery.poll(now).unwrap();
+        }
         assert!(recovery.seal(500).unwrap());
         assert_eq!(
             recovery.survivors.keys().copied().collect::<Vec<_>>(),
@@ -12228,9 +12243,21 @@ mod raw_recovery_engine_tests {
         assert!(!recovery.survivors.contains_key(&2));
     }
     #[test]
-    fn the_collection_window_extends_for_one_local_stall_only() {
-        // A first stall from 10 to 300 holds the window open until 500. A
-        // second stall, from 400 to 520, is not deferred again.
+    fn a_challenge_rearms_the_window_for_the_next_stall() {
+        // One extension per stall, re-armed by a challenge. A first stall
+        // from 10 to 300 holds the window open until 500. A fresh challenge
+        // at 400 re-arms it, so a second stall from 400 to 520 is deferred.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        challenge_survivor(&mut recovery, &descriptor, &standby, &player, 10);
+        recovery.poll(300).unwrap();
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 400);
+        assert_eq!(recovery.accept(20, [2; 32], &proof, 520), Ok(()));
+        assert!(recovery.survivors.contains_key(&2));
+    }
+    #[test]
+    fn a_spent_extension_is_not_renewed_without_a_new_challenge() {
+        // A first stall from 10 to 300 holds the window open until 500. With
+        // no challenge since, a second stall from 400 to 520 is not deferred.
         let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
         let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 10);
         recovery.poll(300).unwrap();
@@ -12239,6 +12266,16 @@ mod raw_recovery_engine_tests {
             recovery.accept(20, [2; 32], &proof, 520),
             Err(Error::Closed)
         );
+    }
+    #[test]
+    fn a_stall_after_the_first_challenge_gets_its_own_extension() {
+        // A 150 ms takeover frame after promotion spends the first extension
+        // (until 350). The first drive then challenges at 150 and decodes the
+        // image for 250 ms before it reads the proof at 400.
+        let (mut recovery, descriptor, standby, player) = collecting_fixture(false);
+        let proof = challenge_survivor(&mut recovery, &descriptor, &standby, &player, 150);
+        assert_eq!(recovery.accept(20, [2; 32], &proof, 400), Ok(()));
+        assert!(recovery.survivors.contains_key(&2));
     }
     #[test]
     fn recovery_seals_survivors_replays_then_drains_stable_ids_before_missing_host_departure() {

@@ -251,8 +251,12 @@ from promotion. The same rule applies to it, because a survivor turned away
 there becomes a departure. Promotion and every `Recovery` call that takes the
 clock are samples. A gap over `STALL_GAP_MS` that began while the window was
 open, such as a long first frame after promotion, holds the window open
-(`challenge`, `accept` and `seal`) until `gap_end + 200 ms`, once per
-recovery. The window is still measured from promotion. Without a stall, a
+(`challenge`, `accept` and `seal`) until `gap_end + 200 ms`. Promotion arms
+one such extension, and each successful `challenge` re-arms it, so a stall
+after a challenge gets its own extension even when the promotion gap spent
+the first. A stall with no challenge since the last extension is not
+deferred, and the 5 s recovery deadline bounds every extension. The window is
+still measured from promotion. Without a stall, a
 proof read at 250 ms or later is still refused, and tests that jump the clock
 past the window sample it every frame up to the jump. Local members (restored bots
 and the standby's own seat) are not reached over a control path, so
