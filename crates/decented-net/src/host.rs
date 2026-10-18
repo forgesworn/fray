@@ -780,6 +780,21 @@ impl HostHandle {
     /// Each change rotates the LAN admission token, so a token heard in an
     /// earlier lobby does not admit anyone later.
     pub fn set_open(&self, open: bool) {
+        self.set_open_inner(open, true);
+    }
+
+    /// As [`set_open`](Self::set_open), but the LAN admission token stays as
+    /// it is. For a game rolling back a failed armed switch: the token it
+    /// handed its players (in the switch) still admits them when they dial
+    /// back in, although the room closed or reopened since. Use it only for
+    /// that rollback window; anywhere else, [`set_open`](Self::set_open)'s
+    /// rotation is what keeps a token heard in an earlier lobby from
+    /// admitting anyone later.
+    pub fn set_open_keeping_token(&self, open: bool) {
+        self.set_open_inner(open, false);
+    }
+
+    fn set_open_inner(&self, open: bool, rotate: bool) {
         if self
             .shared
             .session_policy
@@ -789,7 +804,7 @@ impl HostHandle {
         {
             return;
         }
-        if self.shared.open.swap(open, Ordering::Relaxed) != open {
+        if self.shared.open.swap(open, Ordering::Relaxed) != open && rotate {
             self.shared.rotate_lan_token();
         }
         let _ = self.cmd_tx.send(Cmd::SetOpen(open));

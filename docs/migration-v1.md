@@ -324,6 +324,16 @@ this, any host on the LAN could block the pin by opening a connection every
 few seconds, since an ordinary handshake holds its slot for up to 8 s before
 any admission check.
 
+`HostHandle::set_open` rotates the LAN admission token on every open and close,
+so a token heard in an earlier lobby admits nobody later. That defeats a game
+rolling back a failed armed switch: its switch handed players the current
+token, and the rollback's replayed departures may reopen a room that closed
+when it filled (or close it again), rotating the token those players will dial
+back with. `HostHandle::set_open_keeping_token` opens or closes the room
+exactly as `set_open` does but keeps the token. Use it only for opens and
+closes inside that rollback's rejoin window, then return to `set_open`. A closed
+room still refuses ordinary joins whatever the token.
+
 A matching runtime key and transport handshake do not prove retained client
 state. Normal TLS replacement uses `PlayerQueue::begin_reconnect`, then the
 retained `PlayerEndpoint::reconnect`, followed by the queue's `finish_reconnect`.

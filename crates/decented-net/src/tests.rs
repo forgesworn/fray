@@ -1015,6 +1015,46 @@ fn m1_a_direct_dial_without_the_code_or_lan_token_is_refused() {
     h.shutdown();
 }
 
+/// A game rolling back a failed switch closes or reopens its room without
+/// rotating the LAN token, so its players can dial back in with the token the
+/// switch gave them. Plain `set_open` still rotates.
+#[test]
+fn m1_reopening_while_keeping_the_token_admits_the_old_token() {
+    let c = cfg();
+    let h = host_with_relay_at_day(&c, &Identity::ephemeral(), room(8), None, DAY);
+    wait_ready(&h);
+    let a = h.local_addr().unwrap();
+    let addr = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a.port());
+    let connects = |token: &str| {
+        let cl = join_addr(&c, &Identity::ephemeral(), addr, token);
+        let ev = wait_client(&cl, 10, |e| {
+            matches!(
+                e,
+                ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+            )
+        });
+        (matches!(ev, ClientEvent::Connected { .. }), cl)
+    };
+    let held = h.lan_token();
+    h.set_open_keeping_token(false);
+    assert!(!h.is_open());
+    assert_eq!(held, h.lan_token());
+    h.set_open_keeping_token(true);
+    assert!(h.is_open());
+    assert_eq!(held, h.lan_token());
+    let (ok, _kept) = connects(&held);
+    assert!(ok, "the held token must still admit after a keeping reopen");
+    // Plain set_open still rotates, and the held token stops working.
+    h.set_open(false);
+    h.set_open(true);
+    assert_ne!(held, h.lan_token());
+    let (ok, _stale) = connects(&held);
+    assert!(!ok, "a rotated-away token must be refused");
+    let (ok, _fresh) = connects(&h.lan_token());
+    assert!(ok);
+    h.shutdown();
+}
+
 #[test]
 fn m2_a_peer_that_floods_a_stalled_host_is_dropped_and_memory_stays_bounded() {
     let (h, cl, peer, _) = connected_pair(4);

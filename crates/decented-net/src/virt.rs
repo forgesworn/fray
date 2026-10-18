@@ -219,7 +219,8 @@ async fn run_host(
             }
             _ = sweep.tick() => socket.sweep(),
             cmd = cmd_rx.recv() => match cmd {
-                // Opening or closing already rotated the token new links get.
+                // The handle already applied the open state, and the token
+                // (rotated or kept); each new link reads the current one.
                 Some(Cmd::SetOpen(_)) => {}
                 Some(Cmd::Shutdown(tx)) => { done = Some(tx); break; }
                 None => break,
