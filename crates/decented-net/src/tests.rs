@@ -2046,6 +2046,17 @@ fn liveness_defaults_equal_the_historic_constants() {
 }
 
 #[test]
+fn an_idle_timeout_quic_would_send_as_none_is_refused() {
+    // QUIC carries the idle timeout in whole milliseconds, and 0 means "never time out".
+    let mut c = NetConfig::new("d", "t");
+    c.idle_timeout = Duration::from_micros(500);
+    c.keep_alive = Duration::from_micros(100);
+    assert!(c.liveness().is_err(), "a 0.5 ms idle timeout would go out as no timeout at all");
+    c.idle_timeout = Duration::from_millis(1);
+    assert!(c.liveness().is_ok());
+}
+
+#[test]
 fn a_bad_liveness_pair_is_refused_by_host_and_join() {
     let pairs = [
         (Duration::from_secs(6), Duration::ZERO, "keep_alive"),

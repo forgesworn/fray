@@ -45,10 +45,11 @@ impl Liveness {
     };
 
     /// Both non-zero, and the keep-alive shorter than the idle timeout (or it
-    /// could never keep a quiet connection open).
+    /// could never keep a quiet connection open). QUIC carries the idle timeout
+    /// in whole milliseconds and reads 0 as "never", so it is at least 1 ms.
     pub(crate) fn new(idle_timeout: Duration, keep_alive: Duration) -> Result<Liveness, String> {
-        if idle_timeout.is_zero() {
-            return Err("idle_timeout must not be zero".into());
+        if idle_timeout < Duration::from_millis(1) {
+            return Err(format!("idle_timeout ({idle_timeout:?}) must be at least 1 ms"));
         }
         if keep_alive.is_zero() {
             return Err("keep_alive must not be zero".into());

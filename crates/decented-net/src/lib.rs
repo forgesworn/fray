@@ -133,6 +133,9 @@ pub struct NetConfig {
     /// candidate. STUN still reports the address the VPN presents.
     pub vpn_active: bool,
     /// How long a silent connection lives before it is dropped. Default 6 s.
+    /// QUIC uses the lower of the two ends' values (and never less than three
+    /// round-trip timeouts), so a peer can only shorten it. A longer timeout
+    /// also delays the drop events that start a host migration.
     pub idle_timeout: std::time::Duration,
     /// How often an idle connection sends a keep-alive. Default 1 s.
     pub keep_alive: std::time::Duration,
