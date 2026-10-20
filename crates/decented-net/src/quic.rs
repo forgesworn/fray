@@ -377,17 +377,18 @@ pub(crate) struct HostProof {
 /// Every exporter label Fray uses itself; an app label may not be one.
 const FRAY_EXPORTER_LABELS: &[&[u8]] = &[EXPORTER_LABEL];
 
-/// An app exporter label: `EXPORTER-` prefix (RFC 8446 7.5), at most 255
-/// bytes, and none of Fray's own.
+/// An app exporter label: `EXPORTER-` prefix (RFC 8446 7.5), at most 249
+/// bytes (TLS 1.3 prefixes "tls13 " and caps the whole label at 255), and none
+/// of Fray's own.
 pub(crate) fn check_app_label(label: &str) -> Result<(), String> {
     if !label.starts_with("EXPORTER-") {
         return Err(format!(
             "app_binding_label ({label:?}) must start with EXPORTER-"
         ));
     }
-    if label.len() > 255 {
+    if label.len() > 249 {
         return Err(format!(
-            "app_binding_label is {} bytes; at most 255 are allowed",
+            "app_binding_label is {} bytes; at most 249 are allowed",
             label.len()
         ));
     }

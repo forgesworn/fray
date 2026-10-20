@@ -2682,10 +2682,10 @@ fn a_bad_app_label_is_refused_by_host_and_join() {
         ("no-prefix".to_string(), "EXPORTER-"),
         ("exporter-lowercase".to_string(), "EXPORTER-"),
         ("EXPORTER-decented-net-hello-v2".to_string(), "reserved"),
-        (format!("EXPORTER-{}", "a".repeat(247)), "255"),
+        (format!("EXPORTER-{}", "a".repeat(241)), "249"),
         (String::new(), "EXPORTER-"),
     ];
-    assert_eq!(bad[3].0.len(), 256);
+    assert_eq!(bad[3].0.len(), 250);
     for (label, word) in bad {
         let mut c = cfg();
         c.app_binding_label = Some(label.clone());
@@ -2710,8 +2710,8 @@ fn a_bad_app_label_is_refused_by_host_and_join() {
             "{label:?}: {ev:?}"
         );
     }
-    // The longest allowed label (255 bytes) is accepted.
+    // The longest allowed label (249 bytes: TLS 1.3 adds "tls13 " and caps the whole at 255) is accepted.
     let mut c = cfg();
-    c.app_binding_label = Some(format!("EXPORTER-{}", "a".repeat(246)));
+    c.app_binding_label = Some(format!("EXPORTER-{}", "a".repeat(240)));
     assert!(c.checked().is_ok());
 }

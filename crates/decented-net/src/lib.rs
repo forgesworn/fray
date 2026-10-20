@@ -144,7 +144,7 @@ pub struct NetConfig {
     /// empty context, on both ends: [`ClientHandle::app_binding`] and
     /// [`HostHandle::app_binding`] return them. Both ends of one connection
     /// get the same bytes; two different TLS sessions never do. The label must
-    /// start with `EXPORTER-`, be at most 255 bytes, and differ from every
+    /// start with `EXPORTER-`, be at most 249 bytes, and differ from every
     /// label Fray uses itself (`EXPORTER-decented-net-hello-v2`); anything else
     /// fails the host or join at start, like a bad idle-timeout pair. The value
     /// is `None` if the exporter fails. A host that resumes or stands by gives

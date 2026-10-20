@@ -694,6 +694,8 @@ impl HostHandle {
     /// [`ClientHandle::app_binding`] returns. `None` for an unknown peer, when
     /// no label is configured, or if the exporter failed. A peer that comes
     /// back on a new connection (a resume) gets that connection's own value.
+    /// `peer` is this host's transport id: a migration successor numbers its
+    /// peers afresh, so don't pass a migration seat or logical peer as one.
     pub fn app_binding(&self, peer: PeerId) -> Option<[u8; 32]> {
         self.link(peer)?.app_binding
     }
