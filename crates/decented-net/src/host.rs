@@ -346,6 +346,7 @@ pub(crate) fn start_session_endpoint(
     code: &str,
     policy: crate::migration::EndpointPolicy,
 ) -> Result<HostHandle, String> {
+    cfg.liveness()?;
     policy
         .validate(id.pubkey().to_bytes(), code, &cfg.app_tag)
         .map_err(|e| e.to_string())?;
@@ -904,6 +905,13 @@ impl HostTask {
         relay: Option<Box<dyn RendezvousRelay>>,
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     ) {
+        let live = match self.cfg.liveness() {
+            Ok(l) => l,
+            Err(e) => {
+                self.shared.emit(HostEvent::Failed { reason: e });
+                return;
+            }
+        };
         let online = upnp_wanted(relay.is_some(), self.cfg.vpn_active);
         let prep = match prepare(
             self.cfg.quic_port,
@@ -926,21 +934,22 @@ impl HostTask {
             Some(lan) => (lan, Some(prep.socket)),
             None => (prep.socket, None),
         };
-        let endpoint = match quic::server_endpoint(lan_socket, &self.cfg.app_tag) {
+        let endpoint = match quic::server_endpoint(lan_socket, &self.cfg.app_tag, live) {
             Ok(ep) => ep,
             Err(e) => {
                 self.shared.emit(HostEvent::Failed { reason: e });
                 return;
             }
         };
-        let online_ep = match online_socket.map(|s| quic::server_endpoint(s, &self.cfg.app_tag)) {
-            Some(Ok(ep)) => Some(ep),
-            Some(Err(e)) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                return;
-            }
-            None => None,
-        };
+        let online_ep =
+            match online_socket.map(|s| quic::server_endpoint(s, &self.cfg.app_tag, live)) {
+                Some(Ok(ep)) => Some(ep),
+                Some(Err(e)) => {
+                    self.shared.emit(HostEvent::Failed { reason: e });
+                    return;
+                }
+                None => None,
+            };
         let local = endpoint.local_addr().ok();
         if let Ok(mut a) = self.shared.local_addr.lock() {
             *a = local;
@@ -1946,7 +1955,8 @@ mod migration_transition_tests {
         // welcome but deliberately never sends Identify.
         let (endpoint, bare, opened) = crate::runtime().block_on(async {
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let endpoint = quic::client_endpoint(socket, &cfg.app_tag).unwrap();
+            let endpoint =
+                quic::client_endpoint(socket, &cfg.app_tag, quic::Liveness::DEFAULT).unwrap();
             let bare = endpoint
                 .connect(addr, quic::SERVER_NAME)
                 .unwrap()
@@ -2513,7 +2523,8 @@ mod migration_transition_tests {
             let (mut endpoints, mut stalled) = (Vec::new(), Vec::new());
             for _ in 0..2 {
                 let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-                let endpoint = quic::client_endpoint(socket, &cfg.app_tag).unwrap();
+                let endpoint =
+                    quic::client_endpoint(socket, &cfg.app_tag, quic::Liveness::DEFAULT).unwrap();
                 let conn = endpoint
                     .connect(addr, quic::SERVER_NAME)
                     .unwrap()
@@ -2598,7 +2609,7 @@ mod migration_transition_tests {
         let app = cfg.app_tag.clone();
         let server = crate::runtime().spawn(async move {
             let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let endpoint = quic::server_endpoint(socket, &app).unwrap();
+            let endpoint = quic::server_endpoint(socket, &app, quic::Liveness::DEFAULT).unwrap();
             tx.send(endpoint.local_addr().unwrap()).unwrap();
             let incoming = endpoint.accept().await.unwrap();
             tokio::time::sleep(Duration::from_millis(2500)).await;

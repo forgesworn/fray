@@ -326,6 +326,10 @@ async fn run(
     shared.emit(ClientEvent::Progress {
         stage: JoinStage::Preparing,
     });
+    let live = match cfg.liveness() {
+        Ok(l) => l,
+        Err(e) => return fail(JoinStage::Preparing, FailReason::Network(e)),
+    };
 
     // For a code join: the relay (kept to spot a racing second answer) and
     // the key that answered, which the welcome must match.
@@ -366,14 +370,17 @@ async fn run(
                     shared.emit(ClientEvent::Progress {
                         stage: JoinStage::Connecting,
                     });
-                    (quic::client_endpoint(socket, &cfg.app_tag), PathKind::Lan)
+                    (
+                        quic::client_endpoint(socket, &cfg.app_tag, live),
+                        PathKind::Lan,
+                    )
                 }
                 Some(link) => {
                     shared.emit(ClientEvent::Progress {
                         stage: JoinStage::Connecting,
                     });
                     (
-                        crate::virt::client_endpoint(link, &cfg.app_tag),
+                        crate::virt::client_endpoint(link, &cfg.app_tag, live),
                         PathKind::Virtual,
                     )
                 }
@@ -513,7 +520,7 @@ async fn run(
                 Ok(s) => s,
                 Err(e) => return fail(JoinStage::Connecting, FailReason::Network(e.to_string())),
             };
-            let endpoint = match quic::client_endpoint(socket, &cfg.app_tag) {
+            let endpoint = match quic::client_endpoint(socket, &cfg.app_tag, live) {
                 Ok(ep) => ep,
                 Err(e) => return fail(JoinStage::Connecting, FailReason::Network(e)),
             };

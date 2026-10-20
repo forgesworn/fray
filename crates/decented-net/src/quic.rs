@@ -27,7 +27,46 @@ pub(crate) const SERVER_NAME: &str = "decented-net";
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-decented-net-hello-v2";
 /// Idle timeout: a peer that vanishes (kill -9, Wi-Fi off) is noticed this fast.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
-const KEEP_ALIVE: Duration = Duration::from_secs(1);
+pub(crate) const KEEP_ALIVE: Duration = Duration::from_secs(1);
+
+/// A checked idle-timeout / keep-alive pair (see [`crate::NetConfig::idle_timeout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Liveness {
+    idle_timeout: Duration,
+    keep_alive: Duration,
+}
+
+impl Liveness {
+    /// Today's constants (tests that build endpoints without a config).
+    #[cfg(test)]
+    pub(crate) const DEFAULT: Liveness = Liveness {
+        idle_timeout: IDLE_TIMEOUT,
+        keep_alive: KEEP_ALIVE,
+    };
+
+    /// Both non-zero, and the keep-alive shorter than the idle timeout (or it
+    /// could never keep a quiet connection open).
+    pub(crate) fn new(idle_timeout: Duration, keep_alive: Duration) -> Result<Liveness, String> {
+        if idle_timeout.is_zero() {
+            return Err("idle_timeout must not be zero".into());
+        }
+        if keep_alive.is_zero() {
+            return Err("keep_alive must not be zero".into());
+        }
+        if keep_alive >= idle_timeout {
+            return Err(format!(
+                "keep_alive ({keep_alive:?}) must be shorter than idle_timeout ({idle_timeout:?})"
+            ));
+        }
+        if quinn::IdleTimeout::try_from(idle_timeout).is_err() {
+            return Err(format!("idle_timeout ({idle_timeout:?}) is too long"));
+        }
+        Ok(Liveness {
+            idle_timeout,
+            keep_alive,
+        })
+    }
+}
 /// QUIC handshake + stream open + hello must finish within this.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// A session-bound (pinned-listener) handshake attempt has this one overall
@@ -76,20 +115,22 @@ pub(crate) fn alpn(app_tag: &str) -> Vec<u8> {
 
 /// The transport settings every endpoint shares (a virtual link adds its MTU
 /// pins on top; see `virt`).
-pub(crate) fn base_transport() -> quinn::TransportConfig {
+pub(crate) fn base_transport(live: Liveness) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
-    t.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("idle timeout fits")));
-    t.keep_alive_interval(Some(KEEP_ALIVE));
+    t.max_idle_timeout(Some(
+        live.idle_timeout.try_into().expect("checked by Liveness"),
+    ));
+    t.keep_alive_interval(Some(live.keep_alive));
     t.datagram_receive_buffer_size(Some(256 * 1024));
     t.datagram_send_buffer_size(256 * 1024);
     t
 }
 
-fn transport_config() -> Arc<quinn::TransportConfig> {
-    Arc::new(base_transport())
+fn transport_config(live: Liveness) -> Arc<quinn::TransportConfig> {
+    Arc::new(base_transport(live))
 }
 
-pub(crate) fn server_config(app_tag: &str) -> Result<quinn::ServerConfig, String> {
+pub(crate) fn server_config(app_tag: &str, live: Liveness) -> Result<quinn::ServerConfig, String> {
     let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
         .map_err(|e| format!("certificate: {e}"))?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
@@ -107,11 +148,11 @@ pub(crate) fn server_config(app_tag: &str) -> Result<quinn::ServerConfig, String
     let qc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| format!("quic tls: {e}"))?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(qc));
-    cfg.transport_config(transport_config());
+    cfg.transport_config(transport_config(live));
     Ok(cfg)
 }
 
-pub(crate) fn client_config(app_tag: &str) -> Result<quinn::ClientConfig, String> {
+pub(crate) fn client_config(app_tag: &str, live: Liveness) -> Result<quinn::ClientConfig, String> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -124,7 +165,7 @@ pub(crate) fn client_config(app_tag: &str) -> Result<quinn::ClientConfig, String
     let qc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .map_err(|e| format!("quic tls: {e}"))?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(qc));
-    cfg.transport_config(transport_config());
+    cfg.transport_config(transport_config(live));
     Ok(cfg)
 }
 
@@ -133,11 +174,12 @@ pub(crate) fn client_config(app_tag: &str) -> Result<quinn::ClientConfig, String
 pub(crate) fn server_endpoint(
     socket: std::net::UdpSocket,
     app_tag: &str,
+    live: Liveness,
 ) -> Result<quinn::Endpoint, String> {
     let runtime = quinn::default_runtime().ok_or("no async runtime")?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
-        Some(server_config(app_tag)?),
+        Some(server_config(app_tag, live)?),
         socket,
         runtime,
     )
@@ -147,11 +189,12 @@ pub(crate) fn server_endpoint(
 pub(crate) fn client_endpoint(
     socket: std::net::UdpSocket,
     app_tag: &str,
+    live: Liveness,
 ) -> Result<quinn::Endpoint, String> {
     let runtime = quinn::default_runtime().ok_or("no async runtime")?;
     let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
         .map_err(|e| format!("endpoint: {e}"))?;
-    ep.set_default_client_config(client_config(app_tag)?);
+    ep.set_default_client_config(client_config(app_tag, live)?);
     Ok(ep)
 }
 

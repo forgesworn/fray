@@ -132,6 +132,10 @@ pub struct NetConfig {
     /// so no UPnP is attempted and no room-code offer carries a UPnP
     /// candidate. STUN still reports the address the VPN presents.
     pub vpn_active: bool,
+    /// How long a silent connection lives before it is dropped. Default 6 s.
+    pub idle_timeout: std::time::Duration,
+    /// How often an idle connection sends a keep-alive. Default 1 s.
+    pub keep_alive: std::time::Duration,
     /// Tests only: whether the hooked LAN endpoint treats loopback sources as
     /// local (always so outside tests: loopback is this device).
     #[cfg(test)]
@@ -154,9 +158,17 @@ impl NetConfig {
             withhold_host_attestation: None,
             lan_socket_hook: None,
             vpn_active: false,
+            idle_timeout: quic::IDLE_TIMEOUT,
+            keep_alive: quic::KEEP_ALIVE,
             #[cfg(test)]
             lan_allow_loopback: true,
         }
+    }
+
+    /// The checked idle-timeout / keep-alive pair: both non-zero and
+    /// `keep_alive < idle_timeout`. Checked where the config is first used.
+    pub(crate) fn liveness(&self) -> Result<quic::Liveness, String> {
+        quic::Liveness::new(self.idle_timeout, self.keep_alive)
     }
 
     /// No relays and no STUN: a host or joiner that never touches the internet.

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::{
-    Bytes, ClientEvent, DisconnectReason, HostEvent, LeaveReason, NetConfig, PeerId, RoomInfo,
+    Bytes, ClientEvent, DisconnectReason, FailReason, HostEvent, LeaveReason, NetConfig, PeerId,
+    RoomInfo,
 };
 
 fn cfg() -> NetConfig {
@@ -669,6 +670,127 @@ fn a_dropped_link_times_out_on_both_sides() {
     );
     assert_eq!(h.peer_count(), 0);
     h.shutdown();
+}
+
+fn liveness_cfg(idle_ms: u64, keep_alive_ms: u64) -> NetConfig {
+    let mut c = cfg();
+    c.idle_timeout = Duration::from_millis(idle_ms);
+    c.keep_alive = Duration::from_millis(keep_alive_ms);
+    c
+}
+
+fn ready_host_with(c: &NetConfig, id: &Identity) -> (HostHandle, VirtualLinkSender) {
+    let (links_tx, links_rx) = virtual_link_queue(64);
+    let h = host_virtual(c, id, room(4), links_rx);
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    (h, links_tx)
+}
+
+/// A shorter configured idle timeout drops a silenced peer at that time, not
+/// at the 6 s default.
+#[test]
+fn a_dropped_link_times_out_at_the_configured_idle_timeout() {
+    let c = liveness_cfg(2000, 500);
+    let id = Identity::ephemeral();
+    let (h, links) = ready_host_with(&c, &Identity::ephemeral());
+    let (link, tap) = tapped(&links, "cut me fast", Box::new(|_, p| Some(p)));
+    let cl = join_virtual(&c, &id, link);
+    let peer = connected(&h, &cl, &id);
+    let cut = Instant::now();
+    tap.task.abort();
+    let ev = wait_host(&h, 5, |e| matches!(e, HostEvent::PeerLeft { .. }));
+    let host_after = cut.elapsed();
+    assert!(
+        matches!(ev, HostEvent::PeerLeft { peer: p, reason: LeaveReason::TimedOut } if p == peer),
+        "{ev:?}"
+    );
+    assert!(
+        host_after >= Duration::from_millis(1500) && host_after < Duration::from_millis(4500),
+        "host dropped the peer after {host_after:?}, expected about 2 s"
+    );
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    assert!(
+        matches!(
+            ev,
+            ClientEvent::Disconnected {
+                reason: DisconnectReason::TimedOut
+            }
+        ),
+        "{ev:?}"
+    );
+    assert!(
+        cut.elapsed() < Duration::from_millis(4500),
+        "{:?}",
+        cut.elapsed()
+    );
+    h.shutdown();
+}
+
+/// A long idle timeout with sparse keep-alives holds a live but quiet
+/// connection open well past the 6 s default.
+#[test]
+fn a_quiet_peer_survives_past_the_default_idle_timeout_when_configured() {
+    // A keep-alive every 8 s would not save a 6 s idle timeout.
+    let c = liveness_cfg(12_000, 8_000);
+    let id = Identity::ephemeral();
+    let (h, links) = ready_host_with(&c, &Identity::ephemeral());
+    let (link, tap) = tapped(&links, "quiet", Box::new(|_, p| Some(p)));
+    let cl = join_virtual(&c, &id, link);
+    let peer = connected(&h, &cl, &id);
+    std::thread::sleep(Duration::from_secs(1));
+    let quiet_from = tap.log.lock().unwrap().len();
+    std::thread::sleep(Duration::from_secs(9));
+    // The configured 8 s keep-alive is in use: the default 1 s one would put
+    // some 35 packets on the link in that time.
+    let quiet_packets = tap.log.lock().unwrap().len() - quiet_from;
+    assert!(quiet_packets <= 12, "{quiet_packets} packets while quiet");
+    while let Some(ev) = h.poll() {
+        assert!(!matches!(ev, HostEvent::PeerLeft { .. }), "{ev:?}");
+    }
+    while let Some(ev) = cl.poll() {
+        assert!(!matches!(ev, ClientEvent::Disconnected { .. }), "{ev:?}");
+    }
+    assert_eq!(h.peer_count(), 1);
+    h.send_reliable(peer, Bytes::from_static(b"still here"));
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Reliable(_)));
+    assert!(matches!(ev, ClientEvent::Reliable(b) if &b[..] == b"still here"));
+    h.shutdown();
+}
+
+fn bad_liveness_pairs() -> Vec<(NetConfig, &'static str)> {
+    vec![
+        (liveness_cfg(6000, 0), "keep_alive"),
+        (liveness_cfg(0, 500), "idle_timeout"),
+        (liveness_cfg(0, 0), "idle_timeout"),
+        (liveness_cfg(2000, 2000), "keep_alive"),
+        (liveness_cfg(2000, 3000), "keep_alive"),
+    ]
+}
+
+/// A bad liveness pair is refused by `host_virtual` and `join_virtual`.
+#[test]
+fn a_bad_liveness_pair_is_refused_on_virtual_links() {
+    for (bad, word) in bad_liveness_pairs() {
+        let (links_tx, links_rx) = virtual_link_queue(8);
+        let h = host_virtual(&bad, &Identity::ephemeral(), room(4), links_rx);
+        let ev = wait_host(&h, 5, |e| {
+            matches!(e, HostEvent::Failed { .. } | HostEvent::Ready { .. })
+        });
+        assert!(
+            matches!(&ev, HostEvent::Failed { reason } if reason.contains(word)),
+            "{bad:?}: {ev:?}"
+        );
+        h.shutdown();
+        drop(links_tx);
+
+        let (_good_host, links) = ready_host(&Identity::ephemeral(), 4);
+        let cl = join_virtual(&bad, &Identity::ephemeral(), dial(&links, "bad pair"));
+        let ev = outcome(&cl);
+        assert!(
+            matches!(&ev, ClientEvent::Failed { reason: FailReason::Network(m), .. } if m.contains(word)),
+            "{bad:?}: {ev:?}"
+        );
+    }
 }
 
 /// (e) Every packet on a link fits the frame budget: at most 1 + 1200 bytes,

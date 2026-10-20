@@ -1328,7 +1328,8 @@ fn spawn_on_path_host(
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
     crate::runtime().spawn(async move {
-        let Ok(ep) = crate::quic::server_endpoint(socket, &app_tag) else {
+        let Ok(ep) = crate::quic::server_endpoint(socket, &app_tag, crate::quic::Liveness::DEFAULT)
+        else {
             return;
         };
         while let Some(incoming) = ep.accept().await {
@@ -1529,7 +1530,7 @@ mod review_v2 {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         crate::runtime().spawn(async move {
-            let Ok(ep) = quic::server_endpoint(socket, &app_tag) else {
+            let Ok(ep) = quic::server_endpoint(socket, &app_tag, quic::Liveness::DEFAULT) else {
                 return;
             };
             while let Some(incoming) = ep.accept().await {
@@ -1761,7 +1762,7 @@ mod review_v2 {
         let w = Arc::clone(&welcomed);
         let out = crate::runtime().block_on(async move {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let ep = quic::client_endpoint(socket, &c.app_tag).unwrap();
+            let ep = quic::client_endpoint(socket, &c.app_tag, quic::Liveness::DEFAULT).unwrap();
             let conn = ep.connect(addr, quic::SERVER_NAME).unwrap().await.unwrap();
             let check: quic::HostCheck = Arc::new(move |_| {
                 w.store(true, Ordering::Relaxed);
@@ -2033,6 +2034,53 @@ fn a_host_built_from_existing_keys_presents_those_keys() {
     h.shutdown();
 }
 
+#[test]
+fn liveness_defaults_equal_the_historic_constants() {
+    for c in [
+        NetConfig::new("d", "t"),
+        NetConfig::new("d", "t").lan_only(),
+    ] {
+        assert_eq!(c.idle_timeout, Duration::from_secs(6));
+        assert_eq!(c.keep_alive, Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn a_bad_liveness_pair_is_refused_by_host_and_join() {
+    let pairs = [
+        (Duration::from_secs(6), Duration::ZERO, "keep_alive"),
+        (Duration::ZERO, Duration::from_millis(500), "idle_timeout"),
+        (Duration::ZERO, Duration::ZERO, "idle_timeout"),
+        (Duration::from_secs(2), Duration::from_secs(2), "keep_alive"),
+        (Duration::from_secs(2), Duration::from_secs(3), "keep_alive"),
+    ];
+    for (idle, ka, word) in pairs {
+        let mut c = cfg();
+        c.idle_timeout = idle;
+        c.keep_alive = ka;
+        let h = host(&c, &Identity::ephemeral(), room(4));
+        let ev = wait_host(&h, 5, |e| {
+            matches!(e, HostEvent::Failed { .. } | HostEvent::Ready { .. })
+        });
+        assert!(
+            matches!(&ev, HostEvent::Failed { reason } if reason.contains(word)),
+            "{idle:?}/{ka:?}: {ev:?}"
+        );
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        let cl = join_addr(&c, &Identity::ephemeral(), addr, &"0".repeat(64));
+        let ev = wait_client(&cl, 5, |e| {
+            matches!(
+                e,
+                ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+            )
+        });
+        assert!(
+            matches!(&ev, ClientEvent::Failed { reason: FailReason::Network(m), .. } if m.contains(word)),
+            "{idle:?}/{ka:?}: {ev:?}"
+        );
+    }
+}
+
 /// (b) An IPv4-only joiner and a dual-stack host: QUIC runs over the
 /// v4-mapped path, and the host sees the joiner as `::ffff:127.0.0.1`.
 #[test]
@@ -2044,8 +2092,12 @@ fn w3_an_ipv4_only_joiner_reaches_a_dual_stack_endpoint_via_a_mapped_address() {
     let client_port = client_sock.local_addr().unwrap().port();
     let tag = cfg().app_tag;
     crate::runtime().block_on(async move {
-        let server = crate::quic::server_endpoint(server_sock, &tag).unwrap();
-        let client = crate::quic::client_endpoint(client_sock, &tag).unwrap();
+        let server =
+            crate::quic::server_endpoint(server_sock, &tag, crate::quic::Liveness::DEFAULT)
+                .unwrap();
+        let client =
+            crate::quic::client_endpoint(client_sock, &tag, crate::quic::Liveness::DEFAULT)
+                .unwrap();
         let target = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let dial = client.connect(target, crate::quic::SERVER_NAME).unwrap();
         let incoming = tokio::time::timeout(Duration::from_secs(5), server.accept())

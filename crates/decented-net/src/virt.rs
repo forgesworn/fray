@@ -146,6 +146,7 @@ pub fn host_virtual(
     links: VirtualLinkReceiver,
 ) -> HostHandle {
     let app_tag = cfg.app_tag.clone();
+    let live = cfg.liveness();
     let id = host_identity(cfg, id, true);
     start_host(
         &id,
@@ -155,7 +156,9 @@ pub fn host_virtual(
         Some(PathKind::Virtual),
         cfg.app_tag.clone(),
         None,
-        move |code, _room, _keys, shared, cmd_rx| run_host(app_tag, code, links, shared, cmd_rx),
+        move |code, _room, _keys, shared, cmd_rx| {
+            run_host(app_tag, live, code, links, shared, cmd_rx)
+        },
     )
 }
 
@@ -182,6 +185,7 @@ pub fn join_virtual(cfg: &NetConfig, id: &Identity, link: VirtualLink) -> Client
 /// advertise (whoever feeds `links` decides who is in range).
 async fn run_host(
     app_tag: String,
+    live: Result<quic::Liveness, String>,
     code: String,
     links: VirtualLinkReceiver,
     shared: Arc<Shared>,
@@ -189,7 +193,14 @@ async fn run_host(
 ) {
     let s = Arc::clone(&shared);
     let token: TokenFn = Arc::new(move || s.lan_token());
-    let (endpoint, socket) = match host_endpoint(links, token, &app_tag) {
+    let live = match live {
+        Ok(l) => l,
+        Err(e) => {
+            shared.emit(HostEvent::Failed { reason: e });
+            return;
+        }
+    };
+    let (endpoint, socket) = match host_endpoint(links, token, &app_tag, live) {
         Ok(x) => x,
         Err(e) => {
             shared.emit(HostEvent::Failed { reason: e });
@@ -273,8 +284,8 @@ fn preframe(token: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The transport over a link: the shared settings, with the MTU pinned.
-fn transport() -> Arc<quinn::TransportConfig> {
-    let mut t = quic::base_transport();
+fn transport(live: quic::Liveness) -> Arc<quinn::TransportConfig> {
+    let mut t = quic::base_transport(live);
     t.initial_mtu(VIRTUAL_MTU);
     t.min_mtu(VIRTUAL_MTU);
     // `may_fragment = false` would otherwise let quinn probe upwards.
@@ -296,9 +307,10 @@ fn host_endpoint(
     links: VirtualLinkReceiver,
     token: TokenFn,
     app_tag: &str,
+    live: quic::Liveness,
 ) -> Result<(quinn::Endpoint, Arc<VirtSocket>), String> {
-    let mut server = quic::server_config(app_tag)?;
-    server.transport_config(transport());
+    let mut server = quic::server_config(app_tag, live)?;
+    server.transport_config(transport(live));
     // A link is one fixed peer: a packet "from" another link is never that
     // peer moving, it is someone replaying it (connection ids are in clear).
     server.migration(false);
@@ -322,7 +334,11 @@ fn host_endpoint(
 
 /// A client endpoint over one link whose pre-frame was already read; dial
 /// [`HOST_ADDR`] on it. Must run inside the runtime.
-pub(crate) fn client_endpoint(link: VirtualLink, app_tag: &str) -> Result<quinn::Endpoint, String> {
+pub(crate) fn client_endpoint(
+    link: VirtualLink,
+    app_tag: &str,
+    live: quic::Liveness,
+) -> Result<quinn::Endpoint, String> {
     let socket = VirtSocket::new(CLIENT_LOCAL, Role::Client);
     socket
         .state
@@ -338,8 +354,8 @@ pub(crate) fn client_endpoint(link: VirtualLink, app_tag: &str) -> Result<quinn:
         runtime,
     )
     .map_err(|e| format!("endpoint: {e}"))?;
-    let mut client = quic::client_config(app_tag)?;
-    client.transport_config(transport());
+    let mut client = quic::client_config(app_tag, live)?;
+    client.transport_config(transport(live));
     ep.set_default_client_config(client);
     Ok(ep)
 }
