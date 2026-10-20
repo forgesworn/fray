@@ -139,6 +139,17 @@ pub struct NetConfig {
     pub idle_timeout: std::time::Duration,
     /// How often an idle connection sends a keep-alive. Default 1 s.
     pub keep_alive: std::time::Duration,
+    /// The app's own TLS exporter label (RFC 5705). `None` (the default) =
+    /// none. When set, Fray computes 32 bytes per connection with it and an
+    /// empty context, on both ends: [`ClientHandle::app_binding`] and
+    /// [`HostHandle::app_binding`] return them. Both ends of one connection
+    /// get the same bytes; two different TLS sessions never do. The label must
+    /// start with `EXPORTER-`, be at most 255 bytes, and differ from every
+    /// label Fray uses itself (`EXPORTER-decented-net-hello-v2`); anything else
+    /// fails the host or join at start, like a bad idle-timeout pair. The value
+    /// is `None` if the exporter fails. A host that resumes or stands by gives
+    /// each peer's new connection its own value, the same way.
+    pub app_binding_label: Option<String>,
     /// Tests only: whether the hooked LAN endpoint treats loopback sources as
     /// local (always so outside tests: loopback is this device).
     #[cfg(test)]
@@ -163,6 +174,7 @@ impl NetConfig {
             vpn_active: false,
             idle_timeout: quic::IDLE_TIMEOUT,
             keep_alive: quic::KEEP_ALIVE,
+            app_binding_label: None,
             #[cfg(test)]
             lan_allow_loopback: true,
         }
@@ -172,6 +184,15 @@ impl NetConfig {
     /// `keep_alive < idle_timeout`. Checked where the config is first used.
     pub(crate) fn liveness(&self) -> Result<quic::Liveness, String> {
         quic::Liveness::new(self.idle_timeout, self.keep_alive)
+    }
+
+    /// Everything checked where the config is first used: the liveness pair
+    /// and the app's exporter label.
+    pub(crate) fn checked(&self) -> Result<quic::Liveness, String> {
+        if let Some(label) = &self.app_binding_label {
+            quic::check_app_label(label)?;
+        }
+        self.liveness()
     }
 
     /// No relays and no STUN: a host or joiner that never touches the internet.

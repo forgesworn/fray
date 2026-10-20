@@ -146,7 +146,7 @@ pub fn host_virtual(
     links: VirtualLinkReceiver,
 ) -> HostHandle {
     let app_tag = cfg.app_tag.clone();
-    let live = cfg.liveness();
+    let live = cfg.checked();
     let id = host_identity(cfg, id, true);
     start_host(
         &id,
@@ -155,6 +155,7 @@ pub fn host_virtual(
         0,
         Some(PathKind::Virtual),
         cfg.app_tag.clone(),
+        cfg.app_binding_label.clone(),
         None,
         move |code, _room, _keys, shared, cmd_rx| {
             run_host(app_tag, live, code, links, shared, cmd_rx)

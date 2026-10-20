@@ -97,6 +97,8 @@ pub(crate) struct Shared {
     peers: Mutex<HashMap<PeerId, Link>>,
     session_policy: Mutex<Option<crate::migration::EndpointPolicy>>,
     app_tag: String,
+    /// The app's exporter label ([`NetConfig::app_binding_label`]).
+    app_binding_label: Option<String>,
     pending_handshakes: AtomicUsize,
     generation: AtomicU64,
     /// The generation, published when the pin bumps it: a pending ordinary
@@ -322,6 +324,7 @@ fn host_inner(
         relays_total,
         None,
         cfg.app_tag.clone(),
+        cfg.app_binding_label.clone(),
         None,
         move |code, room, keys, shared, cmd_rx| {
             HostTask {
@@ -346,7 +349,7 @@ pub(crate) fn start_session_endpoint(
     code: &str,
     policy: crate::migration::EndpointPolicy,
 ) -> Result<HostHandle, String> {
-    cfg.liveness()?;
+    cfg.checked()?;
     policy
         .validate(id.pubkey().to_bytes(), code, &cfg.app_tag)
         .map_err(|e| e.to_string())?;
@@ -385,6 +388,7 @@ pub(crate) fn start_session_endpoint(
         relays_total,
         None,
         cfg.app_tag.clone(),
+        cfg.app_binding_label.clone(),
         Some((code, policy)),
         move |code, room, keys, shared, cmd_rx| {
             HostTask {
@@ -411,6 +415,7 @@ pub(crate) fn start_host<F, Fut>(
     relays_total: usize,
     path_override: Option<PathKind>,
     app_tag: String,
+    app_binding_label: Option<String>,
     pinned: Option<(String, crate::migration::EndpointPolicy)>,
     task: F,
 ) -> HostHandle
@@ -436,6 +441,7 @@ where
         peers: Mutex::new(HashMap::new()),
         session_policy: Mutex::new(pinned.as_ref().map(|(_, p)| p.clone())),
         app_tag,
+        app_binding_label,
         pending_handshakes: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
         generation_tx: tokio::sync::watch::Sender::new(0),
@@ -682,6 +688,16 @@ impl HostHandle {
             .map_err(|_| "session framing already attached; reconnect requires fresh TLS")?;
         Ok(channel)
     }
+
+    /// The app's own exporter value for `peer`'s current connection, under
+    /// [`NetConfig::app_binding_label`]: the same 32 bytes that peer's
+    /// [`ClientHandle::app_binding`] returns. `None` for an unknown peer, when
+    /// no label is configured, or if the exporter failed. A peer that comes
+    /// back on a new connection (a resume) gets that connection's own value.
+    pub fn app_binding(&self, peer: PeerId) -> Option<[u8; 32]> {
+        self.link(peer)?.app_binding
+    }
+
     /// Exporter for a ResumeProof challenge on this live authenticated link.
     pub fn tls_binding(&self, peer: PeerId) -> Option<[u8; 32]> {
         quic::binding(&self.link(peer)?.conn).ok()
@@ -905,7 +921,7 @@ impl HostTask {
         relay: Option<Box<dyn RendezvousRelay>>,
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     ) {
-        let live = match self.cfg.liveness() {
+        let live = match self.cfg.checked() {
             Ok(l) => l,
             Err(e) => {
                 self.shared.emit(HostEvent::Failed { reason: e });
@@ -1759,6 +1775,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
     // Seat under the lock so two simultaneous joiners can't both take the last seat.
     let (mut link, out_rx) = Link::new(conn.clone());
     link.migration = hello.migration.clone();
+    link.app_binding = quic::app_binding(&conn, shared.app_binding_label.as_deref());
     link.generation = generation;
     let refused = match shared.peers.lock() {
         Ok(mut peers) => {

@@ -247,6 +247,14 @@ impl ClientHandle {
         quic::binding(&self.link()?.conn).ok()
     }
 
+    /// The app's own exporter value for this connection, under
+    /// [`NetConfig::app_binding_label`]: 32 bytes the host's
+    /// [`HostHandle::app_binding`] returns too. `None` when no label is
+    /// configured, before the connection is up, or if the exporter failed.
+    pub fn app_binding(&self) -> Option<[u8; 32]> {
+        self.link()?.app_binding
+    }
+
     pub fn poll(&self) -> Option<ClientEvent> {
         let (ev, counter) = self.events.lock().ok()?.try_recv().ok()?;
         if let Some(c) = counter {
@@ -326,7 +334,7 @@ async fn run(
     shared.emit(ClientEvent::Progress {
         stage: JoinStage::Preparing,
     });
-    let live = match cfg.liveness() {
+    let live = match cfg.checked() {
         Ok(l) => l,
         Err(e) => return fail(JoinStage::Preparing, FailReason::Network(e)),
     };
@@ -595,6 +603,7 @@ async fn run(
     } = opened;
     let (mut link, out_rx) = Link::new(conn.clone());
     link.migration = proof.migration.clone();
+    link.app_binding = quic::app_binding(&conn, cfg.app_binding_label.as_deref());
     link.session_key = Some(proof.pubkey.to_bytes());
     if let Ok(mut binding) = shared.migration.lock() {
         *binding = proof.migration.clone();

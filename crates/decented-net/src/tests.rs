@@ -2606,3 +2606,112 @@ fn a_headless_room_advertises_zero_players_and_seats_eight_remote_clients() {
     }
     late.shutdown();
 }
+
+const APP_LABEL: &str = "EXPORTER-test-app-join-v1";
+
+fn labelled() -> NetConfig {
+    let mut c = cfg();
+    c.app_binding_label = Some(APP_LABEL.into());
+    c
+}
+
+/// Join `h` over loopback with `c`; returns the connected client and the host's id for it.
+fn join_host(c: &NetConfig, h: &HostHandle, addr: std::net::SocketAddr) -> (ClientHandle, PeerId) {
+    let cl = join_addr(c, &Identity::ephemeral(), addr, &h.lan_token());
+    wait_client(&cl, 10, |e| matches!(e, ClientEvent::Connected { .. }));
+    let HostEvent::PeerJoined { peer, .. } =
+        wait_host(h, 5, |e| matches!(e, HostEvent::PeerJoined { .. }))
+    else {
+        unreachable!()
+    };
+    (cl, peer)
+}
+
+#[test]
+fn an_app_label_gives_both_ends_the_same_value_and_not_the_hello_binding() {
+    let c = labelled();
+    let h = host(&c, &Identity::ephemeral(), room(4));
+    let (cl, peer) = join_host(&c, &h, local_addr(&h));
+    let mine = cl.app_binding().expect("client computes it");
+    assert_eq!(h.app_binding(peer), Some(mine), "both ends agree");
+    assert_ne!(mine, [0u8; 32]);
+    assert_ne!(
+        Some(mine),
+        cl.tls_binding(),
+        "not the hello's own exporter value"
+    );
+    assert_eq!(h.app_binding(PeerId(9999)), None, "unknown peer");
+    h.shutdown();
+}
+
+#[test]
+fn two_connections_get_different_app_values() {
+    let c = labelled();
+    let h = host(&c, &Identity::ephemeral(), room(4));
+    let addr = local_addr(&h);
+    let (a, pa) = join_host(&c, &h, addr);
+    let (b, pb) = join_host(&c, &h, addr);
+    assert_ne!(pa, pb);
+    assert_eq!(h.app_binding(pa), a.app_binding());
+    assert_eq!(h.app_binding(pb), b.app_binding());
+    assert!(a.app_binding().is_some() && b.app_binding().is_some());
+    assert_ne!(
+        a.app_binding(),
+        b.app_binding(),
+        "two TLS sessions never share a value"
+    );
+    assert_ne!(h.app_binding(pa), h.app_binding(pb));
+    h.shutdown();
+}
+
+#[test]
+fn without_a_label_there_is_no_app_value() {
+    let c = cfg();
+    assert_eq!(c.app_binding_label, None);
+    let h = host(&c, &Identity::ephemeral(), room(4));
+    let (cl, peer) = join_host(&c, &h, local_addr(&h));
+    assert_eq!(cl.app_binding(), None);
+    assert_eq!(h.app_binding(peer), None);
+    assert!(cl.tls_binding().is_some());
+    h.shutdown();
+}
+
+#[test]
+fn a_bad_app_label_is_refused_by_host_and_join() {
+    let bad = [
+        ("no-prefix".to_string(), "EXPORTER-"),
+        ("exporter-lowercase".to_string(), "EXPORTER-"),
+        ("EXPORTER-decented-net-hello-v2".to_string(), "reserved"),
+        (format!("EXPORTER-{}", "a".repeat(247)), "255"),
+        (String::new(), "EXPORTER-"),
+    ];
+    assert_eq!(bad[3].0.len(), 256);
+    for (label, word) in bad {
+        let mut c = cfg();
+        c.app_binding_label = Some(label.clone());
+        let h = host(&c, &Identity::ephemeral(), room(4));
+        let ev = wait_host(&h, 5, |e| {
+            matches!(e, HostEvent::Failed { .. } | HostEvent::Ready { .. })
+        });
+        assert!(
+            matches!(&ev, HostEvent::Failed { reason } if reason.contains("app_binding_label") && reason.contains(word)),
+            "{label:?}: {ev:?}"
+        );
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 9));
+        let cl = join_addr(&c, &Identity::ephemeral(), addr, &"0".repeat(64));
+        let ev = wait_client(&cl, 5, |e| {
+            matches!(
+                e,
+                ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+            )
+        });
+        assert!(
+            matches!(&ev, ClientEvent::Failed { reason: FailReason::Network(m), .. } if m.contains("app_binding_label")),
+            "{label:?}: {ev:?}"
+        );
+    }
+    // The longest allowed label (255 bytes) is accepted.
+    let mut c = cfg();
+    c.app_binding_label = Some(format!("EXPORTER-{}", "a".repeat(246)));
+    assert!(c.checked().is_ok());
+}

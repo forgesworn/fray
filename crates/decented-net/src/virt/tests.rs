@@ -918,3 +918,25 @@ fn a_diverted_packet_does_not_migrate_the_connection() {
     assert!(cl.is_connected(), "the joiner is unaffected");
     h.shutdown();
 }
+
+/// The app's exporter value matches on both ends of a virtual link too.
+#[test]
+fn a_virtual_link_gives_both_ends_the_same_app_value() {
+    let mut c = cfg();
+    c.app_binding_label = Some("EXPORTER-test-app-join-v1".into());
+    let (links_tx, links_rx) = virtual_link_queue(64);
+    let h = host_virtual(&c, &Identity::ephemeral(), room(4), links_rx);
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    let cl = join_virtual(&c, &Identity::ephemeral(), dial(&links_tx, "BLE app"));
+    let ev = outcome(&cl);
+    assert!(matches!(ev, ClientEvent::Connected { .. }), "{ev:?}");
+    let HostEvent::PeerJoined { peer, .. } =
+        wait_host(&h, 5, |e| matches!(e, HostEvent::PeerJoined { .. }))
+    else {
+        unreachable!()
+    };
+    let mine = cl.app_binding().expect("client computes it");
+    assert_eq!(h.app_binding(peer), Some(mine));
+    assert_ne!(Some(mine), cl.tls_binding());
+    h.shutdown();
+}

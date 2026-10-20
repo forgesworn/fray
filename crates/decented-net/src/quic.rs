@@ -374,6 +374,40 @@ pub(crate) struct HostProof {
     pub inbox_relays: Vec<String>,
 }
 
+/// Every exporter label Fray uses itself; an app label may not be one.
+const FRAY_EXPORTER_LABELS: &[&[u8]] = &[EXPORTER_LABEL];
+
+/// An app exporter label: `EXPORTER-` prefix (RFC 8446 7.5), at most 255
+/// bytes, and none of Fray's own.
+pub(crate) fn check_app_label(label: &str) -> Result<(), String> {
+    if !label.starts_with("EXPORTER-") {
+        return Err(format!(
+            "app_binding_label ({label:?}) must start with EXPORTER-"
+        ));
+    }
+    if label.len() > 255 {
+        return Err(format!(
+            "app_binding_label is {} bytes; at most 255 are allowed",
+            label.len()
+        ));
+    }
+    if FRAY_EXPORTER_LABELS.contains(&label.as_bytes()) {
+        return Err(format!(
+            "app_binding_label ({label:?}) is reserved for Fray's own use"
+        ));
+    }
+    Ok(())
+}
+
+/// The app's exporter value for this connection (32 bytes, empty context).
+/// `None` without a label, or if the exporter fails (the app decides).
+pub(crate) fn app_binding(conn: &quinn::Connection, label: Option<&str>) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    conn.export_keying_material(&mut out, label?.as_bytes(), b"")
+        .ok()?;
+    Some(out)
+}
+
 pub(crate) fn binding(conn: &quinn::Connection) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     conn.export_keying_material(&mut out, EXPORTER_LABEL, b"")
@@ -893,6 +927,8 @@ pub(crate) struct Link {
     pub session_channel_claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub conn: quinn::Connection,
     pub migration: Option<crate::migration::ConnectionBinding>,
+    /// The app's exporter value for this connection ([`app_binding`]).
+    pub app_binding: Option<[u8; 32]>,
     pub generation: u64,
     pub tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     pub queued: Arc<AtomicUsize>,
@@ -907,6 +943,7 @@ impl Link {
                 session_player: None,
                 conn,
                 migration: None,
+                app_binding: None,
                 generation: 0,
                 session_live: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 session_channel_claimed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
