@@ -137,6 +137,16 @@ impl Identity {
         }
     }
 
+    /// An identity for keys the app already holds (its own attested runtime key, say). Nothing is
+    /// written to disk.
+    pub fn from_keys(keys: Keys) -> Identity {
+        Identity {
+            keys,
+            attestation: None,
+            inbox_relays: Vec::new(),
+        }
+    }
+
     pub fn pubkey(&self) -> PublicKey {
         self.keys.public_key()
     }
@@ -284,6 +294,56 @@ mod tests {
         std::fs::write(dir.join(FILE_NAME), "not hex").unwrap();
         assert!(Identity::load_or_create(&dir).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_identity_from_existing_keys_keeps_the_key() {
+        let original = Identity::ephemeral();
+        let secret = original.keys().secret_key().clone();
+        let restored = Identity::from_keys(Keys::new(secret));
+        assert_eq!(restored.pubkey(), original.pubkey());
+        assert_eq!(restored.npub(), original.npub());
+        assert_eq!(restored.attestation(), None);
+        assert!(restored.inbox_relays().is_empty());
+    }
+
+    #[test]
+    fn an_identity_from_existing_keys_writes_no_file() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/dnet-id-from-keys")
+            .join(hex::encode({
+                let mut b = [0u8; 8];
+                getrandom::fill(&mut b).unwrap();
+                b
+            }));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        let id = Identity::from_keys(Keys::generate()).with_attestation("{}".into());
+        let _ = (id.pubkey(), id.npub(), format!("{id:?}"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        assert!(!dir.join(FILE_NAME).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_identity_from_existing_keys_takes_an_attestation() {
+        let id = Identity::from_keys(Keys::generate()).with_attestation("{\"k\":1}".into());
+        assert_eq!(id.attestation(), Some("{\"k\":1}"));
+        let too_long = "x".repeat(MAX_ATTESTATION_LEN + 1);
+        assert_eq!(
+            Identity::from_keys(Keys::generate())
+                .with_attestation(too_long)
+                .attestation(),
+            None
+        );
+    }
+
+    #[test]
+    fn debug_of_an_identity_from_existing_keys_never_prints_the_secret() {
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+        let id = Identity::from_keys(keys);
+        assert!(!format!("{id:?}").contains(&secret));
     }
 
     #[test]

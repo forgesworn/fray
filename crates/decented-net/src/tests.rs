@@ -2007,6 +2007,32 @@ fn w3_a_joiner_reaches_a_dual_stack_host_over_ipv6_loopback() {
     h.shutdown();
 }
 
+/// A host that runs on keys the app already holds is the key the joiner sees.
+#[test]
+fn a_host_built_from_existing_keys_presents_those_keys() {
+    let keys = nostr::Keys::generate();
+    let expected = keys.public_key();
+    let c = cfg();
+    let h = host(&c, &Identity::from_keys(keys), room(4));
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    let addr = std::net::SocketAddr::new(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        h.local_addr().expect("listening").port(),
+    );
+    let cl = join_addr(&c, &Identity::ephemeral(), addr, &h.lan_token());
+    let ev = wait_client(&cl, 10, |e| {
+        matches!(
+            e,
+            ClientEvent::Connected { .. } | ClientEvent::Failed { .. }
+        )
+    });
+    assert!(
+        matches!(ev, ClientEvent::Connected { host_pubkey, .. } if host_pubkey == expected),
+        "{ev:?}"
+    );
+    h.shutdown();
+}
+
 /// (b) An IPv4-only joiner and a dual-stack host: QUIC runs over the
 /// v4-mapped path, and the host sees the joiner as `::ffff:127.0.0.1`.
 #[test]
