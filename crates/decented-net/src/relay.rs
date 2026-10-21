@@ -3,7 +3,9 @@
 //!
 //! [`MultiRelay`] is a worker (on the crate runtime) holding one websocket per
 //! relay, in the player's order. Which relay may be dialled, and when, comes from
-//! the shared [`RelayPool`] (5 s, 15 s, 45 s, then every 2 min after a failure);
+//! the shared [`RelayPool`] (5 s, 15 s, 45 s, then every 2 min after a failure),
+//! except that each relay's first dial from a new worker (a join or host
+//! start) goes out at once, whatever backoff built up while nothing was waiting;
 //! reads (the standing subscription) go to every connected relay, writes to the
 //! top healthy few in order. When every listed relay is failing, the pool's
 //! built-in defaults are dialled as a last resort. [`FakeRelayHub`] is an
@@ -449,6 +451,12 @@ async fn relay_worker(
     let n = urls.len();
     let mut sockets: Vec<Option<RelaySocket>> = (0..n).map(|_| None).collect();
     let mut dialing = vec![false; n];
+    // Each relay's first dial in this worker ignores the pool's backoff: a
+    // join or host start is somebody waiting now, and the backoff may have
+    // grown while nothing was waiting (the app in the background). Only that
+    // first dial is free; a failure starts or lengthens the backoff as usual,
+    // and every later automatic redial obeys it.
+    let mut first_dial = vec![true; n];
     let (dial_tx, mut dial_rx) =
         tokio::sync::mpsc::unbounded_channel::<(usize, Result<RelaySocket, String>, Duration)>();
     let mut standing: Option<TagFilter> = None;
@@ -481,14 +489,16 @@ async fn relay_worker(
         // 1. (Re)connect everything that is down and allowed (its backoff is
         //    over), each dial on its own task so one black-hole relay never
         //    delays the others. The dial after a backoff is the quiet re-probe.
+        //    A relay's first dial from this worker goes out whatever its backoff.
         for i in 0..n {
             if sockets[i].is_some()
                 || dialing[i]
                 || (i >= listed_n && !using_defaults)
-                || !pool.eligible(&urls[i])
+                || (!first_dial[i] && !pool.eligible(&urls[i]))
             {
                 continue;
             }
+            first_dial[i] = false;
             dialing[i] = true;
             let url = urls[i].clone();
             let tx = dial_tx.clone();
@@ -984,5 +994,79 @@ mod tests {
         assert_eq!(m.connected().0, 0);
         assert_eq!(d.connections(), 0);
         assert!(!pool.fallback_active());
+    }
+
+    /// A pool whose relays have been failing for a long while: one failure
+    /// already recorded, so the next wait is a minute.
+    fn pool_in_long_backoff(url: &str) -> Arc<RelayPool> {
+        let pool = Arc::new(RelayPool::with(
+            vec![],
+            Schedule::new(vec![Duration::from_secs(60)], Duration::from_secs(60)),
+        ));
+        pool.record_failure(url, "network went away in the background");
+        assert!(!pool.eligible(url), "set up: the relay is in backoff");
+        pool
+    }
+
+    #[test]
+    fn a_new_start_dials_a_relay_in_long_backoff_at_once() {
+        let a = FakeWsRelay::start();
+        let pool = pool_in_long_backoff(&a.url);
+        let m = MultiRelay::start_in(pool.clone(), vec![a.url.clone()], false);
+        m.subscribe(TagFilter::one(20911, 'p', "me")).unwrap();
+        eventually("the relay to be dialled despite its backoff", || {
+            (m.connected().0 == 1 && a.reqs() == 1).then_some(())
+        });
+        assert!(
+            !pool.failing(&a.url),
+            "the dial worked, so the backoff is cleared"
+        );
+    }
+
+    #[test]
+    fn the_free_first_dial_is_the_only_one_a_relay_that_keeps_failing_gets() {
+        let a = FakeWsRelay::start();
+        a.kill();
+        let pool = pool_in_long_backoff(&a.url);
+        assert_eq!(a.attempts(), 0);
+        let m = MultiRelay::start_in(pool.clone(), vec![a.url.clone()], false);
+        eventually("the one free dial", || (a.attempts() == 1).then_some(()));
+        eventually("its failure to be recorded", || {
+            (pool.view(&a.url).failures == 2).then_some(())
+        });
+        std::thread::sleep(ms(600));
+        assert_eq!(a.attempts(), 1, "no redial storm: the backoff holds again");
+        assert_eq!(pool.view(&a.url).failures, 2);
+        assert!(
+            !pool.eligible(&a.url),
+            "still backed off after the free dial failed"
+        );
+        assert_eq!(m.connected().0, 0);
+    }
+
+    #[test]
+    fn a_relay_dropped_after_the_free_dial_waits_out_its_backoff_as_before() {
+        let a = FakeWsRelay::start();
+        let pool = pool_in_long_backoff(&a.url);
+        let m = MultiRelay::start_in(pool.clone(), vec![a.url.clone()], false);
+        eventually("the free dial to connect", || {
+            (m.connected().0 == 1).then_some(())
+        });
+        a.kill();
+        eventually("the drop to be noticed", || {
+            (m.connected().0 == 0 && pool.failing(&a.url)).then_some(())
+        });
+        a.revive();
+        std::thread::sleep(ms(600));
+        assert_eq!(
+            m.connected().0,
+            0,
+            "a steady-state redial still obeys the backoff"
+        );
+        assert_eq!(
+            a.attempts(),
+            1,
+            "only the free dial went out; the kill refused none"
+        );
     }
 }

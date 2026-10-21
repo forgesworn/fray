@@ -20,6 +20,7 @@ struct State {
     bus: tokio::sync::broadcast::Sender<Event>,
     reqs: AtomicUsize,
     conns: AtomicUsize,
+    tries: AtomicUsize,
     received: Mutex<Vec<Event>>,
 }
 
@@ -67,11 +68,13 @@ impl FakeWsRelay {
             bus,
             reqs: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
+            tries: AtomicUsize::new(0),
             received: Mutex::new(Vec::new()),
         });
         let st = Arc::clone(&state);
         crate::runtime().spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
+                st.tries.fetch_add(1, Ordering::Relaxed);
                 if st.down.load(Ordering::Relaxed) {
                     drop(tcp);
                     continue;
@@ -150,6 +153,11 @@ impl FakeWsRelay {
     /// `REQ`s received so far (a resubscription after a reconnect adds one).
     pub fn reqs(&self) -> usize {
         self.state.reqs.load(Ordering::Relaxed)
+    }
+
+    /// TCP connection attempts so far, refused ones included.
+    pub fn attempts(&self) -> usize {
+        self.state.tries.load(Ordering::Relaxed)
     }
 
     /// Open connections right now.
