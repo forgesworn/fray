@@ -129,19 +129,22 @@ own public key. `HostHandle::add_invite` / `remove_invite` manage them (at most
 - **No address in the link.** The link holds the secret and the host's key.
   The joiner finds the host through the same encrypted offer/answer exchange as
   a code join, on relay tags that change every UTC day (today and yesterday are
-  both listened on, as for codes). The daily tag buys unlinkability across
-  days; a relay observer cannot map tags to invites, because it would have to
-  guess 256 bits.
+  both listened on, as for codes). A relay observer cannot map a tag to an
+  invite, because it would have to guess 256 bits. What it can and cannot
+  link, and what the relay serving the host can, is under "Privacy" below.
 - **Revoking.** `remove_invite` strips the invite's tokens at once, so a hello
-  proving them gets `NOT_ADMITTED` before any welcome, and stops the host
+  proving them gets `NOT_ADMITTED` before any welcome, a handshake already
+  under way is refused again when the peer would be seated, and the host stops
   answering offers on its tags. A revoked invite learns nothing: no answer, no
   welcome. Connections it already admitted stay: Fray does not drop them, the
   game decides (`kick`).
 - **The host is pinned.** A joiner by invite joins only a host whose key is the
-  one in the link: an answer naming another key is refused before the joiner
-  punches or dials, and the welcome must be signed by that key too
-  (`HostUnverified`). Someone who obtains the secret can answer the offer, but
-  cannot pass as the host.
+  one in the link. An answer (a refusal included) that names another key is
+  ignored, as if it had not arrived: the joiner keeps waiting for the real
+  host's answer until the normal timeout (`NoAnswer`), and never punches or
+  dials towards the other. The welcome must be signed by the pinned key too
+  (`HostUnverified`). Someone who obtains the secret can answer the offer
+  first, but cannot pass as the host or make the real join fail.
 - **What a leaked link gives.** Whoever holds a live invite can ask the host to
   answer and can prove admission (the same as a code, only stronger because it
   cannot be guessed), so treat it as a bearer ticket: a host that wants it to
@@ -159,7 +162,11 @@ operator could log which installs play together, when, and from which IP. So:
 
 - Each **join attempt** signs its offer with a fresh **throwaway key**, and
   receives its answer (`#p`) on that key.
-- Each **room** signs its answers with its own throwaway key.
+- Each **join session** (one offer, however often it is re-sent) gets its
+  answer signed by a throwaway key made for that session alone: never the
+  host's identity, and never a key shared with another joiner, invite, the
+  code or day. The host names that key in the welcome (inside QUIC), which is
+  how the joiner knows the answer and the host are the same party.
 - The identity keys appear **only inside encrypted payloads**: the joiner's
   identify frame and the host's welcome inside QUIC (both signed over the TLS
   exporter), and the host's key inside the answer's NIP-44 ciphertext, which
@@ -182,7 +189,32 @@ operator could log which installs play together, when, and from which IP. So:
 
 A relay observer can still see the room tag, that some keys exchanged an offer
 and an answer, and the websocket IPs. It cannot link those keys to an install,
-or one session to the next. That holds for this crate's own events; once
+or one session to the next.
+
+What an observer can and cannot link across rooms (the code and each invite):
+
+- **Cannot link by author.** Every answer has its own signing key, so two
+  answers, whether to the same room, to two invites, to the code or on two
+  days, carry no common key that says one host sent them. A room's tag is
+  derived from a 256-bit secret (an invite) or an Argon2id output (the code)
+  and changes every UTC day, so a tag does not name its room to someone
+  without the secret, and today's tag does not lead to yesterday's.
+- **Can still see, per tag:** each offer on that tag and when, and each answer
+  p-tagged to that offer's throwaway key, so the number and timing of joins
+  per tag (per invite, so per link you handed out) are visible, as are
+  that a host is online and answering at all.
+- **The relay that serves the host's connection links all of its tags.** A
+  host holds one standing subscription per relay, one REQ over one websocket
+  naming every tag it listens on (two per room, today's and yesterday's: up to
+  514 with the code and 256 invites). That relay's operator therefore sees,
+  from one connection and IP, that all those tags belong to one host,
+  and links the answers that follow them to it by arrival, even though the
+  answers carry unrelated keys. Fray cannot avoid this without a separate
+  connection per invite. A host that must not show this to a relay should not
+  list that relay.
+- **A holder of a live invite** learns nothing about other rooms from it: it
+  can derive that invite's own tags and nothing else's, and the answers it
+  receives are signed by keys that are not reused for anyone else. That holds for this crate's own events; once
 decented-signet publishes an attestation for the runtime key, that key itself
 is public and persona-linked (see "The runtime key is linked to the persona").
 
@@ -197,7 +229,8 @@ offer first, with their own addresses. The joiner checks:
    - the join session id;
    - the peer id;
    - the display name;
-   - the host's **relay key** (the throwaway key that signs its answers);
+   - the host's **relay key** (the throwaway key that signed the answer to
+     this join session);
    - any persona attestation.
 
    No man in the middle can relay or replay it: each leg of a MITM has a

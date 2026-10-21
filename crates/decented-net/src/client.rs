@@ -577,6 +577,7 @@ async fn run(
                 &session,
                 &prep.candidates,
                 relay.as_ref(),
+                pinned.as_ref(),
             )
             .await
             {
@@ -584,14 +585,9 @@ async fn run(
                 Err(reason) => return fail(JoinStage::FindingHost, reason),
             };
             let answer = found.answer.clone();
-            // An invite names its host: an answer naming anyone else is
-            // refused before we punch or dial towards it.
-            if let Some(key) = &pinned {
-                if PublicKey::from_hex(&answer.host_pubkey).ok().as_ref() != Some(key) {
-                    log::warn!("[join] the answer names a host other than the invite's");
-                    return fail(JoinStage::Handshake, FailReason::HostUnverified);
-                }
-            }
+            // An invite names its host: `find_host` already set aside any
+            // answer naming anyone else, so nothing is punched or dialled
+            // towards a host the invite does not pin.
             // The host we reach must be the one that answered the code: the
             // answer (encrypted to us, so the relays never see it) names the
             // host identity, and only that identity may sign the
@@ -877,18 +873,26 @@ struct Found {
 /// until answered), and return the host's answer. `rooms` is today's secrets
 /// then yesterday's: the first round offers on today's tag only, later rounds
 /// on both (covers a host on the other side of UTC midnight).
+///
+/// With `pinned` (an invite join), an answer whose encrypted host identity is
+/// not that key, a refusal included, is ignored as if it had not arrived: a
+/// holder of a leaked secret cannot end the join by answering first, and the
+/// real host's answer is still waited for until the normal deadline.
 async fn find_host(
     keys: &Keys,
     rooms: &[RoomSecrets],
     session: &str,
     candidates: &[crate::rendezvous::Candidate],
     relay: &dyn RendezvousRelay,
+    pinned: Option<&PublicKey>,
 ) -> Result<Found, FailReason> {
-    // Only answers that open for this session may take a queue slot, so a
-    // flood of junk can never push out the real one.
-    let (k, sess) = (keys.clone(), session.to_string());
+    // Only answers that open for this session (and, for an invite, name its
+    // host) may take a queue slot, so a flood of junk can never push out the
+    // real one.
+    let (k, sess, pin) = (keys.clone(), session.to_string(), pinned.copied());
     relay.set_accept(Some(Arc::new(move |ev: &nostr::Event| {
-        open_answer(&k, ev, &sess, crate::unix_now()).is_ok()
+        open_answer(&k, ev, &sess, crate::unix_now())
+            .is_ok_and(|a| names_pinned_host(&a, pin.as_ref()))
     })));
     // The answer subscription goes first: answers are ephemeral and never stored.
     relay
@@ -932,6 +936,9 @@ async fn find_host(
         }
         while let Some(ev) = relay.try_recv() {
             match open_answer(keys, &ev, session, crate::unix_now()) {
+                Ok(a) if !names_pinned_host(&a, pinned) => {
+                    log::warn!("[join] ignoring an answer naming a host other than the invite's");
+                }
                 Ok(a) if a.accepted => {
                     return Ok(Found {
                         answer: a,
@@ -955,6 +962,12 @@ async fn find_host(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Whether `answer` may be acted on given the invite's pinned host: always
+/// for a code join (`None`), otherwise only if it names exactly that key.
+fn names_pinned_host(answer: &Answer, pinned: Option<&PublicKey>) -> bool {
+    pinned.is_none_or(|key| PublicKey::from_hex(&answer.host_pubkey).ok().as_ref() == Some(key))
 }
 
 /// A valid answer to our session (the pre-queue check already opened it)

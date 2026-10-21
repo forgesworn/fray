@@ -43,7 +43,7 @@ pub use host::{HostHandle, MAX_INVITES};
 pub use identity::{npub_of, Identity};
 pub use lan::{lan_browse, LanBrowser};
 pub use netbind::{check_lan_binding, lan_blocked, LanBindError, LanSocketHook, VPN_BLOCKS_LAN};
-pub use room::InviteId;
+pub use room::{generate_invite_secret, InviteId};
 pub use virt::{
     host_virtual, join_virtual, virtual_link_queue, virtual_pair, VirtualLink, VirtualLinkReceiver,
     VirtualLinkSender, MAX_VIRTUAL_PACKET, VIRTUAL_MTU,
@@ -368,10 +368,11 @@ pub enum Admission {
     Lan,
     /// The invite with this id (see [`HostHandle::add_invite`]).
     Invite(InviteId),
-    /// A token proved over a path that is not a person's own join: a
-    /// Bluetooth [`VirtualLink`], or a session-bound reconnect during a host
-    /// handover (the LAN token, there). Who may join is then the session
-    /// policy's decision, not the token's.
+    /// The LAN token proved over a path that is not a person's own LAN join:
+    /// a Bluetooth [`VirtualLink`], or a session-bound reconnect during a host
+    /// handover. Who may join is then the session policy's decision, not the
+    /// token's. A session-bound hello that proves the room code or an invite
+    /// is still reported as [`Admission::Code`] or [`Admission::Invite`].
     Other,
 }
 

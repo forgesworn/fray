@@ -86,6 +86,17 @@ pub fn generate_code() -> String {
     })
 }
 
+/// A fresh invite secret: 32 bytes from the OS random number generator, the
+/// only kind [`HostHandle::add_invite`](crate::HostHandle::add_invite) should
+/// be given. Every relay tag, key and admission token of an invite is derived
+/// from it with a plain hash (no stretching, unlike a code), so a secret that
+/// is not uniformly random can be guessed offline.
+pub fn generate_invite_secret() -> [u8; 32] {
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).expect("OS RNG unavailable");
+    secret
+}
+
 /// Build a code from a source of random bytes. Rejection sampling keeps every
 /// letter equally likely: 240 = 10 * 24, so bytes 240..=255 are discarded.
 fn code_from_bytes(mut next: impl FnMut() -> u8) -> String {
@@ -461,6 +472,17 @@ mod tests {
         assert_eq!(utc_day_number(86_399), 0);
         assert_eq!(utc_day_number(86_400), 1);
         assert_eq!(utc_day_number(1_728_000_000), 20_000);
+    }
+
+    #[test]
+    fn generated_invite_secrets_are_fresh_and_32_bytes() {
+        let secrets: std::collections::HashSet<[u8; 32]> =
+            (0..64).map(|_| generate_invite_secret()).collect();
+        assert_eq!(secrets.len(), 64, "a repeated secret");
+        assert!(secrets.iter().all(|s| s.iter().any(|b| *b != 0)));
+        // Usable as an invite: it derives a room.
+        let s = generate_invite_secret();
+        assert!(derive_invite("t", &s, 20_000).is_ok());
     }
 
     #[test]

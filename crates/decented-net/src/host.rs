@@ -143,15 +143,55 @@ pub(crate) struct Shared {
     attestation: Option<String>,
     /// The host identity's inbox relays, sent in the welcome next to the attestation.
     inbox_relays: Vec<String>,
-    /// The throwaway key relay answers are signed with (named in the welcome).
-    relay_key: PublicKey,
+    /// The throwaway key each join session's relay answer was signed with
+    /// (named in that session's welcome).
+    answer_keys: Mutex<AnswerKeys>,
     room_name: String,
     /// Reported for every peer instead of the path its hello claims (a
     /// virtual host knows all its peers came over a virtual link).
     path_override: Option<PathKind>,
 }
 
+/// The throwaway key behind each recent join session's relay answer, so the
+/// welcome can name the key that signed the answer the joiner is acting on.
+#[derive(Default)]
+pub(crate) struct AnswerKeys {
+    by_session: HashMap<String, PublicKey>,
+    /// Oldest first; the map holds at most [`MAX_SESSIONS`].
+    order: std::collections::VecDeque<String>,
+}
+
 impl Shared {
+    /// Remember the key that signed the answer to join session `session`.
+    fn record_answer_key(&self, session: &str, key: PublicKey) {
+        let Ok(mut keys) = self.answer_keys.lock() else {
+            return;
+        };
+        if keys.by_session.insert(session.to_string(), key).is_none() {
+            keys.order.push_back(session.to_string());
+        }
+        while keys.order.len() > MAX_SESSIONS {
+            if let Some(old) = keys.order.pop_front() {
+                keys.by_session.remove(&old);
+            }
+        }
+    }
+
+    /// The key to name in a welcome: the one that signed the answer to the
+    /// hello's join session, or, for a hello that did not come from a relay
+    /// answer (a LAN or virtual link, a session-bound reconnect, an answer
+    /// long forgotten), a fresh key no answer was ever signed with.
+    fn answer_key_for(&self, session: Option<&str>) -> PublicKey {
+        session
+            .and_then(|s| {
+                self.answer_keys
+                    .lock()
+                    .ok()
+                    .and_then(|k| k.by_session.get(s).copied())
+            })
+            .unwrap_or_else(|| Keys::generate().public_key())
+    }
+
     pub(crate) fn emit(&self, ev: HostEvent) {
         self.emit_at(ev, self.generation.load(Ordering::Acquire));
     }
@@ -352,10 +392,9 @@ fn host_inner(
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
         None,
-        move |code, room, keys, shared, cmd_rx| {
+        move |code, room, shared, cmd_rx| {
             HostTask {
                 cfg,
-                keys,
                 room,
                 code,
                 shared,
@@ -417,10 +456,9 @@ pub(crate) fn start_session_endpoint(
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
         Some((code, policy)),
-        move |code, room, keys, shared, cmd_rx| {
+        move |code, room, shared, cmd_rx| {
             HostTask {
                 cfg,
-                keys,
                 room,
                 code,
                 shared,
@@ -432,7 +470,7 @@ pub(crate) fn start_session_endpoint(
 }
 
 /// Everything about a host but its transport: the room code, the shared state
-/// and the handle. `task` gets the code, the clamped room, the relay key, the
+/// and the handle. `task` gets the code, the clamped room, the
 /// shared state and the command channel, and returns the transport's loop,
 /// which runs on the crate runtime (the UDP loop above, or `virt`'s).
 pub(crate) fn start_host<F, Fut>(
@@ -447,13 +485,7 @@ pub(crate) fn start_host<F, Fut>(
     task: F,
 ) -> HostHandle
 where
-    F: FnOnce(
-        String,
-        RoomInfo,
-        Keys,
-        Arc<Shared>,
-        tokio::sync::mpsc::UnboundedReceiver<Cmd>,
-    ) -> Fut,
+    F: FnOnce(String, RoomInfo, Arc<Shared>, tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let code = pinned
@@ -463,7 +495,6 @@ where
     let (ev_tx, ev_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let max_players = room.max_players.clamp(2, MAX_PLAYERS);
-    let relay_keys = Keys::generate();
     let shared = Arc::new(Shared {
         peers: Mutex::new(HashMap::new()),
         session_policy: Mutex::new(pinned.as_ref().map(|(_, p)| p.clone())),
@@ -495,7 +526,7 @@ where
         host_keys: id.keys().clone(),
         attestation: id.attestation().map(str::to_string),
         inbox_relays: id.inbox_relays().to_vec(),
-        relay_key: relay_keys.public_key(),
+        answer_keys: Mutex::new(AnswerKeys::default()),
         room_name: room.name.clone(),
         path_override,
     });
@@ -505,7 +536,6 @@ where
             name: room.name,
             max_players,
         },
-        relay_keys,
         Arc::clone(&shared),
         cmd_rx,
     );
@@ -736,6 +766,15 @@ impl HostHandle {
         quic::binding(&self.link(peer)?.conn).ok()
     }
 
+    /// Park every handshake just before it is seated, until the test has
+    /// reached the barrier twice (tests of changes made in that window).
+    #[cfg(test)]
+    pub(crate) fn pause_before_seating(&self, barrier: Option<Arc<tokio::sync::Barrier>>) {
+        if let Ok(mut b) = self.shared.before_registration.lock() {
+            *b = barrier;
+        }
+    }
+
     /// Move the host's UTC day on (tests of the midnight roll).
     #[cfg(test)]
     pub(crate) fn set_test_day(&self, day: u64) {
@@ -745,6 +784,13 @@ impl HostHandle {
     /// Let people in by **invite** as well as by the room code. `secret` is 32
     /// random bytes the host generated and keeps; the invite link carries it
     /// with the host's public key (see [`join_invite`](crate::join_invite)).
+    ///
+    /// **The secret must be uniformly random**, from
+    /// [`generate_invite_secret`](crate::generate_invite_secret) or an
+    /// equivalent OS-RNG source. The invite's relay tags, keys and admission
+    /// token are plain hashes of it, with no stretching, so anything guessable
+    /// (a counter, a timestamp, a short phrase padded out) can be searched
+    /// offline by anyone watching the relays.
     ///
     /// Callable at any time while hosting. The host then also listens on the
     /// invite's relay tags (today's and yesterday's, rolled at UTC midnight
@@ -779,7 +825,8 @@ impl HostHandle {
     }
 
     /// Revoke an invite. From the moment this returns, a hello proving its
-    /// token is refused; the host stops listening on its tags and stops
+    /// token is refused, and so is one already mid-handshake (it is checked
+    /// again when the peer would be seated); the host stops listening on its tags and stops
     /// answering offers sent to them (that lands on the host task's next
     /// turn, and an offer answered just before is a rendezvous only, never
     /// an admission). `false` if no such invite was live.
@@ -991,7 +1038,6 @@ impl Drop for HostHandle {
 
 struct HostTask {
     cfg: NetConfig,
-    keys: Keys,
     room: RoomInfo,
     code: String,
     shared: Arc<Shared>,
@@ -1472,10 +1518,19 @@ impl HostTask {
             // signed by this key (review-net-1 N1).
             host_pubkey: self.shared.host_keys.public_key().to_hex(),
         };
-        // Signed with the room's throwaway key, never the host identity.
-        let Ok(event) = seal_answer(&self.keys, &ev.pubkey, &answer) else {
+        // Signed with a throwaway key made for this one session, never the
+        // host identity and never a key shared with another room, day or
+        // joiner: observers cannot tell from the author that two answers
+        // came from the same host. The welcome names this key.
+        let answer_keys = Keys::generate();
+        let Ok(event) = seal_answer(&answer_keys, &ev.pubkey, &answer) else {
             return;
         };
+        if refusal.is_none() {
+            // Before it goes out: the joiner dials only after it has the answer.
+            self.shared
+                .record_answer_key(&offer.session, answer_keys.public_key());
+        }
         let _ = relay.publish(&event);
         let targets = punch_targets(&offer.candidates);
         log::info!(
@@ -1952,6 +2007,8 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                 "no valid admission proof".into(),
             );
         };
+        // The token the hello proved, to re-check when the peer is seated.
+        let proved = tokens[which];
         // The LAN token is what a virtual link and a session-bound reconnect
         // prove; neither is a person's own join, so they are `Other`.
         let admitted_by = match tokens[which].0 {
@@ -2000,7 +2057,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             shared.attestation.as_deref(),
             &shared.inbox_relays,
             &shared.room_name,
-            &shared.relay_key,
+            &shared.answer_key_for(hello.session.as_deref()),
             hello.session.as_deref(),
             peer.0,
             hello.migration.clone(),
@@ -2055,6 +2112,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             inbox_relays,
             peer,
             admitted_by,
+            proved,
         ))
     };
     // An ordinary handshake ends when the pin bumps the generation; a
@@ -2083,7 +2141,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             return;
         }
     };
-    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer, admitted_by) =
+    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer, admitted_by, proved) =
         match outcome {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => {
@@ -2122,6 +2180,10 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                     .unwrap_or(true)
             {
                 Some(close::CLOSED)
+            } else if !shared.admission_tokens().contains(&proved) {
+                // The invite (or the day's code token) that admitted this hello
+                // was revoked while the handshake ran: not seated.
+                Some(close::NOT_ADMITTED)
             } else {
                 seat_refusal(&shared, &peers)
             };
@@ -2573,7 +2635,6 @@ mod migration_transition_tests {
         };
         let task = HostTask {
             cfg: cfg.clone(),
-            keys: relay_keys,
             room: RoomInfo {
                 name: "Original".into(),
                 max_players: 8,
@@ -3100,7 +3161,6 @@ mod advertise_tests {
         task_cfg.advertise_only = advertise_only;
         let task = HostTask {
             cfg: task_cfg,
-            keys: Keys::generate(),
             room: RoomInfo {
                 name: "r".into(),
                 max_players: 4,

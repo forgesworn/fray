@@ -157,9 +157,7 @@ pub fn host_virtual(
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
         None,
-        move |code, _room, _keys, shared, cmd_rx| {
-            run_host(app_tag, live, code, links, shared, cmd_rx)
-        },
+        move |code, _room, shared, cmd_rx| run_host(app_tag, live, code, links, shared, cmd_rx),
     )
 }
 

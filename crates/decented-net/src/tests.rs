@@ -2051,7 +2051,10 @@ fn an_idle_timeout_quic_would_send_as_none_is_refused() {
     let mut c = NetConfig::new("d", "t");
     c.idle_timeout = Duration::from_micros(500);
     c.keep_alive = Duration::from_micros(100);
-    assert!(c.liveness().is_err(), "a 0.5 ms idle timeout would go out as no timeout at all");
+    assert!(
+        c.liveness().is_err(),
+        "a 0.5 ms idle timeout would go out as no timeout at all"
+    );
     c.idle_timeout = Duration::from_millis(1);
     assert!(c.liveness().is_ok());
 }
@@ -3427,13 +3430,15 @@ mod invites {
         settle();
         let wrong = Identity::ephemeral().pubkey().to_bytes();
         let (cl, _) = join_by_invite(&hub, &s, wrong);
+        // The real host's answer names a key the invite does not pin: it is
+        // ignored, so there is nothing to join and the join times out.
         let ev = join_outcome(&cl);
         assert!(
             matches!(
                 ev,
                 ClientEvent::Failed {
-                    reason: FailReason::HostUnverified,
-                    ..
+                    stage: JoinStage::FindingHost,
+                    reason: FailReason::NoAnswer
                 }
             ),
             "{ev:?}"
@@ -3469,12 +3474,13 @@ mod invites {
             matches!(
                 ev,
                 ClientEvent::Failed {
-                    reason: FailReason::HostUnverified,
-                    ..
+                    stage: JoinStage::FindingHost,
+                    reason: FailReason::NoAnswer
                 }
             ),
             "{ev:?}"
         );
+        assert_eq!(imposter.peer_count(), 0, "it was never dialled");
         imposter.shutdown();
     }
 
@@ -3617,6 +3623,338 @@ mod invites {
         assert!(matches!(join_outcome(&cl), ClientEvent::Connected { .. }));
         assert_eq!(joined(&h).1, Admission::Invite(ids[255]));
         h.shutdown();
+    }
+
+    /// A relay client that remembers who signed every answer it was handed.
+    struct Recording {
+        inner: crate::relay::FakeRelay,
+        signers: Arc<std::sync::Mutex<Vec<PublicKey>>>,
+    }
+
+    impl RendezvousRelay for Recording {
+        fn publish(&self, ev: &nostr::Event) -> Result<(), String> {
+            self.inner.publish(ev)
+        }
+        fn subscribe(&self, filter: TagFilter) -> Result<(), String> {
+            self.inner.subscribe(filter)
+        }
+        fn unsubscribe(&self) -> Result<(), String> {
+            self.inner.unsubscribe()
+        }
+        fn try_recv(&self) -> Option<nostr::Event> {
+            let ev = self.inner.try_recv()?;
+            self.signers.lock().unwrap().push(ev.pubkey);
+            Some(ev)
+        }
+        fn connected(&self) -> (usize, usize) {
+            self.inner.connected()
+        }
+        fn set_accept(&self, accept: Option<crate::relay::AcceptFn>) {
+            self.inner.set_accept(accept)
+        }
+        fn overflowed(&self) -> bool {
+            self.inner.overflowed()
+        }
+    }
+
+    /// Join by code, recording the signers of the answers that reach the joiner.
+    fn recorded_code_join(
+        hub: &FakeRelayHub,
+        code: &str,
+    ) -> (ClientHandle, Arc<std::sync::Mutex<Vec<PublicKey>>>) {
+        let signers = Arc::default();
+        let relay = Recording {
+            inner: hub.client(),
+            signers: Arc::clone(&signers),
+        };
+        let cl = join_with_relay(&cfg(), &Identity::ephemeral(), code, Box::new(relay));
+        (cl, signers)
+    }
+
+    /// Join by invite, recording the signers of the answers that reach the joiner.
+    fn recorded_invite_join(
+        hub: &FakeRelayHub,
+        secret: &[u8; 32],
+        host_key: [u8; 32],
+    ) -> (ClientHandle, Arc<std::sync::Mutex<Vec<PublicKey>>>) {
+        let signers = Arc::default();
+        let relay = Recording {
+            inner: hub.client(),
+            signers: Arc::clone(&signers),
+        };
+        let cl = join_invite_with_relay(
+            &cfg(),
+            &Identity::ephemeral(),
+            secret,
+            host_key,
+            Box::new(relay),
+        );
+        (cl, signers)
+    }
+
+    /// Answers every offer on invite `s`'s tag as someone holding the leaked
+    /// secret: signed by a throwaway key, naming `named` as the host (here,
+    /// not the real one), accepting or refusing as "closed", pointing at
+    /// `candidates`.
+    fn decoy(
+        hub: &FakeRelayHub,
+        s: &[u8; 32],
+        named: PublicKey,
+        accepted: bool,
+        candidates: Vec<Candidate>,
+    ) -> Arc<AtomicBool> {
+        let relay = hub.client();
+        let secrets = derive_invite(TAG, s, utc_today()).unwrap();
+        relay
+            .subscribe(TagFilter::one(
+                KIND_JOIN_OFFER,
+                ROOM_TAG_LETTER,
+                secrets.tag.clone(),
+            ))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut answered = std::collections::HashSet::new();
+            while !st.load(Ordering::Relaxed) {
+                while let Some(ev) = relay.try_recv() {
+                    let Ok(offer) = open_offer(&secrets.keys, &ev, unix_now()) else {
+                        continue;
+                    };
+                    if !answered.insert(offer.session.clone()) {
+                        continue;
+                    }
+                    let a = Answer {
+                        v: NET_PROTOCOL_VERSION,
+                        session: offer.session,
+                        accepted,
+                        reason: (!accepted).then(|| "closed".to_string()),
+                        candidates: candidates.clone(),
+                        sent_at: unix_now(),
+                        host_pubkey: named.to_hex(),
+                    };
+                    let out = seal_answer(&nostr::Keys::generate(), &ev.pubkey, &a).unwrap();
+                    relay.publish(&out).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        stop
+    }
+
+    fn loopback_candidate(addr: std::net::SocketAddr) -> Candidate {
+        Candidate {
+            kind: "lan".into(),
+            addr: std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), addr.port())
+                .to_string(),
+        }
+    }
+
+    /// Answers are not linkable by their author: each join session's answer is
+    /// signed by a key of its own, so two invites, the code and two joiners on
+    /// the same invite show four unrelated signers, none of them the host's
+    /// identity. Each of these joins still completes, which is the proof that
+    /// the welcome names the key that signed that session's answer (a joiner
+    /// from before this change checks exactly that).
+    #[test]
+    fn answers_for_different_invites_and_the_code_are_signed_by_different_keys() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, code) = hosted(&hub, &host_id);
+        let (a, b) = (secret(20), secret(21));
+        h.add_invite(a).unwrap();
+        h.add_invite(b).unwrap();
+        settle();
+        let key = host_id.pubkey().to_bytes();
+
+        let joins = [
+            recorded_code_join(&hub, &code),
+            recorded_invite_join(&hub, &a, key),
+            recorded_invite_join(&hub, &b, key),
+            recorded_invite_join(&hub, &a, key),
+        ];
+        let mut signer_of_each = Vec::new();
+        for (cl, signers) in &joins {
+            assert!(
+                matches!(join_outcome(cl), ClientEvent::Connected { .. }),
+                "a join with a per-session answer key must complete"
+            );
+            let distinct: std::collections::HashSet<_> =
+                signers.lock().unwrap().iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "one answer key per session: {distinct:?}"
+            );
+            signer_of_each.push(*distinct.iter().next().unwrap());
+        }
+        let all: std::collections::HashSet<_> = signer_of_each.iter().copied().collect();
+        assert_eq!(
+            all.len(),
+            joins.len(),
+            "answers to the code, two invites and a repeat of one share a signer"
+        );
+        assert!(
+            !all.contains(&host_id.pubkey()),
+            "an answer was signed by the host's identity"
+        );
+        h.shutdown();
+    }
+
+    /// An invite removed after its hello passed admission but before the peer
+    /// was seated does not get a seat.
+    #[test]
+    fn an_invite_removed_during_the_handshake_is_not_seated() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let s = secret(22);
+        let invite = h.add_invite(s).unwrap();
+        settle();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        h.pause_before_seating(Some(barrier.clone()));
+        let (cl, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        // Admitted, welcomed and identified; about to be seated.
+        crate::runtime().block_on(barrier.wait());
+        assert!(h.remove_invite(invite));
+        crate::runtime().block_on(barrier.wait());
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    reason: FailReason::NotAdmitted,
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        assert_eq!(h.peer_count(), 0);
+        while let Some(ev) = h.poll() {
+            assert!(
+                !matches!(ev, HostEvent::PeerJoined { .. }),
+                "a revoked invite was seated"
+            );
+        }
+        h.pause_before_seating(None);
+        h.shutdown();
+    }
+
+    /// Someone holding the leaked secret answers first, once as an acceptance
+    /// naming another host and once as a refusal. The joiner ignores both and
+    /// still reaches the real host.
+    #[test]
+    fn a_decoy_answer_from_a_holder_of_the_secret_does_not_stop_the_real_join() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let s = secret(23);
+        h.add_invite(s).unwrap();
+        settle();
+        let other = Identity::ephemeral().pubkey();
+        let stops = [
+            decoy(&hub, &s, other, true, Vec::new()),
+            decoy(&hub, &s, other, false, Vec::new()),
+        ];
+        let (cl, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(&ev, ClientEvent::Connected { host_pubkey, .. } if *host_pubkey == host_id.pubkey()),
+            "{ev:?}"
+        );
+        assert_eq!(joined(&h).1, Admission::Invite(InviteId::of(&s)));
+        for stop in stops {
+            stop.store(true, Ordering::Relaxed);
+        }
+        h.shutdown();
+    }
+
+    /// Pin layer one, alone: an answer naming a host other than the pinned
+    /// one. With no real host answering, the join times out without a
+    /// `Connecting` step, and nothing is sent to the address the answer gave.
+    #[test]
+    fn an_answer_naming_another_host_is_ignored_and_never_dialled() {
+        let hub = FakeRelayHub::new();
+        let s = secret(24);
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let named = Identity::ephemeral().pubkey();
+        let stop = decoy(
+            &hub,
+            &s,
+            named,
+            true,
+            vec![loopback_candidate(target.local_addr().unwrap())],
+        );
+        let pinned = Identity::ephemeral().pubkey().to_bytes();
+        let (cl, _) = join_by_invite(&hub, &s, pinned);
+        let mut stages = Vec::new();
+        let ev = wait_client(&cl, 25, |e| {
+            if let ClientEvent::Progress { stage } = e {
+                stages.push(*stage);
+            }
+            matches!(
+                e,
+                ClientEvent::Connected { .. } | ClientEvent::Failed { .. }
+            )
+        });
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    stage: JoinStage::FindingHost,
+                    reason: FailReason::NoAnswer
+                }
+            ),
+            "{ev:?}"
+        );
+        assert!(!stages.contains(&JoinStage::Connecting), "{stages:?}");
+        assert_eq!(
+            datagrams_within(&target, Duration::from_millis(300)),
+            0,
+            "the joiner punched towards a host the invite does not pin"
+        );
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Pin layer two, alone: the answer names the pinned key (so the first
+    /// layer passes it) but the host that is dialled signs its welcome as
+    /// someone else. The joiner refuses and never says who it is.
+    #[test]
+    fn a_welcome_signed_by_another_host_is_refused_even_if_the_answer_names_the_pinned_one() {
+        let hub = FakeRelayHub::new();
+        let imposter_id = Identity::ephemeral();
+        let (imposter, _) = hosted(&hub, &imposter_id);
+        let s = secret(25);
+        // The imposter has the secret (admission passes) but is not asked to
+        // answer: the forged answer below does, naming the pinned key.
+        imposter.add_invite(s).unwrap();
+        let pinned = Identity::ephemeral().pubkey();
+        let stop = decoy(
+            &hub,
+            &s,
+            pinned,
+            true,
+            vec![loopback_candidate(imposter.local_addr().unwrap())],
+        );
+        settle();
+        let (cl, _) = join_by_invite(&hub, &s, pinned.to_bytes());
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    reason: FailReason::HostUnverified,
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        assert_eq!(imposter.peer_count(), 0, "we never said who we are");
+        while let Some(ev) = imposter.poll() {
+            assert!(!matches!(ev, HostEvent::PeerJoined { .. }), "{ev:?}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        imposter.shutdown();
     }
 
     #[test]
