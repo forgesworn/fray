@@ -39,7 +39,7 @@ pub use client::{
     join, join_addr, join_invite, join_invite_with_relay, join_lan, join_session_addr,
     join_with_relay, ClientHandle,
 };
-pub use host::HostHandle;
+pub use host::{HostHandle, MAX_INVITES};
 pub use identity::{npub_of, Identity};
 pub use lan::{lan_browse, LanBrowser};
 pub use netbind::{check_lan_binding, lan_blocked, LanBindError, LanSocketHook, VPN_BLOCKS_LAN};

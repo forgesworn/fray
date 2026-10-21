@@ -3540,7 +3540,11 @@ mod invites {
 
         // Midnight UTC passes on the host: it listens on DAY + 1 and DAY.
         h.set_test_day(DAY + 1);
-        std::thread::sleep(Duration::from_millis(500));
+        // The roll derives the code again (Argon2id) before the invites follow.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !raw_hello(addr, day_proof(DAY + 1)).0 {
+            assert!(Instant::now() < deadline, "the host never rolled");
+        }
         assert!(raw_hello(addr, day_proof(DAY + 1)).0, "the new day's token");
         assert!(raw_hello(addr, day_proof(DAY)).0, "yesterday's still works");
         assert!(
