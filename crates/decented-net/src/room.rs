@@ -261,7 +261,7 @@ fn invite_master(app_tag: &str, secret: &[u8; 32], day: u64) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The same tag / room keypair / admission token as [`derive`] yields for a
+/// The same tag / room keypair / admission token as [`derive()`] yields for a
 /// code, from an invite's `secret` on UTC `day`. Cheap (a few hashes and one
 /// key derivation), so it needs no thread of its own. Fails only if the room
 /// key hash is zero or at least the curve order (probability about 2^-128).
