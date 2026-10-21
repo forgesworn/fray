@@ -167,7 +167,12 @@ impl Shared {
         let Ok(mut keys) = self.answer_keys.lock() else {
             return;
         };
-        if keys.by_session.insert(session.to_string(), key).is_none() {
+        // The first key recorded for a session stays: someone who re-offers a
+        // session id they saw cannot swap the key its real joiner will be told.
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            keys.by_session.entry(session.to_string())
+        {
+            slot.insert(key);
             keys.order.push_back(session.to_string());
         }
         while keys.order.len() > MAX_SESSIONS {
@@ -2572,6 +2577,31 @@ mod migration_transition_tests {
             refused
         });
         assert_eq!(h.peer_count(), 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn the_first_answer_key_recorded_for_a_session_stays() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "answer-key-test").lan_only();
+        cfg.lan_port = 0;
+        let h = host(
+            &cfg,
+            &Identity::ephemeral(),
+            RoomInfo {
+                name: "r".into(),
+                max_players: 4,
+            },
+        );
+        let (first, second) = (Keys::generate().public_key(), Keys::generate().public_key());
+        h.shared.record_answer_key("session-a", first);
+        // A re-offer of the same session id gets its own answer key, but the
+        // welcome keeps naming the first.
+        h.shared.record_answer_key("session-a", second);
+        assert_eq!(h.shared.answer_key_for(Some("session-a")), first);
+        h.shared.record_answer_key("session-b", second);
+        assert_eq!(h.shared.answer_key_for(Some("session-b")), second);
+        assert_ne!(h.shared.answer_key_for(Some("unknown")), first);
+        assert_eq!(h.shared.answer_keys.lock().unwrap().order.len(), 2);
         h.shutdown();
     }
 

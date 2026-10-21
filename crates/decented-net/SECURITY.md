@@ -143,8 +143,12 @@ own public key. `HostHandle::add_invite` / `remove_invite` manage them (at most
   ignored, as if it had not arrived: the joiner keeps waiting for the real
   host's answer until the normal timeout (`NoAnswer`), and never punches or
   dials towards the other. The welcome must be signed by the pinned key too
-  (`HostUnverified`). Someone who obtains the secret can answer the offer
-  first, but cannot pass as the host or make the real join fail.
+  (`HostUnverified`). Someone who obtains the secret cannot pass as the host
+  or be admitted anywhere the invite is not, but can disrupt that invite's
+  joins: a forged answer that names the pinned host (which anyone can read
+  from the link) and points elsewhere fails the join closed
+  (`HostUnverified`, `HostConflict` or a refusal). The fix for a leaked
+  secret is to revoke it.
 - **What a leaked link gives.** Whoever holds a live invite can ask the host to
   answer and can prove admission (the same as a code, only stronger because it
   cannot be guessed), so treat it as a bearer ticket: a host that wants it to
