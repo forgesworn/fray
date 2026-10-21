@@ -49,6 +49,19 @@ This creates a transport identity and echoes reliable bytes; it does not impleme
 
 See [transport v6](docs/transport-v6.md) for the compatibility inventory and [security notes](crates/decented-net/SECURITY.md) for room-code and identity limitations. A room code is an invitation mechanism, not proof of a friend's identity.
 
+## Invites
+
+A host that has relays (a home "Keep") can also admit people by invite, next to
+its 6-letter code. The host makes a 32-byte random secret, calls
+`host.add_invite(secret)` (it returns an `InviteId`; `remove_invite(id)` revokes)
+and puts the secret and `host.runtime_key()` in a link. The joiner calls
+`fray_net::join_invite(&config, &identity, &secret, host_key)`. It finds the
+host over the relays the way a code join does, so the link holds no address and
+a revoked invite gets no answer. It only joins the host whose key is in the
+link. `HostEvent::PeerJoined { admitted_by, .. }` says whether a peer came in by
+`Admission::Code`, `Lan`, `Invite(id)` or `Other`. A host holds at most 256
+invites; see the security notes for the design.
+
 ## Dedicated game host
 
 Set `NetConfig::host_has_player = false` when the game authority has no local

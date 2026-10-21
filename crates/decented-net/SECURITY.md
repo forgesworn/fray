@@ -84,11 +84,13 @@ the joiner reveals nothing identifying to a host it has not verified
 (review-net-1 N5). Before v4 the joiner's key and attestation went in the
 first frame, to whoever answered the dial.
 
-## Admission: the hello must prove the code (or the LAN token)
+## Admission: the hello must prove the code, an invite or the LAN token
 
 A QUIC dial is admitted only if its hello proves an **admission token**:
 
 - **Code joins:** the code's admission sub-key, for today or yesterday.
+- **Invite joins:** the invite's admission sub-key (see "Invites" below), for
+  today or yesterday.
 - **LAN joins:** a random 32-byte token in the LAN beacon. Being on the same
   network counts as being in the room. The token rotates whenever the room
   opens or closes, so a token heard in an earlier lobby stops working.
@@ -109,6 +111,46 @@ that TLS session. A fake host learns nothing it can replay.
   messages; the net layer's `FLOOD` close does not ban): a joiner refused because the room was full, the match had
   started or its version differed, or one that sat on the confirm screen too
   long (`CONFIRM_TIMEOUT`), is only disconnected and may come back.
+
+## Invites (code-room hosts)
+
+A host can admit people by **invite** as well as by its room code. An invite is
+a 32-byte secret from the OS RNG that the host hands out in a link, with its
+own public key. `HostHandle::add_invite` / `remove_invite` manage them (at most
+256 live at once); `join_invite` is the joiner's side.
+
+- **Derivation.** `master = sha256("<app_tag>-invite-v1:" || utc_day || ":" ||
+  secret)`, then the same three sub-keys as a code (relay tag, room keypair,
+  admission token). No KDF: the secret already has 256 bits, so there is
+  nothing to sweep. A code's master is an Argon2id output and an invite's a
+  labelled sha256, so the two can never yield each other's tag, key or token.
+  The invite's id (`InviteId`, 16 bytes) is `sha256("decented-net/invite-v1/id\0"
+  || secret)` truncated: it names the invite to the app and reveals nothing of it.
+- **No address in the link.** The link holds the secret and the host's key.
+  The joiner finds the host through the same encrypted offer/answer exchange as
+  a code join, on relay tags that change every UTC day (today and yesterday are
+  both listened on, as for codes). The daily tag buys unlinkability across
+  days; a relay observer cannot map tags to invites, because it would have to
+  guess 256 bits.
+- **Revoking.** `remove_invite` strips the invite's tokens at once, so a hello
+  proving them gets `NOT_ADMITTED` before any welcome, and stops the host
+  answering offers on its tags. A revoked invite learns nothing: no answer, no
+  welcome. Connections it already admitted stay: Fray does not drop them, the
+  game decides (`kick`).
+- **The host is pinned.** A joiner by invite joins only a host whose key is the
+  one in the link: an answer naming another key is refused before the joiner
+  punches or dials, and the welcome must be signed by that key too
+  (`HostUnverified`). Someone who obtains the secret can answer the offer, but
+  cannot pass as the host.
+- **What a leaked link gives.** Whoever holds a live invite can ask the host to
+  answer and can prove admission (the same as a code, only stronger because it
+  cannot be guessed), so treat it as a bearer ticket: a host that wants it to
+  work once should revoke it after use. The host reports which invite admitted
+  each peer (`Admission::Invite(id)`) so the app can do that.
+- **Limits.** All live invites share the host's one standing relay
+  subscription, which then names two tags per invite (up to 514 values at
+  the cap); a relay that caps the values of a tag filter would drop some. Invites
+  need relays, like the code; a virtual-link host refuses them.
 
 ## Privacy: identity keys never reach relays
 
