@@ -2718,6 +2718,61 @@ fn a_bad_app_label_is_refused_by_host_and_join() {
 
 // ─── Announcing addresses the host is given (`advertise`) ──────────────────
 
+/// A UDP port nothing holds right now (the caller sets `quic_port` to it, as
+/// it would to the port a forward targets).
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A private LAN address of this machine, or `None` (the test then skips).
+fn private_lan_ip() -> Option<std::net::Ipv4Addr> {
+    let ip = crate::nat::candidates::local_outbound_v4().filter(|ip| ip.is_private());
+    if ip.is_none() {
+        eprintln!("skipped: this machine has no private LAN IPv4 address");
+    }
+    ip
+}
+
+/// Offer `offered` to the room `code` (hosted at [`DAY`]) as a stranger who
+/// holds the code would, and return the answer the host sends back.
+fn answer_to_offer(hub: &FakeRelayHub, code: &str, offered: Vec<Candidate>) -> Answer {
+    let secrets = derive(TAG, code, DAY).unwrap();
+    let me = nostr::Keys::generate();
+    let relay = hub.client();
+    relay
+        .subscribe(TagFilter::one(
+            crate::rendezvous::KIND_JOIN_ANSWER,
+            'p',
+            me.public_key().to_hex(),
+        ))
+        .unwrap();
+    let session = "ab".repeat(16);
+    let offer = crate::rendezvous::Offer {
+        v: NET_PROTOCOL_VERSION,
+        session: session.clone(),
+        pubkey: me.public_key().to_hex(),
+        candidates: offered,
+        sent_at: unix_now(),
+    };
+    let ev = crate::rendezvous::seal_offer(&me, &secrets.keys.public_key(), &secrets.tag, &offer)
+        .unwrap();
+    hub.client().publish(&ev).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        while let Some(ev) = relay.try_recv() {
+            if let Ok(a) = crate::rendezvous::open_answer(&me, &ev, &session, unix_now()) {
+                return a;
+            }
+        }
+        assert!(Instant::now() < deadline, "no answer");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn sa(s: &str) -> std::net::SocketAddr {
     s.parse().unwrap()
 }
@@ -2798,17 +2853,26 @@ fn a_host_config_with_bad_advertise_fails_at_start() {
         empty.advertise_only = true;
         let mut loopback = cfg();
         loopback.advertise = vec![sa("127.0.0.1:40000")];
+        let mut no_port = cfg();
+        no_port.advertise = vec![sa("192.168.1.20:40000")];
+        let mut cgnat_hooked = cfg();
+        cgnat_hooked.quic_port = 40000;
+        cgnat_hooked.advertise = vec![sa("100.64.0.7:40000")];
+        cgnat_hooked.lan_socket_hook = Some(recording_hook().0);
         let mut low = cfg();
         low.advertise = vec![sa("192.168.1.20:443")];
         let mut only_loopback = cfg();
         only_loopback.advertise_only = true;
         only_loopback.advertise = vec![sa("[::1]:40000")];
         let mut hooked = cfg();
+        hooked.quic_port = 40000;
         hooked.advertise = vec![sa("81.2.69.160:40000")];
         hooked.lan_socket_hook = Some(recording_hook().0);
         vec![
             (empty, "advertise is empty"),
             (loopback, "127.0.0.1:40000"),
+            (no_port, "quic_port"),
+            (cgnat_hooked, "100.64.0.7:40000"),
             (low, "1024"),
             (only_loopback, "::1"),
             (hooked, "lan_socket_hook"),
@@ -2920,26 +2984,26 @@ fn advertise_only_announces_exactly_the_configured_set() {
 
 #[test]
 fn an_advertised_ipv6_address_needs_a_socket_that_can_answer_it() {
-    use crate::host::{prepare_advertising, Advertise};
-    let list =
-        crate::nat::candidates::advertised_candidates(&[sa("[2a00:1450::1]:40000")]).unwrap();
-    let r = futures_block(prepare_advertising(
-        0,
-        false,
-        Vec::new(),
-        None,
-        Advertise { list, only: true },
-    ));
-    // Dual-stack machines succeed; an IPv4-only bind fallback says why not.
-    if let Err(e) = r {
-        assert!(e.contains("IPv4-only"), "{e}");
-    }
+    use crate::host::check_advertise_family;
+    let v6 = crate::nat::candidates::advertised_candidates(&[sa("[2a00:1450::1]:40000")]).unwrap();
+    let v4 = crate::nat::candidates::advertised_candidates(&[sa("81.2.69.160:40000")]).unwrap();
+    let both = [v4.clone(), v6.clone()].concat();
+    // A dual-stack socket answers both families; an IPv4-only one only IPv4.
+    assert!(check_advertise_family(sa("[::]:40000"), &both).is_ok());
+    assert!(check_advertise_family(sa("0.0.0.0:40000"), &v4).is_ok());
+    assert!(check_advertise_family(sa("0.0.0.0:40000"), &[]).is_ok());
+    let e = check_advertise_family(sa("0.0.0.0:40000"), &both).unwrap_err();
+    assert!(
+        e.contains("[2a00:1450::1]:40000") && e.contains("IPv4-only"),
+        "{e}"
+    );
 }
 
 #[test]
 fn an_advertise_only_host_sends_no_lan_beacon() {
     let mut c = cfg();
     c.advertise_only = true;
+    c.quic_port = free_udp_port();
     c.advertise = vec![sa("10.1.2.3:40000")];
     let mut browser = lan_browse(&c);
     let h = host(&c, &Identity::ephemeral(), room(4));
@@ -2951,6 +3015,7 @@ fn an_advertise_only_host_sends_no_lan_beacon() {
     }
     // Positive control: the same browser does hear an ordinary host.
     let mut plain = c.clone();
+    plain.quic_port = 0;
     plain.advertise_only = false;
     plain.advertise.clear();
     let h2 = host(&plain, &Identity::ephemeral(), room(4));
@@ -2967,10 +3032,11 @@ fn an_advertise_only_host_sends_no_lan_beacon() {
     h2.shutdown();
 }
 
-/// A joiner reaches an advertise-only host through the one address it was
-/// told to announce: the machine's own LAN address on the port it binds. The
-/// host announces nothing it discovered, so the join proves the answer carried
-/// the configured candidate.
+/// A joiner reaches an advertise-only host through the address it was told
+/// to announce: the machine's own LAN address on the port it binds. (This
+/// address is also what the host's own gather would find, so the test does not
+/// tell the two apart; the answer's exact content and the absence of STUN and
+/// punches are pinned by the tests below.)
 #[test]
 fn a_joiner_reaches_an_advertise_only_host_through_its_advertised_address() {
     let Some(lan_ip) = crate::nat::candidates::local_outbound_v4() else {
@@ -2979,11 +3045,7 @@ fn a_joiner_reaches_an_advertise_only_host_through_its_advertised_address() {
     };
     // A free port for the host to bind (the caller sets quic_port to the port
     // a forward targets).
-    let port = std::net::UdpSocket::bind("0.0.0.0:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_udp_port();
     let hub = FakeRelayHub::new();
     let joiner_cfg = cfg();
     let mut host_cfg = joiner_cfg.clone();
@@ -3014,5 +3076,81 @@ fn a_joiner_reaches_an_advertise_only_host_through_its_advertised_address() {
     };
     assert_eq!(path, PathKind::Lan);
     wait_host(&h, 5, |e| matches!(e, HostEvent::PeerJoined { .. }));
+    h.shutdown();
+}
+
+/// Datagrams that reach `sock` within `window`.
+fn datagrams_within(sock: &std::net::UdpSocket, window: Duration) -> usize {
+    let until = Instant::now() + window;
+    let mut n = 0;
+    let mut buf = [0u8; 2048];
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    while Instant::now() < until {
+        if sock.recv_from(&mut buf).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn an_advertise_only_host_answers_with_exactly_its_list() {
+    let Some(lan_ip) = private_lan_ip() else {
+        return;
+    };
+    let mut c = cfg();
+    c.quic_port = free_udp_port();
+    // A global IPv4 entry no discovery of this machine would produce (STUN is
+    // off), so the answer can only hold it if it came from `advertise`.
+    c.advertise = vec![
+        std::net::SocketAddr::new(lan_ip.into(), c.quic_port),
+        sa(&format!("81.2.69.160:{}", c.quic_port)),
+    ];
+    c.advertise_only = true;
+    let hub = FakeRelayHub::new();
+    let h = host_with_relay_at_day(
+        &c,
+        &Identity::ephemeral(),
+        room(4),
+        Some(Box::new(hub.client())),
+        DAY,
+    );
+    let code = wait_ready(&h);
+    let answer = answer_to_offer(&hub, &code, vec![cand("lan", "10.9.9.9:40000")]);
+    assert!(answer.accepted);
+    assert_eq!(
+        answer.candidates,
+        vec![
+            cand("lan", &c.advertise[0].to_string()),
+            cand("upnp", &c.advertise[1].to_string()),
+        ]
+    );
+    h.shutdown();
+}
+
+#[test]
+fn an_advertise_only_host_sends_no_stun_query() {
+    // A STUN "server" that only counts what reaches it.
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut c = cfg();
+    c.stun = vec![server.local_addr().unwrap().to_string()];
+    c.quic_port = free_udp_port();
+    c.advertise = vec![sa(&format!("81.2.69.160:{}", c.quic_port))];
+    c.advertise_only = true;
+    let h = host_with_relay(&c, &Identity::ephemeral(), room(4), None);
+    wait_ready(&h);
+    assert_eq!(datagrams_within(&server, Duration::from_millis(1500)), 0);
+    h.shutdown();
+    // Positive control: without advertise_only the host does ask.
+    c.advertise_only = false;
+    c.advertise.clear();
+    c.quic_port = 0;
+    let h = host_with_relay(&c, &Identity::ephemeral(), room(4), None);
+    wait_ready(&h);
+    assert!(
+        datagrams_within(&server, Duration::from_millis(500)) > 0,
+        "control: an ordinary host sent no STUN query"
+    );
     h.shutdown();
 }

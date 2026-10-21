@@ -1202,6 +1202,16 @@ impl HostTask {
         }
     }
 
+    /// Punch towards the addresses a joiner offered. An advertise-only host
+    /// sends none: every packet it started would leave by the default route
+    /// (not the forward or tunnel it announces), and the joiner dials the
+    /// advertised addresses anyway.
+    fn punch(&self, punchers: &Punchers, targets: Vec<SocketAddr>, session: String) {
+        if !self.cfg.advertise_only {
+            punchers.send(targets, session);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_offer(
         &self,
@@ -1246,7 +1256,7 @@ impl HostTask {
                 a.sends += 1;
                 let _ = relay.publish(&a.event);
                 if a.accepted {
-                    punchers.send(a.targets.clone(), offer.session.clone());
+                    self.punch(punchers, a.targets.clone(), offer.session.clone());
                 }
             }
             return;
@@ -1300,7 +1310,7 @@ impl HostTask {
             refusal.unwrap_or("accepted")
         );
         if refusal.is_none() {
-            punchers.send(targets.clone(), offer.session.clone());
+            self.punch(punchers, targets.clone(), offer.session.clone());
         }
         while offers.sessions.len() >= MAX_SESSIONS {
             let Some(oldest) = offers
@@ -1448,6 +1458,29 @@ pub(crate) struct Advertise {
     pub only: bool,
 }
 
+/// An IPv6 address to announce needs a socket that can answer it: `serving`
+/// is the socket whose port the advertised addresses name.
+pub(crate) fn check_advertise_family(
+    serving: SocketAddr,
+    advertised: &[Candidate],
+) -> Result<(), String> {
+    if serving.is_ipv6() {
+        return Ok(());
+    }
+    match advertised.iter().find(|c| {
+        c.addr
+            .parse::<SocketAddr>()
+            .map(|a| a.is_ipv6())
+            .unwrap_or(false)
+    }) {
+        Some(c) => Err(format!(
+            "advertise {}: the UDP socket is IPv4-only, so it cannot answer IPv6",
+            c.addr
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Whether to ask the router for a port mapping: an online host, and no VPN
 /// carrying its traffic (the mapping would advertise the home router's real
 /// address while the VPN carries the traffic).
@@ -1494,6 +1527,26 @@ pub(crate) async fn prepare_advertising(
         let local = socket
             .local_addr()
             .map_err(|e| format!("socket has no address: {e}"))?;
+        // With a hook the LAN socket binds `port` and serves the advertised
+        // addresses, so it is bound now, before anything is gathered or
+        // mapped. Local joiners dial it, and it must answer them on the local
+        // network, so it is bound there before anything is sent from it.
+        // Nothing else is ever sent from it: no STUN, no UPnP.
+        let lan_bound = if split {
+            let lan = crate::nat::addr::bind_dual_stack(port)
+                .map_err(|e| format!("could not bind UDP port {port}: {e}"))?;
+            let _ = crate::netbind::bind_lan(lan_hook.as_ref(), &lan);
+            let lan_local = lan
+                .local_addr()
+                .map_err(|e| format!("socket has no address: {e}"))?;
+            Some((lan, lan_local))
+        } else {
+            None
+        };
+        check_advertise_family(
+            lan_bound.as_ref().map_or(local, |(_, l)| *l),
+            &advertise.list,
+        )?;
         let mapping_thread = upnp.then(|| {
             std::thread::spawn(move || {
                 let v4 = crate::nat::candidates::local_outbound_v4()?;
@@ -1526,20 +1579,6 @@ pub(crate) async fn prepare_advertising(
                     .unwrap_or(false)
             });
         }
-        // An IPv6 address to announce needs a socket that can answer it.
-        if !local.is_ipv6() {
-            if let Some(c) = advertise.list.iter().find(|c| {
-                c.addr
-                    .parse::<SocketAddr>()
-                    .map(|a| a.is_ipv6())
-                    .unwrap_or(false)
-            }) {
-                return Err(format!(
-                    "advertise {}: the UDP socket is IPv4-only, so it cannot answer IPv6",
-                    c.addr
-                ));
-            }
-        }
         let punch_socket = socket
             .try_clone()
             .map_err(|e| format!("socket clone: {e}"))?;
@@ -1547,16 +1586,7 @@ pub(crate) async fn prepare_advertising(
         let _ = socket.set_read_timeout(None);
 
         let (mut lan_socket, mut lan_punch_socket) = (None, None);
-        if split {
-            let lan = crate::nat::addr::bind_dual_stack(port)
-                .map_err(|e| format!("could not bind UDP port {port}: {e}"))?;
-            // Local joiners dial this socket, and it must answer them on the
-            // local network, so it is bound there before anything is sent
-            // from it. Nothing else is ever sent from it: no STUN, no UPnP.
-            let _ = crate::netbind::bind_lan(lan_hook.as_ref(), &lan);
-            let lan_local = lan
-                .local_addr()
-                .map_err(|e| format!("socket has no address: {e}"))?;
+        if let Some((lan, lan_local)) = lan_bound {
             // Its own gather names only itself (no STUN servers, no UPnP);
             // of that, only the LAN candidate is used.
             let mut lan_candidates: Vec<Candidate> = if advertise.only {
@@ -2831,5 +2861,74 @@ mod migration_transition_tests {
         assert_eq!(h.peer_count(), 4);
         drop(seated);
         h.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod advertise_tests {
+    use super::*;
+
+    /// Datagrams `punch` makes reach `watch` (one local socket standing for a
+    /// joiner's offered address); the punch itself is 3 rounds 100 ms apart.
+    fn punches_seen(advertise_only: bool) -> usize {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "advertise-punch-test").lan_only();
+        cfg.lan_port = 0;
+        let h = host(
+            &cfg,
+            &Identity::ephemeral(),
+            RoomInfo {
+                name: "r".into(),
+                max_players: 4,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(h.poll(), Some(HostEvent::Ready { .. })) {
+            assert!(Instant::now() < deadline, "host not ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut task_cfg = cfg.clone();
+        task_cfg.advertise_only = advertise_only;
+        let task = HostTask {
+            cfg: task_cfg,
+            keys: Keys::generate(),
+            room: RoomInfo {
+                name: "r".into(),
+                max_players: 4,
+            },
+            code: h.code().into(),
+            shared: h.shared.clone(),
+            fixed_day: None,
+        };
+        let watch = UdpSocket::bind("127.0.0.1:0").unwrap();
+        watch
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let punchers = Punchers {
+            online: Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            lan: None,
+        };
+        {
+            let _rt = crate::runtime().enter();
+            task.punch(
+                &punchers,
+                vec![watch.local_addr().unwrap()],
+                "ab".repeat(16),
+            );
+        }
+        let (until, mut n) = (Instant::now() + Duration::from_millis(1200), 0);
+        let mut buf = [0u8; 2048];
+        while Instant::now() < until {
+            if watch.recv_from(&mut buf).is_ok() {
+                n += 1;
+            }
+        }
+        h.shutdown();
+        n
+    }
+
+    #[test]
+    fn an_advertise_only_host_sends_no_punch() {
+        assert!(punches_seen(false) > 0, "control: an ordinary host punches");
+        assert_eq!(punches_seen(true), 0, "an advertise-only host punched");
     }
 }

@@ -158,14 +158,19 @@ pub struct NetConfig {
     /// IPv6 unique-local as `lan`, global IPv4 as `upnp`, global IPv6 as `v6`.
     /// Loopback, unspecified, link-local, multicast, documentation and other
     /// reserved addresses, and ports below 1024, fail the host at start (a
-    /// joiner would drop them), as do more than 8 addresses, and a non-`lan`
-    /// address while [`NetConfig::lan_socket_hook`] is set (the hooked socket
-    /// serves local peers only). Default empty.
+    /// joiner would drop them), as do more than 8 addresses, a non-empty list
+    /// with `quic_port` 0 (no forward can target an ephemeral port), and any
+    /// address but a private or unique-local one while
+    /// [`NetConfig::lan_socket_hook`] is set (the hooked socket serves local
+    /// sources only, and its replies bypass a VPN). Default empty.
     pub advertise: Vec<SocketAddr>,
     /// Announce only [`NetConfig::advertise`]: the host skips its own LAN,
     /// STUN, UPnP and IPv6 gathering, starts no router mapping, and sends no
     /// LAN beacon, so nothing it discovers is announced. Fails the host at
-    /// start if `advertise` is empty. Default false.
+    /// start if `advertise` is empty. The host also sends no hole punches
+    /// towards the addresses a joiner offers: joiners reach it by dialling the
+    /// advertised addresses. Its relay connections still leave by the default
+    /// route (relay operators see its address; players do not). Default false.
     pub advertise_only: bool,
     /// Tests only: whether the hooked LAN endpoint treats loopback sources as
     /// local (always so outside tests: loopback is this device).
@@ -223,14 +228,23 @@ impl NetConfig {
         }
         let list = nat::candidates::advertised_candidates(&self.advertise)?;
         if self.lan_socket_hook.is_some() {
-            let lan = nat::candidates::CandidateKind::Lan.as_str();
-            if let Some(c) = list.iter().find(|c| c.kind != lan) {
+            // The hooked endpoint serves `is_lan_ip` sources only, which
+            // leaves out carrier-NAT (100.64/10) as well as public ones.
+            let local = |c: &rendezvous::Candidate| {
+                c.addr
+                    .parse::<SocketAddr>()
+                    .is_ok_and(|a| nat::candidates::is_lan_ip(a.ip()))
+            };
+            if let Some(c) = list.iter().find(|c| !local(c)) {
                 return Err(format!(
                     "advertise {}: with a lan_socket_hook the host's QUIC port is bound for \
-                     local peers only, so only private addresses can be announced",
+                     local peers only, so only private and unique-local addresses can be announced",
                     c.addr
                 ));
             }
+        }
+        if !list.is_empty() && self.quic_port == 0 {
+            return Err("advertise is set but quic_port is 0: a forward needs a fixed port".into());
         }
         Ok(list)
     }
