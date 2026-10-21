@@ -3154,3 +3154,492 @@ fn an_advertise_only_host_sends_no_stun_query() {
     );
     h.shutdown();
 }
+
+/// Joining by invite: a secret the host hands out, with its public key.
+mod invites {
+    use super::*;
+    use crate::client::{join_invite_with_relay, join_invite_with_relay_at_day};
+    use crate::quic;
+    use crate::room::{derive_invite, utc_today, InviteId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A distinct secret per `n`.
+    fn secret(n: u8) -> [u8; 32] {
+        let mut s = [0x5a; 32];
+        s[0] = n;
+        s
+    }
+
+    /// A relay-hosted room at the clock's day, with its code.
+    fn hosted(hub: &FakeRelayHub, id: &Identity) -> (HostHandle, String) {
+        let h = host_with_relay(&cfg(), id, room(8), Some(Box::new(hub.client())));
+        let code = wait_ready(&h);
+        (h, code)
+    }
+
+    /// The host's loopback address (its `Ready` was already taken).
+    fn addr_of(h: &HostHandle) -> std::net::SocketAddr {
+        let a = h.local_addr().expect("listening");
+        std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), a.port())
+    }
+
+    /// The host listens on a new invite's tags a moment after `add_invite`.
+    fn settle() {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    fn join_by_invite(
+        hub: &FakeRelayHub,
+        secret: &[u8; 32],
+        host_key: [u8; 32],
+    ) -> (ClientHandle, Identity) {
+        let id = Identity::ephemeral();
+        let cl = join_invite_with_relay(&cfg(), &id, secret, host_key, Box::new(hub.client()));
+        (cl, id)
+    }
+
+    fn joined(h: &HostHandle) -> (PublicKey, Admission) {
+        let HostEvent::PeerJoined {
+            pubkey,
+            admitted_by,
+            ..
+        } = wait_host(h, 10, |e| matches!(e, HostEvent::PeerJoined { .. }))
+        else {
+            unreachable!()
+        };
+        (pubkey, admitted_by)
+    }
+
+    /// Dial `addr` and send a hello proving `token` only. Whether the host
+    /// welcomed us (it only does an admitted hello), and how it ended.
+    fn raw_hello(addr: std::net::SocketAddr, token: [u8; 32]) -> (bool, Option<quic::Ended>) {
+        let welcomed = Arc::new(AtomicBool::new(false));
+        let w = Arc::clone(&welcomed);
+        let ended = crate::runtime().block_on(async move {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let ep = quic::client_endpoint(socket, TAG, quic::Liveness::DEFAULT).unwrap();
+            let conn = ep.connect(addr, quic::SERVER_NAME).unwrap().await.unwrap();
+            let check: quic::HostCheck = Arc::new(move |_| {
+                w.store(true, Ordering::Relaxed);
+                Err("stop after the welcome".into())
+            });
+            let _ = quic::client_open(&conn, None, PathKind::Lan, &[token], &check).await;
+            // Give a refusal time to arrive.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            conn.close_reason().map(|e| quic::ended_of(&e))
+        });
+        (welcomed.load(Ordering::Relaxed), ended)
+    }
+
+    #[test]
+    fn a_joiner_gets_in_by_invite_and_the_host_sees_which() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _code) = hosted(&hub, &host_id);
+        let s = secret(1);
+        let invite = h.add_invite(s).unwrap();
+        assert_eq!(invite, InviteId::of(&s));
+        assert_eq!(invite.to_string().len(), 32);
+        settle();
+
+        let (cl, id) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        let mut stages = Vec::new();
+        let ev = wait_client(&cl, 25, |e| {
+            if let ClientEvent::Progress { stage } = e {
+                stages.push(*stage);
+            }
+            matches!(
+                e,
+                ClientEvent::Connected { .. } | ClientEvent::Failed { .. }
+            )
+        });
+        assert!(
+            matches!(&ev, ClientEvent::Connected { host_pubkey, .. } if *host_pubkey == host_id.pubkey()),
+            "{ev:?}"
+        );
+        assert_eq!(
+            stages,
+            vec![
+                JoinStage::Preparing,
+                JoinStage::FindingHost,
+                JoinStage::Connecting,
+                JoinStage::Handshake
+            ],
+            "same flow as a code join"
+        );
+        let (pubkey, by) = joined(&h);
+        assert_eq!(pubkey, id.pubkey());
+        assert_eq!(by, Admission::Invite(invite));
+        cl.send_reliable(Bytes::from_static(b"hi"));
+        wait_host(&h, 5, |e| matches!(e, HostEvent::Reliable { .. }));
+        h.shutdown();
+    }
+
+    #[test]
+    fn invite_code_and_lan_joins_coexist_and_are_told_apart() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, code) = hosted(&hub, &host_id);
+        let (a, b) = (secret(1), secret(2));
+        let (ia, ib) = (h.add_invite(a).unwrap(), h.add_invite(b).unwrap());
+        assert_ne!(ia, ib);
+        settle();
+        let addr = addr_of(&h);
+
+        let c = cfg();
+        let by_code = join_with_relay(&c, &Identity::ephemeral(), &code, Box::new(hub.client()));
+        assert!(matches!(
+            join_outcome(&by_code),
+            ClientEvent::Connected { .. }
+        ));
+        assert_eq!(joined(&h).1, Admission::Code);
+
+        let (inv_a, _) = join_by_invite(&hub, &a, host_id.pubkey().to_bytes());
+        assert!(matches!(
+            join_outcome(&inv_a),
+            ClientEvent::Connected { .. }
+        ));
+        assert_eq!(joined(&h).1, Admission::Invite(ia));
+
+        let (inv_b, _) = join_by_invite(&hub, &b, host_id.pubkey().to_bytes());
+        assert!(matches!(
+            join_outcome(&inv_b),
+            ClientEvent::Connected { .. }
+        ));
+        assert_eq!(joined(&h).1, Admission::Invite(ib));
+
+        let lan = join_addr(&c, &Identity::ephemeral(), addr, &h.lan_token());
+        assert!(matches!(join_outcome(&lan), ClientEvent::Connected { .. }));
+        assert_eq!(joined(&h).1, Admission::Lan);
+        assert_eq!(h.peer_count(), 4);
+        h.shutdown();
+    }
+
+    #[test]
+    fn a_removed_invite_gets_no_answer_and_its_proof_is_refused() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _code) = hosted(&hub, &host_id);
+        let addr = addr_of(&h);
+        let s = secret(3);
+        let invite = h.add_invite(s).unwrap();
+        settle();
+        let today = utc_today();
+        let proof_today = derive_invite(TAG, &s, today).unwrap().admit;
+        let proof_yesterday = derive_invite(TAG, &s, today - 1).unwrap().admit;
+
+        // Live: its proof is welcomed (the raw hello stops after the welcome).
+        assert!(
+            raw_hello(addr, proof_today).0,
+            "a live invite's proof is admitted"
+        );
+        assert!(raw_hello(addr, proof_yesterday).0, "... and yesterday's");
+
+        assert!(h.remove_invite(invite));
+        assert!(!h.remove_invite(invite), "already gone");
+        // At once, with no pause: the token is gone from admission.
+        for proof in [proof_today, proof_yesterday] {
+            let (welcomed, ended) = raw_hello(addr, proof);
+            assert!(!welcomed, "a welcome was sent to a revoked invite");
+            assert_eq!(ended, Some(quic::Ended::Remote(quic::close::NOT_ADMITTED)));
+        }
+
+        // And the host no longer answers offers on its tags.
+        settle();
+        let (cl, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    stage: JoinStage::FindingHost,
+                    reason: FailReason::NoAnswer
+                }
+            ),
+            "{ev:?}"
+        );
+        assert_eq!(h.peer_count(), 0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn removing_an_invite_does_not_drop_a_connection_it_admitted() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let s = secret(4);
+        let invite = h.add_invite(s).unwrap();
+        settle();
+        let (cl, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        assert!(matches!(join_outcome(&cl), ClientEvent::Connected { .. }));
+        let (_, by) = joined(&h);
+        assert_eq!(by, Admission::Invite(invite));
+        assert!(h.remove_invite(invite));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(h.peer_count(), 1, "the game decides about existing peers");
+        cl.send_reliable(Bytes::from_static(b"still here"));
+        wait_host(&h, 5, |e| matches!(e, HostEvent::Reliable { .. }));
+        h.shutdown();
+    }
+
+    /// A code's proof is not an invite's and the other way round: each is
+    /// credited only to its own kind, and never admits without its own token.
+    #[test]
+    fn a_code_proof_is_not_an_invite_proof_and_vice_versa() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, code) = hosted(&hub, &host_id);
+        let addr = addr_of(&h);
+        let today = utc_today();
+        let code_proof = derive(TAG, &code, today).unwrap().admit;
+        let s = secret(5);
+        let invite_proof = derive_invite(TAG, &s, today).unwrap().admit;
+
+        // Before the invite exists, its proof gets nothing; the code's gets in.
+        assert!(!raw_hello(addr, invite_proof).0);
+        assert!(raw_hello(addr, code_proof).0);
+
+        // With it added both work, each for itself.
+        h.add_invite(s).unwrap();
+        settle();
+        assert!(raw_hello(addr, invite_proof).0);
+        assert!(raw_hello(addr, code_proof).0);
+
+        // An invite built from the code's own derived token is a different
+        // invite and a different room; it is not the code.
+        let confused = derive_invite(TAG, &code_proof, today).unwrap();
+        assert_ne!(confused.admit, code_proof);
+        assert!(!raw_hello(addr, confused.admit).0);
+        // A secret the host does not hold admits nobody.
+        let other = derive_invite(TAG, &secret(6), today).unwrap().admit;
+        assert!(!raw_hello(addr, other).0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn an_invite_pins_the_host_key() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let s = secret(7);
+        h.add_invite(s).unwrap();
+        settle();
+        let wrong = Identity::ephemeral().pubkey().to_bytes();
+        let (cl, _) = join_by_invite(&hub, &s, wrong);
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    reason: FailReason::HostUnverified,
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        assert_eq!(h.peer_count(), 0, "we never said who we are");
+        while let Some(ev) = h.poll() {
+            assert!(
+                !matches!(ev, HostEvent::PeerJoined { .. }),
+                "the host seated a joiner that refused it"
+            );
+        }
+        // The right key, same secret: in.
+        let (ok, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        assert!(matches!(join_outcome(&ok), ClientEvent::Connected { .. }));
+        h.shutdown();
+    }
+
+    /// An imposter holding the secret (a leaked link) answers as itself: its
+    /// welcome is signed by the wrong key, so the pinned joiner refuses it
+    /// even though the answer, the tag and the admission all check out.
+    #[test]
+    fn a_host_other_than_the_pinned_one_is_refused_even_with_the_secret() {
+        let hub = FakeRelayHub::new();
+        let imposter_id = Identity::ephemeral();
+        let (imposter, _) = hosted(&hub, &imposter_id);
+        let s = secret(8);
+        imposter.add_invite(s).unwrap();
+        settle();
+        let real = Identity::ephemeral().pubkey().to_bytes();
+        let (cl, _) = join_by_invite(&hub, &s, real);
+        let ev = join_outcome(&cl);
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Failed {
+                    reason: FailReason::HostUnverified,
+                    ..
+                }
+            ),
+            "{ev:?}"
+        );
+        imposter.shutdown();
+    }
+
+    #[test]
+    fn invites_overlap_across_utc_midnight_like_the_code() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let c = cfg();
+        let h = host_with_relay_at_day(&c, &host_id, room(8), Some(Box::new(hub.client())), DAY);
+        wait_ready(&h);
+        let s = secret(9);
+        let invite = h.add_invite(s).unwrap();
+        settle();
+        let key = host_id.pubkey().to_bytes();
+        let at = |day| {
+            join_invite_with_relay_at_day(
+                &c,
+                &Identity::ephemeral(),
+                &s,
+                key,
+                Box::new(hub.client()),
+                day,
+            )
+        };
+        // Same day, a joiner a day ahead (host's yesterday), a day behind
+        // (joiner's yesterday is the host's today): all meet.
+        for day in [DAY, DAY + 1] {
+            let cl = at(day);
+            assert!(
+                matches!(join_outcome(&cl), ClientEvent::Connected { .. }),
+                "day {day}"
+            );
+            assert_eq!(joined(&h).1, Admission::Invite(invite));
+        }
+        // Two days out, nothing in common.
+        let far = at(DAY + 2);
+        assert!(matches!(
+            join_outcome(&far),
+            ClientEvent::Failed {
+                stage: JoinStage::FindingHost,
+                reason: FailReason::NoAnswer
+            }
+        ));
+        h.shutdown();
+    }
+
+    #[test]
+    fn invites_roll_to_the_new_day_with_the_code() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let c = cfg();
+        let h = host_with_relay_at_day(&c, &host_id, room(8), Some(Box::new(hub.client())), DAY);
+        let code = wait_ready(&h);
+        let addr = addr_of(&h);
+        let s = secret(10);
+        let invite = h.add_invite(s).unwrap();
+        settle();
+        let key = host_id.pubkey().to_bytes();
+        let day_proof = |d: u64| derive_invite(TAG, &s, d).unwrap().admit;
+        assert!(raw_hello(addr, day_proof(DAY)).0);
+        assert!(raw_hello(addr, day_proof(DAY - 1)).0);
+        assert!(!raw_hello(addr, day_proof(DAY + 1)).0, "not yet");
+
+        // Midnight UTC passes on the host: it listens on DAY + 1 and DAY.
+        h.set_test_day(DAY + 1);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(raw_hello(addr, day_proof(DAY + 1)).0, "the new day's token");
+        assert!(raw_hello(addr, day_proof(DAY)).0, "yesterday's still works");
+        assert!(
+            !raw_hello(addr, day_proof(DAY - 1)).0,
+            "the day before yesterday's is dropped"
+        );
+
+        // A joiner on the new day and one still on the old day both find it.
+        let join_at = |day| {
+            join_invite_with_relay_at_day(
+                &c,
+                &Identity::ephemeral(),
+                &s,
+                key,
+                Box::new(hub.client()),
+                day,
+            )
+        };
+        for day in [DAY + 1, DAY] {
+            let cl = join_at(day);
+            assert!(
+                matches!(join_outcome(&cl), ClientEvent::Connected { .. }),
+                "day {day}"
+            );
+            assert_eq!(joined(&h).1, Admission::Invite(invite));
+        }
+        // A joiner two days behind the host finds nothing.
+        let behind = join_at(DAY - 1);
+        assert!(matches!(
+            join_outcome(&behind),
+            ClientEvent::Failed {
+                reason: FailReason::NoAnswer,
+                ..
+            }
+        ));
+        // The code rolled too, and an invite added after the roll is derived for the new day.
+        let late = secret(11);
+        h.add_invite(late).unwrap();
+        settle();
+        assert!(raw_hello(addr, derive_invite(TAG, &late, DAY + 1).unwrap().admit).0);
+        assert!(raw_hello(addr, derive(TAG, &code, DAY + 1).unwrap().admit).0);
+        h.shutdown();
+    }
+
+    #[test]
+    fn the_257th_invite_is_refused() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let secrets: Vec<[u8; 32]> = (0..=255u8)
+            .map(|n| {
+                let mut s = [0x33; 32];
+                s[0] = n;
+                s
+            })
+            .collect();
+        assert_eq!(secrets.len(), crate::host::MAX_INVITES);
+        let ids: Vec<InviteId> = secrets.iter().map(|s| h.add_invite(*s).unwrap()).collect();
+        let extra = [0x77; 32];
+        assert!(h.add_invite(extra).is_err(), "257th refused");
+        // Adding one already held is not a new invite.
+        assert_eq!(h.add_invite(secrets[0]).unwrap(), ids[0]);
+        // Room frees up when one is revoked.
+        assert!(h.remove_invite(ids[7]));
+        assert_eq!(h.add_invite(extra).unwrap(), InviteId::of(&extra));
+        assert!(h.add_invite(secrets[7]).is_err(), "full again");
+        settle();
+        // A full house still answers: the last one in gets through.
+        let (cl, _) = join_by_invite(&hub, &secrets[255], host_id.pubkey().to_bytes());
+        assert!(matches!(join_outcome(&cl), ClientEvent::Connected { .. }));
+        assert_eq!(joined(&h).1, Admission::Invite(ids[255]));
+        h.shutdown();
+    }
+
+    #[test]
+    fn a_closed_room_does_not_answer_an_invite_and_an_open_one_does_again() {
+        let hub = FakeRelayHub::new();
+        let host_id = Identity::ephemeral();
+        let (h, _) = hosted(&hub, &host_id);
+        let s = secret(12);
+        h.add_invite(s).unwrap();
+        settle();
+        h.set_open(false);
+        settle();
+        // Adding an invite to a closed room must not reopen the subscription.
+        h.add_invite(secret(13)).unwrap();
+        settle();
+        let (late, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        assert!(matches!(
+            join_outcome(&late),
+            ClientEvent::Failed {
+                reason: FailReason::NoAnswer,
+                ..
+            }
+        ));
+        h.set_open(true);
+        settle();
+        let (cl, _) = join_by_invite(&hub, &s, host_id.pubkey().to_bytes());
+        assert!(matches!(join_outcome(&cl), ClientEvent::Connected { .. }));
+        h.shutdown();
+    }
+}

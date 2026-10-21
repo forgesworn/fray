@@ -166,15 +166,35 @@ fn connected(h: &HostHandle, cl: &ClientHandle, id: &Identity) -> PeerId {
         panic!("{ev:?}")
     };
     assert_eq!(path, PathKind::Virtual);
-    let HostEvent::PeerJoined { peer, path, .. } = wait_host(
+    let HostEvent::PeerJoined {
+        peer,
+        path,
+        admitted_by,
+        ..
+    } = wait_host(
         h,
         10,
         |e| matches!(e, HostEvent::PeerJoined { pubkey, .. } if *pubkey == id.pubkey()),
-    ) else {
+    )
+    else {
         unreachable!()
     };
     assert_eq!(path, PathKind::Virtual);
+    assert_eq!(
+        admitted_by,
+        crate::Admission::Other,
+        "a virtual link proves the LAN token, but is not a LAN join"
+    );
     peer
+}
+
+/// A virtual-link host has no relays, so it takes no invites.
+#[test]
+fn a_virtual_host_refuses_invites() {
+    let (h, _links) = ready_host(&Identity::ephemeral(), 4);
+    assert!(h.add_invite([7u8; 32]).is_err());
+    assert!(!h.remove_invite(crate::InviteId::of(&[7u8; 32])));
+    h.shutdown();
 }
 
 /// (a) A virtual host and two virtual joiners connect exactly as LAN does:

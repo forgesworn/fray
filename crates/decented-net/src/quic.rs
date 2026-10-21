@@ -49,7 +49,9 @@ impl Liveness {
     /// in whole milliseconds and reads 0 as "never", so it is at least 1 ms.
     pub(crate) fn new(idle_timeout: Duration, keep_alive: Duration) -> Result<Liveness, String> {
         if idle_timeout < Duration::from_millis(1) {
-            return Err(format!("idle_timeout ({idle_timeout:?}) must be at least 1 ms"));
+            return Err(format!(
+                "idle_timeout ({idle_timeout:?}) must be at least 1 ms"
+            ));
         }
         if keep_alive.is_zero() {
             return Err("keep_alive must not be zero".into());
@@ -474,16 +476,45 @@ pub(crate) fn admit_proof(token: &[u8; 32], binding: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Whether `hello` proves any of `tokens` on this connection.
-pub(crate) fn admitted(hello: &Hello, binding: &[u8; 32], tokens: &[[u8; 32]]) -> bool {
-    tokens.iter().any(|t| {
+/// Which of `tokens` (by index) `hello` proves on this connection, if any. A
+/// hello may carry several proofs (a code joiner sends one per day); the
+/// lowest index that matches wins. Every token is checked against every proof
+/// (no early exit), so the time taken does not say which token was proved.
+pub(crate) fn admitted_which(
+    hello: &Hello,
+    binding: &[u8; 32],
+    tokens: &[[u8; 32]],
+) -> Option<usize> {
+    let proofs: Vec<&str> = hello
+        .admit
+        .iter()
+        .take(MAX_ADMIT_PROOFS)
+        .map(String::as_str)
+        .collect();
+    let mut found: Option<usize> = None;
+    for (i, t) in tokens.iter().enumerate() {
         let want = hex::encode(admit_proof(t, binding));
-        hello
-            .admit
-            .iter()
-            .take(MAX_ADMIT_PROOFS)
-            .any(|p| *p == want)
-    })
+        let mut hit = false;
+        for p in &proofs {
+            hit |= ct_str_eq(p, &want);
+        }
+        if hit && found.is_none() {
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Equality of two strings without stopping at the first difference (the
+/// lengths are not secret: a proof is always 64 hex characters).
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn welcome_digest(
@@ -1446,23 +1477,43 @@ mod tests {
             admit,
         };
         let good = hex::encode(admit_proof(&token, &b));
-        assert!(admitted(
-            &hello(vec![good.clone()]),
-            &b,
-            &[[1u8; 32], token]
-        ));
+        assert_eq!(
+            admitted_which(&hello(vec![good.clone()]), &b, &[[1u8; 32], token]),
+            Some(1),
+            "the index of the token that was proved"
+        );
         assert!(
-            !admitted(&hello(vec![good.clone()]), &[8u8; 32], &[token]),
+            admitted_which(&hello(vec![good.clone()]), &[8u8; 32], &[token]).is_none(),
             "other connection"
         );
         assert!(
-            !admitted(&hello(vec![good]), &b, &[[4u8; 32]]),
+            admitted_which(&hello(vec![good.clone()]), &b, &[[4u8; 32]]).is_none(),
             "other token"
         );
-        assert!(!admitted(&hello(vec![]), &b, &[token]), "no proof");
         assert!(
-            !admitted(&hello(vec![hex::encode(token)]), &b, &[token]),
+            admitted_which(&hello(vec![]), &b, &[token]).is_none(),
+            "no proof"
+        );
+        assert!(
+            admitted_which(&hello(vec![hex::encode(token)]), &b, &[token]).is_none(),
             "the raw token is not a proof"
         );
+        // Several tokens proved: the earliest in the list wins; proofs beyond
+        // the cap are ignored.
+        let other = hex::encode(admit_proof(&[5u8; 32], &b));
+        assert_eq!(
+            admitted_which(
+                &hello(vec![other.clone(), good.clone()]),
+                &b,
+                &[token, [5u8; 32]]
+            ),
+            Some(0)
+        );
+        let junk = || "0".repeat(64);
+        assert!(
+            admitted_which(&hello(vec![junk(), junk(), junk(), good]), &b, &[token]).is_none(),
+            "a fourth proof is past the cap"
+        );
+        assert!(!ct_str_eq("abc", "abd") && !ct_str_eq("abc", "ab") && ct_str_eq("abc", "abc"));
     }
 }

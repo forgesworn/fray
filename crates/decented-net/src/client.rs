@@ -1,5 +1,5 @@
-//! Joining a room: by code (relay rendezvous, punch, QUIC race) or straight
-//! to a LAN beacon's address.
+//! Joining a room: by code or invite (relay rendezvous, punch, QUIC race) or
+//! straight to a LAN beacon's address.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,7 +13,7 @@ use crate::nat::candidates::{dialable, parse_addrs};
 use crate::quic::{self, close, Ended, Link};
 use crate::relay::{MultiRelay, RendezvousRelay, TagFilter};
 use crate::rendezvous::{new_session_id, open_answer, seal_offer, Answer, Offer, KIND_JOIN_ANSWER};
-use crate::room::{derive_days, normalize_code, utc_today, RoomSecrets};
+use crate::room::{derive_days, derive_invite_days, normalize_code, utc_today, RoomSecrets};
 use crate::{
     ClientEvent, DisconnectReason, FailReason, Identity, JoinStage, LanRoom, NetConfig, PathKind,
     NET_PROTOCOL_VERSION,
@@ -76,6 +76,14 @@ pub struct ClientHandle {
 pub(crate) enum Target {
     /// Code, relay, and a pinned UTC day (tests) or `None` for the clock.
     Code(String, Box<dyn RendezvousRelay>, Option<u64>),
+    /// An invite's secret, the host key it pins, the relay, and a pinned UTC
+    /// day (tests) or `None` for the clock. Rendezvous as a code join does.
+    Invite {
+        secret: [u8; 32],
+        host_key: PublicKey,
+        relay: Box<dyn RendezvousRelay>,
+        fixed_day: Option<u64>,
+    },
     /// Address and the LAN admission token (hex) from the beacon.
     Lan(
         SocketAddr,
@@ -95,6 +103,74 @@ pub fn join(cfg: &NetConfig, id: &Identity, code: &str) -> ClientHandle {
         cfg.relay_fallback,
     ));
     spawn(cfg, id, Target::Code(code.to_string(), relay, None))
+}
+
+/// Join by **invite** over the configured relays: the 32-byte `secret` and the
+/// host's public key `host_key` that an invite link carries (the host handed
+/// them out after [`HostHandle::add_invite`](crate::HostHandle::add_invite)).
+///
+/// It finds the host the way a code join does, on relay tags derived from the
+/// secret (today's, then yesterday's), so the link never holds an address and
+/// a revoked invite is simply not answered. The hello proves the invite's
+/// admission token, bound to the connection, never sent in the clear.
+///
+/// **The host is pinned.** Only a host whose welcome is signed by `host_key`
+/// (and by the key the encrypted answer named) is joined; any other, even one
+/// holding the secret, ends in [`FailReason::HostUnverified`] before this
+/// side says who it is. Events and flow are otherwise those of [`join`]; the
+/// host sees [`Admission::Invite`](crate::Admission::Invite) with the invite's
+/// [`InviteId`](crate::InviteId) ([`InviteId::of`](crate::InviteId::of) the
+/// secret).
+pub fn join_invite(
+    cfg: &NetConfig,
+    id: &Identity,
+    secret: &[u8; 32],
+    host_key: [u8; 32],
+) -> ClientHandle {
+    let relay = Box::new(MultiRelay::start_in(
+        decented_relays::RelayPool::global(),
+        cfg.relays.clone(),
+        cfg.relay_fallback,
+    ));
+    join_invite_with_relay(cfg, id, secret, host_key, relay)
+}
+
+/// [`join_invite`] over a caller-supplied relay (e.g. [`crate::relay::FakeRelayHub`] in tests).
+pub fn join_invite_with_relay(
+    cfg: &NetConfig,
+    id: &Identity,
+    secret: &[u8; 32],
+    host_key: [u8; 32],
+    relay: Box<dyn RendezvousRelay>,
+) -> ClientHandle {
+    spawn(cfg, id, invite_target(secret, host_key, relay, None))
+}
+
+/// [`join_invite_with_relay`] pinned to UTC day `day` (tests of the midnight overlap).
+#[cfg(test)]
+pub(crate) fn join_invite_with_relay_at_day(
+    cfg: &NetConfig,
+    id: &Identity,
+    secret: &[u8; 32],
+    host_key: [u8; 32],
+    relay: Box<dyn RendezvousRelay>,
+    day: u64,
+) -> ClientHandle {
+    spawn(cfg, id, invite_target(secret, host_key, relay, Some(day)))
+}
+
+fn invite_target(
+    secret: &[u8; 32],
+    host_key: [u8; 32],
+    relay: Box<dyn RendezvousRelay>,
+    fixed_day: Option<u64>,
+) -> Target {
+    Target::Invite {
+        secret: *secret,
+        host_key: PublicKey::from_byte_array(host_key),
+        relay,
+        fixed_day,
+    }
 }
 
 /// Join a room heard on the LAN beacon: dials its address directly, no internet.
@@ -454,9 +530,24 @@ async fn run(
                 }
             }
         }
-        Target::Code(code, relay, fixed_day) => {
-            let Some(code) = normalize_code(&code) else {
-                return fail(JoinStage::Preparing, FailReason::BadCode);
+        room_target @ (Target::Code(..) | Target::Invite { .. }) => {
+            // A code join and an invite join rendezvous the same way. They
+            // differ in where the room secrets come from, and an invite pins
+            // the host's key.
+            let (source, relay, fixed_day, pinned) = match room_target {
+                Target::Code(code, relay, fixed_day) => {
+                    let Some(code) = normalize_code(&code) else {
+                        return fail(JoinStage::Preparing, FailReason::BadCode);
+                    };
+                    (RoomSource::Code(code), relay, fixed_day, None)
+                }
+                Target::Invite {
+                    secret,
+                    host_key,
+                    relay,
+                    fixed_day,
+                } => (RoomSource::Invite(secret), relay, fixed_day, Some(host_key)),
+                _ => unreachable!("matched as a room target above"),
             };
             let prep =
                 match crate::host::prepare(cfg.quic_port, false, cfg.stun.clone(), None).await {
@@ -468,7 +559,11 @@ async fn run(
             });
             let session = new_session_id();
             let day = fixed_day.unwrap_or_else(utc_today);
-            let rooms = match derive_days(&cfg.app_tag, &code, day).await {
+            let rooms = match &source {
+                RoomSource::Code(code) => derive_days(&cfg.app_tag, code, day).await,
+                RoomSource::Invite(secret) => derive_invite_days(&cfg.app_tag, secret, day),
+            };
+            let rooms = match rooms {
                 Ok(r) => r,
                 Err(e) => return fail(JoinStage::Preparing, FailReason::Network(e)),
             };
@@ -489,6 +584,14 @@ async fn run(
                 Err(reason) => return fail(JoinStage::FindingHost, reason),
             };
             let answer = found.answer.clone();
+            // An invite names its host: an answer naming anyone else is
+            // refused before we punch or dial towards it.
+            if let Some(key) = &pinned {
+                if PublicKey::from_hex(&answer.host_pubkey).ok().as_ref() != Some(key) {
+                    log::warn!("[join] the answer names a host other than the invite's");
+                    return fail(JoinStage::Handshake, FailReason::HostUnverified);
+                }
+            }
             // The host we reach must be the one that answered the code: the
             // answer (encrypted to us, so the relays never see it) names the
             // host identity, and only that identity may sign the
@@ -496,7 +599,16 @@ async fn run(
             // enough: that key is public, so an on-path box could name it too
             // (review-net-1 N1). Checked per candidate, before we say who we are.
             let (named, signer) = (answer.host_pubkey.clone(), found.signer);
-            let check: quic::HostCheck = Arc::new(move |p| host_matches(p, &named, &signer));
+            let check: quic::HostCheck = Arc::new(move |p| {
+                host_matches(p, &named, &signer)?;
+                match &pinned {
+                    Some(key) if p.pubkey != *key => Err(format!(
+                        "welcome signed by {} but the invite pins {key}",
+                        p.pubkey
+                    )),
+                    _ => Ok(()),
+                }
+            });
             rendezvous = Some((relay, found));
             shared.emit(ClientEvent::Progress {
                 stage: JoinStage::Connecting,
@@ -651,6 +763,14 @@ async fn run(
         Ended::Error(e) => DisconnectReason::Error(e),
     };
     shared.emit(ClientEvent::Disconnected { reason });
+}
+
+/// Where a room join's secrets come from.
+enum RoomSource {
+    /// A normalised room code (Argon2id).
+    Code(String),
+    /// An invite's 32-byte secret.
+    Invite([u8; 32]),
 }
 
 /// Bind the QUIC socket of a joiner dialling a local host (a LAN room or a

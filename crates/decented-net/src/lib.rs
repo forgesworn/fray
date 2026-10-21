@@ -35,11 +35,15 @@ pub mod rendezvous;
 pub mod room;
 mod virt;
 
-pub use client::{join, join_addr, join_lan, join_session_addr, join_with_relay, ClientHandle};
+pub use client::{
+    join, join_addr, join_invite, join_invite_with_relay, join_lan, join_session_addr,
+    join_with_relay, ClientHandle,
+};
 pub use host::HostHandle;
 pub use identity::{npub_of, Identity};
 pub use lan::{lan_browse, LanBrowser};
 pub use netbind::{check_lan_binding, lan_blocked, LanBindError, LanSocketHook, VPN_BLOCKS_LAN};
+pub use room::InviteId;
 pub use virt::{
     host_virtual, join_virtual, virtual_link_queue, virtual_pair, VirtualLink, VirtualLinkReceiver,
     VirtualLinkSender, MAX_VIRTUAL_PACKET, VIRTUAL_MTU,
@@ -353,6 +357,24 @@ pub enum PathKind {
     Virtual,
 }
 
+/// Which admission token a joiner's hello proved: how it got in. Reported on
+/// [`HostEvent::PeerJoined`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Admission {
+    /// The room code.
+    Code,
+    /// The LAN beacon token (a LAN join, or [`join_addr`] with
+    /// [`HostHandle::lan_token`]).
+    Lan,
+    /// The invite with this id (see [`HostHandle::add_invite`]).
+    Invite(InviteId),
+    /// A token proved over a path that is not a person's own join: a
+    /// Bluetooth [`VirtualLink`], or a session-bound reconnect during a host
+    /// handover (the LAN token, there). Who may join is then the session
+    /// policy's decision, not the token's.
+    Other,
+}
+
 /// Why a peer left (host side).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaveReason {
@@ -387,11 +409,12 @@ pub enum DisconnectReason {
 pub enum JoinStage {
     /// Binding a socket and gathering our own candidates.
     Preparing,
-    /// Room-code join: reaching relays, sending the offer, waiting for the answer.
+    /// Room-code or invite join: reaching relays, sending the offer, waiting
+    /// for the answer.
     FindingHost,
     /// Punching and racing QUIC across the host's candidates (or dialling the
-    /// LAN address directly). For a code join each candidate must also send a
-    /// verified welcome before it can win.
+    /// LAN address directly). For a code or invite join each candidate must
+    /// also send a verified welcome before it can win.
     Connecting,
     /// QUIC is up; verifying the host's welcome, then (only to a verified
     /// host) sending our identity and waiting to be seated.
@@ -417,7 +440,9 @@ pub enum FailReason {
     VersionMismatch,
     /// The host's signed welcome did not verify, or (code join) it was not
     /// signed by the identity the encrypted relay answer named, or it named a
-    /// different relay key than the one that answered. Fails closed.
+    /// different relay key than the one that answered. An invite join also
+    /// fails with this when the host's key is not the one the invite pins.
+    /// Fails closed.
     HostUnverified,
     /// Two different keys answered our offer for this code: someone else knows
     /// the code and is racing the real host. Fails closed.
@@ -484,6 +509,9 @@ pub enum HostEvent {
     /// does not verify the attestation: the app must, against `pubkey`.
     /// `inbox_relays` are the joiner's inbox relays from the same signed
     /// frame (validated: at most 3 `wss://` URLs, each at most 256 chars).
+    /// `admitted_by` is which admission token the joiner's hello proved. If it
+    /// proved more than one, the first of: the LAN token, the room code's,
+    /// then an invite's (a joiner sends one kind, so this is only a tie-break).
     PeerJoined {
         peer: PeerId,
         pubkey: PublicKey,
@@ -491,6 +519,7 @@ pub enum HostEvent {
         rtt_ms: u32,
         attestation: Option<String>,
         inbox_relays: Vec<String>,
+        admitted_by: Admission,
     },
     PeerLeft {
         peer: PeerId,

@@ -26,6 +26,25 @@
 //! The memory-hard KDF plus the daily salt mean a relay observer who wants to
 //! map tags back to codes must redo an expensive sweep of the whole code space
 //! every day, instead of one sha256 pass for all time. See `SECURITY.md`.
+//!
+//! # Invites
+//!
+//! A host can also be reached by **invite**: a 32-byte random secret the host
+//! hands out (in a link, next to its public key). It runs through the same
+//! rendezvous as a code and is expanded by the same `tag` / `sk` / `admit`
+//! step, but its master secret needs no memory-hard KDF, because the secret
+//! is already high-entropy:
+//!
+//! ```text
+//! master = sha256("<app_tag>-invite-v1:" || utc_day (decimal) || ":" || secret)
+//! tag, sk, admit = the same sub-keys of `master` as for a code
+//! ```
+//!
+//! A code's master is an Argon2id output and an invite's is a sha256 over a
+//! different, labelled input, so one can never yield the other's tag, key or
+//! admission token (the two inputs are disjoint, and a clash would be a
+//! sha256 / Argon2id collision). The link carries the secret and the host's
+//! key, never an address. See [`derive_invite`] and [`InviteId`].
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use nostr::{Keys, SecretKey};
@@ -56,6 +75,7 @@ const SECS_PER_DAY: u64 = 86_400;
 const TAG_LABEL: &[u8] = b"decented-net/room-v2/tag\0";
 const KEY_LABEL: &[u8] = b"decented-net/room-v2/key\0";
 const ADMIT_LABEL: &[u8] = b"decented-net/room-v2/admit\0";
+const INVITE_ID_LABEL: &[u8] = b"decented-net/invite-v1/id\0";
 
 /// A fresh random code.
 pub fn generate_code() -> String {
@@ -180,17 +200,85 @@ fn sub_key(label: &[u8], master: &[u8; 32]) -> [u8; 32] {
 
 /// Derive the room tag and room keypair for `code` on UTC `day`.
 pub fn derive(app_tag: &str, code: &str, day: u64) -> Result<RoomSecrets, String> {
-    let m = master(app_tag, code, day)?;
-    let tag = hex::encode(sub_key(TAG_LABEL, &m))[..32].to_string();
+    expand(day, &master(app_tag, code, day)?)
+}
+
+/// The tag, room keypair and admission token of one master secret. Shared by
+/// codes and invites, so both rendezvous the same way.
+fn expand(day: u64, m: &[u8; 32]) -> Result<RoomSecrets, String> {
+    let tag = hex::encode(sub_key(TAG_LABEL, m))[..32].to_string();
     // Fails only if the hash is zero or >= the curve order (probability ~2^-128).
-    let sk =
-        SecretKey::from_slice(&sub_key(KEY_LABEL, &m)).map_err(|e| format!("room key: {e}"))?;
+    let sk = SecretKey::from_slice(&sub_key(KEY_LABEL, m)).map_err(|e| format!("room key: {e}"))?;
     Ok(RoomSecrets {
         day,
         tag,
         keys: Keys::new(sk),
-        admit: sub_key(ADMIT_LABEL, &m),
+        admit: sub_key(ADMIT_LABEL, m),
     })
+}
+
+/// Names an invite without revealing it: the first 16 bytes of
+/// `sha256("decented-net/invite-v1/id\0" || secret)`. Safe to log, to keep in
+/// a list and to show; it cannot be turned back into the secret and is not
+/// used in any tag, key or token. Displays as 32 hex characters.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InviteId(pub [u8; 16]);
+
+impl InviteId {
+    /// The id of the invite whose secret is `secret`.
+    pub fn of(secret: &[u8; 32]) -> InviteId {
+        let mut h = Sha256::new();
+        h.update(INVITE_ID_LABEL);
+        h.update(secret);
+        let digest: [u8; 32] = h.finalize().into();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&digest[..16]);
+        InviteId(id)
+    }
+}
+
+impl std::fmt::Display for InviteId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl std::fmt::Debug for InviteId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InviteId({})", hex::encode(self.0))
+    }
+}
+
+/// The sha256 master secret for an invite on `day` (no KDF: the secret is
+/// 256 random bits, so there is nothing to sweep).
+fn invite_master(app_tag: &str, secret: &[u8; 32], day: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(app_tag.as_bytes());
+    h.update(b"-invite-v1:");
+    h.update(day.to_string().as_bytes());
+    h.update(b":");
+    h.update(secret);
+    h.finalize().into()
+}
+
+/// The same tag / room keypair / admission token as [`derive`] yields for a
+/// code, from an invite's `secret` on UTC `day`. Cheap (a few hashes and one
+/// key derivation), so it needs no thread of its own. Fails only if the room
+/// key hash is zero or at least the curve order (probability about 2^-128).
+pub fn derive_invite(app_tag: &str, secret: &[u8; 32], day: u64) -> Result<RoomSecrets, String> {
+    expand(day, &invite_master(app_tag, secret, day))
+}
+
+/// [`derive_invite`] for `day` and `day - 1`. Today first.
+pub(crate) fn derive_invite_days(
+    app_tag: &str,
+    secret: &[u8; 32],
+    day: u64,
+) -> Result<Vec<RoomSecrets>, String> {
+    Ok(vec![
+        derive_invite(app_tag, secret, day)?,
+        derive_invite(app_tag, secret, day.saturating_sub(1))?,
+    ])
 }
 
 /// [`derive`] for `day` and `day - 1`, off the async threads. Today first.
@@ -272,6 +360,99 @@ mod tests {
             base.keys.secret_key().to_secret_hex()
         );
         assert_eq!(base.tag.len(), 32);
+    }
+
+    // Computed independently with Python hashlib (sha256 only; no KDF), from
+    // the secret bytes 0, 1, ..., 31 and app tag "twangthang". They pin the
+    // invite derivation the same way the Argon2id vectors pin the code one.
+    const INVITE_SECRET: [u8; 32] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ];
+    const VEC_INVITE_TAG: &str = "585946a782eccb636b97ec0faa661a41";
+    const VEC_INVITE_SK: &str = "5b8a6da7953515232b268493befacaff41120fbe828372a5f36c40ca298c0128";
+    const VEC_INVITE_ADMIT: &str =
+        "2f23b1215969cfb4e2013a9813176f8f7eb31638481f9b0c59ceff2433232671";
+    const VEC_INVITE_TAG_NEXT_DAY: &str = "276cbc5d94e959d344ec4086755570be";
+    const VEC_INVITE_ID: &str = "874845c19fe6ecd329f42ecd01441c55";
+
+    #[test]
+    fn invite_vectors() {
+        let s = derive_invite("twangthang", &INVITE_SECRET, DAY).unwrap();
+        assert_eq!(s.day, DAY);
+        assert_eq!(s.tag, VEC_INVITE_TAG);
+        assert_eq!(s.keys.secret_key().to_secret_hex(), VEC_INVITE_SK);
+        assert_eq!(hex::encode(s.admit), VEC_INVITE_ADMIT);
+        let next = derive_invite("twangthang", &INVITE_SECRET, DAY + 1).unwrap();
+        assert_eq!(next.tag, VEC_INVITE_TAG_NEXT_DAY);
+        assert_eq!(InviteId::of(&INVITE_SECRET).to_string(), VEC_INVITE_ID);
+        assert_eq!(
+            format!("{:?}", InviteId::of(&INVITE_SECRET)),
+            format!("InviteId({VEC_INVITE_ID})")
+        );
+    }
+
+    #[test]
+    fn invite_days_are_today_then_yesterday() {
+        let d = derive_invite_days("twangthang", &INVITE_SECRET, DAY).unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].day, d[1].day), (DAY, DAY - 1));
+        assert_eq!(d[0].tag, VEC_INVITE_TAG);
+        assert_ne!(d[0].tag, d[1].tag);
+    }
+
+    #[test]
+    fn an_invite_never_yields_a_code_rooms_tag_key_or_token() {
+        let code = derive("twangthang", "KMTRWX", DAY).unwrap();
+        // Whatever the invite secret: unrelated bytes, a code's own derived
+        // values fed in as the secret, or the code's letters padded out.
+        let mut padded = [0u8; 32];
+        padded[..6].copy_from_slice(b"KMTRWX");
+        for secret in [INVITE_SECRET, code.admit, padded, [0u8; 32], [0xff; 32]] {
+            let inv = derive_invite("twangthang", &secret, DAY).unwrap();
+            assert_ne!(inv.tag, code.tag);
+            assert_ne!(inv.keys.public_key(), code.keys.public_key());
+            assert_ne!(inv.admit, code.admit);
+        }
+    }
+
+    #[test]
+    fn the_day_the_app_tag_and_the_secret_all_change_an_invite() {
+        let base = derive_invite("twangthang", &INVITE_SECRET, DAY).unwrap();
+        let mut other_secret = INVITE_SECRET;
+        other_secret[31] ^= 1;
+        for other in [
+            derive_invite("twangthang", &INVITE_SECRET, DAY + 1).unwrap(),
+            derive_invite("other", &INVITE_SECRET, DAY).unwrap(),
+            derive_invite("twangthang", &other_secret, DAY).unwrap(),
+        ] {
+            assert_ne!(base.tag, other.tag);
+            assert_ne!(base.keys.public_key(), other.keys.public_key());
+            assert_ne!(base.admit, other.admit);
+        }
+        // Tag, key and token are domain-separated sub-keys, as for a code.
+        assert_ne!(
+            hex::encode(base.admit),
+            base.keys.secret_key().to_secret_hex()
+        );
+        assert!(!hex::encode(base.admit).starts_with(&base.tag));
+    }
+
+    #[test]
+    fn an_invite_id_names_the_secret_and_reveals_nothing_of_it() {
+        let a = InviteId::of(&INVITE_SECRET);
+        assert_eq!(a, InviteId::of(&INVITE_SECRET));
+        let mut other = INVITE_SECRET;
+        other[0] ^= 1;
+        assert_ne!(a, InviteId::of(&other));
+        let rooms = derive_invite_days("twangthang", &INVITE_SECRET, DAY).unwrap();
+        let shown = a.to_string();
+        assert_eq!(shown.len(), 32);
+        for r in &rooms {
+            assert_ne!(shown, r.tag, "the id is not the tag");
+            assert!(!hex::encode(r.admit).starts_with(&shown));
+        }
+        assert!(!shown.contains(&hex::encode(INVITE_SECRET)[..8]));
     }
 
     #[test]

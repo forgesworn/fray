@@ -14,10 +14,12 @@ use crate::nat::candidates::{gather, punch_targets};
 use crate::quic::{self, close, Ended, Link};
 use crate::relay::{MultiRelay, RendezvousRelay, TagFilter};
 use crate::rendezvous::{open_offer, seal_answer, Answer, Candidate, KIND_JOIN_OFFER};
-use crate::room::{derive_days, utc_today, RoomSecrets, ROOM_TAG_LETTER};
+use crate::room::{
+    derive_days, derive_invite_days, utc_today, InviteId, RoomSecrets, ROOM_TAG_LETTER,
+};
 use crate::{
-    HostEvent, Identity, LeaveReason, NetConfig, PathKind, PeerId, RoomInfo, MAX_PLAYERS,
-    NET_PROTOCOL_VERSION,
+    Admission, HostEvent, Identity, LeaveReason, NetConfig, PathKind, PeerId, RoomInfo,
+    MAX_PLAYERS, NET_PROTOCOL_VERSION,
 };
 
 const BEACON_EVERY: Duration = Duration::from_secs(1);
@@ -37,6 +39,9 @@ pub const MAX_QUEUED_LOSSY: usize = 64;
 /// How long a kicked peer's connection stays open so a last message flushes.
 const KICK_FLUSH: Duration = Duration::from_millis(250);
 const UPNP_RENEW_CHECK: Duration = Duration::from_secs(60);
+/// Most invites a host holds at once ([`HostHandle::add_invite`]). Each costs
+/// two relay tags in the host's one standing subscription.
+pub const MAX_INVITES: usize = 256;
 
 /// An event plus the per-peer counter it occupies until polled.
 type Queued<E> = (E, Option<Arc<AtomicUsize>>, u64, Option<PeerEventFence>);
@@ -85,6 +90,9 @@ struct Tokens {
     lan: [u8; 32],
     /// From the code, for today and yesterday (online hosts only).
     code: Vec<[u8; 32]>,
+    /// From each live invite, for today and yesterday (online hosts only).
+    /// Installed by the host task; `remove_invite` strips a row at once.
+    invites: Vec<(InviteId, [u8; 32])>,
 }
 
 fn random_token() -> [u8; 32] {
@@ -106,11 +114,19 @@ pub(crate) struct Shared {
     generation_tx: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     before_registration: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    /// Tests move the host's UTC day on (to roll the room tags at "midnight");
+    /// 0 = no override.
+    #[cfg(test)]
+    test_day: AtomicU64,
     /// Each connected peer's identity key (for the kick deny-list).
     peer_keys: Mutex<HashMap<PeerId, PublicKey>>,
     /// Identity keys kicked from this room; refused for the room's life.
     denied: Mutex<HashSet<PublicKey>>,
     tokens: Mutex<Tokens>,
+    /// The live invites' secrets (at most [`MAX_INVITES`]). The handle edits
+    /// this; the host task derives the tags and tokens from it. Lock this
+    /// before `tokens` when holding both.
+    invites: Mutex<HashMap<InviteId, [u8; 32]>>,
     open: AtomicBool,
     max_peers: usize,
     next_peer: AtomicU32,
@@ -215,12 +231,20 @@ impl Shared {
         }
     }
 
-    fn admission_tokens(&self) -> Vec<[u8; 32]> {
+    /// Every token a hello may prove, in precedence order: the LAN token, the
+    /// code's, then each invite's. A hello that proves several is credited to
+    /// the first.
+    fn admission_tokens(&self) -> Vec<(Admission, [u8; 32])> {
         self.tokens
             .lock()
             .map(|t| {
-                std::iter::once(t.lan)
-                    .chain(t.code.iter().copied())
+                std::iter::once((Admission::Lan, t.lan))
+                    .chain(t.code.iter().map(|c| (Admission::Code, *c)))
+                    .chain(
+                        t.invites
+                            .iter()
+                            .map(|(id, token)| (Admission::Invite(*id), *token)),
+                    )
                     .collect()
             })
             .unwrap_or_default()
@@ -260,6 +284,8 @@ impl Shared {
 
 pub(crate) enum Cmd {
     SetOpen(bool),
+    /// The set of live invites changed: derive, subscribe, install.
+    InvitesChanged,
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -448,12 +474,16 @@ where
         generation_tx: tokio::sync::watch::Sender::new(0),
         #[cfg(test)]
         before_registration: Mutex::new(None),
+        #[cfg(test)]
+        test_day: AtomicU64::new(0),
         peer_keys: Mutex::new(HashMap::new()),
         denied: Mutex::new(HashSet::new()),
         tokens: Mutex::new(Tokens {
             lan: random_token(),
             code: Vec::new(),
+            invites: Vec::new(),
         }),
+        invites: Mutex::new(HashMap::new()),
         open: AtomicBool::new(pinned.is_none()),
         max_peers: max_players as usize - usize::from(host_has_player),
         next_peer: AtomicU32::new(1),
@@ -704,6 +734,73 @@ impl HostHandle {
     /// Exporter for a ResumeProof challenge on this live authenticated link.
     pub fn tls_binding(&self, peer: PeerId) -> Option<[u8; 32]> {
         quic::binding(&self.link(peer)?.conn).ok()
+    }
+
+    /// Move the host's UTC day on (tests of the midnight roll).
+    #[cfg(test)]
+    pub(crate) fn set_test_day(&self, day: u64) {
+        self.shared.test_day.store(day, Ordering::Relaxed);
+    }
+
+    /// Let people in by **invite** as well as by the room code. `secret` is 32
+    /// random bytes the host generated and keeps; the invite link carries it
+    /// with the host's public key (see [`join_invite`](crate::join_invite)).
+    ///
+    /// Callable at any time while hosting. The host then also listens on the
+    /// invite's relay tags (today's and yesterday's, rolled at UTC midnight
+    /// like the code's), answers offers on them under the same rules as the
+    /// code (only while the room is open), and admits a hello proving the
+    /// invite's token. Which one a joiner used is reported as
+    /// [`Admission::Invite`] on [`HostEvent::PeerJoined`].
+    ///
+    /// Returns the invite's [`InviteId`] (derived from the secret, which it
+    /// does not reveal); adding the same secret again returns the same id and
+    /// takes no further slot. At most [`MAX_INVITES`] (256) are live at once:
+    /// beyond that this returns an error. The listening starts a moment after
+    /// this returns, on the host's task.
+    ///
+    /// Invites ride on the code-room host: they need relays, as the code does
+    /// (on a host without relays they are accepted and can never be reached),
+    /// and a virtual-link host refuses them.
+    pub fn add_invite(&self, secret: [u8; 32]) -> Result<InviteId, String> {
+        if self.shared.path_override == Some(PathKind::Virtual) {
+            return Err("a virtual-link host has no relay rendezvous for invites".into());
+        }
+        let id = InviteId::of(&secret);
+        {
+            let mut live = self.shared.invites.lock().map_err(|_| "host invite lock")?;
+            if !live.contains_key(&id) && live.len() >= MAX_INVITES {
+                return Err(format!("too many invites (at most {MAX_INVITES})"));
+            }
+            live.insert(id, secret);
+        }
+        let _ = self.cmd_tx.send(Cmd::InvitesChanged);
+        Ok(id)
+    }
+
+    /// Revoke an invite. From the moment this returns, a hello proving its
+    /// token is refused; the host stops listening on its tags and stops
+    /// answering offers sent to them (that lands on the host task's next
+    /// turn, and an offer answered just before is a rendezvous only, never
+    /// an admission). `false` if no such invite was live.
+    ///
+    /// Fray does **not** drop connections that were admitted by the invite:
+    /// the game decides whether to [`kick`](Self::kick) those peers.
+    pub fn remove_invite(&self, id: InviteId) -> bool {
+        let removed = match self.shared.invites.lock() {
+            Ok(mut live) => {
+                let removed = live.remove(&id).is_some();
+                if let Ok(mut t) = self.shared.tokens.lock() {
+                    t.invites.retain(|(i, _)| *i != id);
+                }
+                removed
+            }
+            Err(_) => false,
+        };
+        if removed {
+            let _ = self.cmd_tx.send(Cmd::InvitesChanged);
+        }
+        removed
     }
 
     /// The room code (also delivered in `Ready`).
@@ -999,10 +1096,13 @@ impl HostTask {
         // Listen on today's and yesterday's room tag (a joiner whose clock has
         // already passed midnight, or a room opened before midnight). Only an
         // online host pays for the derivation.
-        let mut day = self.fixed_day.unwrap_or_else(utc_today);
-        let mut secrets: Vec<RoomSecrets> = Vec::new();
+        let mut day = self.today();
+        // `code_secrets` is the code's; `invite_rooms` each live invite's;
+        // `secrets` is all of them, which is what offers are matched against.
+        let mut code_secrets: Vec<RoomSecrets> = Vec::new();
+        let mut invite_rooms: HashMap<InviteId, Vec<RoomSecrets>> = HashMap::new();
         if relay.is_some() {
-            secrets = match derive_days(&self.cfg.app_tag, &self.code, day).await {
+            code_secrets = match derive_days(&self.cfg.app_tag, &self.code, day).await {
                 Ok(s) => s,
                 Err(e) => {
                     self.shared.emit(HostEvent::Failed { reason: e });
@@ -1010,7 +1110,11 @@ impl HostTask {
                 }
             };
         }
-        self.set_code_tokens(&secrets);
+        self.set_code_tokens(&code_secrets);
+        if relay.is_some() {
+            self.sync_invites(&mut invite_rooms, day);
+        }
+        let mut secrets = all_rooms(&code_secrets, &invite_rooms);
         let mut filter = offer_filter(&secrets);
         // Before an offer takes a relay queue slot it must open with one of
         // our current room keys; anything else is junk.
@@ -1066,6 +1170,19 @@ impl HostTask {
                     tokio::spawn(accept_peer(incoming, Arc::clone(&self.shared)));
                 }
                 cmd = cmd_rx.recv() => match cmd {
+                    Some(Cmd::InvitesChanged) => {
+                        if let Some(r) = &relay {
+                            self.sync_invites(&mut invite_rooms, day);
+                            secrets = all_rooms(&code_secrets, &invite_rooms);
+                            if let Ok(mut k) = accept_keys.lock() {
+                                *k = secrets.clone();
+                            }
+                            filter = offer_filter(&secrets);
+                            if self.is_open() {
+                                let _ = r.subscribe(filter.clone());
+                            }
+                        }
+                    }
                     Some(Cmd::SetOpen(open)) => {
                         if let Some(r) = &relay {
                             let _ = if open { r.subscribe(filter.clone()) } else { r.unsubscribe() };
@@ -1078,16 +1195,20 @@ impl HostTask {
                     None => break,
                 },
                 _ = tick.tick() => {
-                    let open = self.shared.open.load(Ordering::Relaxed) && !self.shared.session_policy.lock().map(|p|p.as_ref().is_some_and(|p|p.passive())).unwrap_or(true);
+                    let open = self.is_open();
                     if let Some(r) = &relay {
-                        let now_day = self.fixed_day.unwrap_or_else(utc_today);
+                        let now_day = self.today();
                         if now_day > day {
                             // Midnight UTC: roll to the new today + yesterday.
                             match derive_days(&self.cfg.app_tag, &self.code, now_day).await {
                                 Ok(s) => {
                                     day = now_day;
-                                    secrets = s;
-                                    self.set_code_tokens(&secrets);
+                                    code_secrets = s;
+                                    self.set_code_tokens(&code_secrets);
+                                    // The invites roll with the code.
+                                    invite_rooms.clear();
+                                    self.sync_invites(&mut invite_rooms, day);
+                                    secrets = all_rooms(&code_secrets, &invite_rooms);
                                     if let Ok(mut k) = accept_keys.lock() {
                                         *k = secrets.clone();
                                     }
@@ -1194,6 +1315,59 @@ impl HostTask {
             return false;
         }
         crate::nat::candidates::is_lan_ip(ip)
+    }
+
+    /// The UTC day the host's room tags are for (tests pin or move it).
+    fn today(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let moved = self.shared.test_day.load(Ordering::Relaxed);
+            if moved != 0 {
+                return moved;
+            }
+        }
+        self.fixed_day.unwrap_or_else(utc_today)
+    }
+
+    /// Whether offers are being answered now: the room is open and not a
+    /// passive standby.
+    fn is_open(&self) -> bool {
+        self.shared.open.load(Ordering::Relaxed)
+            && !self
+                .shared
+                .session_policy
+                .lock()
+                .map(|p| p.as_ref().is_some_and(|p| p.passive()))
+                .unwrap_or(true)
+    }
+
+    /// Bring `rooms` (each live invite's secrets for `day` and `day - 1`) in
+    /// line with the invites the handle holds, and install their admission
+    /// tokens. Derives only the invites not yet in `rooms`; the caller clears
+    /// it when the day rolls. Done under the invite lock, so an invite
+    /// removed meanwhile is not resurrected.
+    fn sync_invites(&self, rooms: &mut HashMap<InviteId, Vec<RoomSecrets>>, day: u64) {
+        let Ok(live) = self.shared.invites.lock() else {
+            return;
+        };
+        rooms.retain(|id, _| live.contains_key(id));
+        for (id, secret) in live.iter() {
+            if rooms.contains_key(id) {
+                continue;
+            }
+            match derive_invite_days(&self.cfg.app_tag, secret, day) {
+                Ok(r) => {
+                    rooms.insert(*id, r);
+                }
+                Err(e) => log::warn!("[host] invite {id}: {e}"),
+            }
+        }
+        if let Ok(mut t) = self.shared.tokens.lock() {
+            t.invites = rooms
+                .iter()
+                .flat_map(|(id, rs)| rs.iter().map(move |r| (*id, r.admit)))
+                .collect();
+        }
     }
 
     fn set_code_tokens(&self, secrets: &[RoomSecrets]) {
@@ -1334,6 +1508,17 @@ impl HostTask {
             },
         );
     }
+}
+
+/// Every room the host answers: the code's, then each invite's.
+fn all_rooms(
+    code: &[RoomSecrets],
+    invites: &HashMap<InviteId, Vec<RoomSecrets>>,
+) -> Vec<RoomSecrets> {
+    code.iter()
+        .chain(invites.values().flatten())
+        .cloned()
+        .collect()
 }
 
 /// The room secrets an offer's `#t` tag names, if it is one of ours.
@@ -1755,16 +1940,28 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             Ok(x) => x,
             Err((code, why)) => return refuse(&conn, code, why),
         };
-        // Admission: the hello must prove the room code or the LAN token
-        // before anything about this host is sent.
+        // Admission: the hello must prove the room code, an invite or the LAN
+        // token before anything about this host is sent.
         let b = quic::binding(&conn)?;
-        if !quic::admitted(&hello, &b, &shared.admission_tokens()) {
+        let tokens = shared.admission_tokens();
+        let raw: Vec<[u8; 32]> = tokens.iter().map(|(_, t)| *t).collect();
+        let Some(which) = quic::admitted_which(&hello, &b, &raw) else {
             return refuse(
                 &conn,
                 close::NOT_ADMITTED,
                 "no valid admission proof".into(),
             );
-        }
+        };
+        // The LAN token is what a virtual link and a session-bound reconnect
+        // prove; neither is a person's own join, so they are `Other`.
+        let admitted_by = match tokens[which].0 {
+            Admission::Lan
+                if shared.path_override == Some(PathKind::Virtual) || hello.migration.is_some() =>
+            {
+                Admission::Other
+            }
+            by => by,
+        };
         match (&policy, &hello.migration) {
             (Some(policy), Some(binding)) => {
                 if let Err(e) = policy.check_request(binding) {
@@ -1848,7 +2045,17 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                 barrier.wait().await;
             }
         }
-        Ok((conn, send, recv, hello, pk, attestation, inbox_relays, peer))
+        Ok((
+            conn,
+            send,
+            recv,
+            hello,
+            pk,
+            attestation,
+            inbox_relays,
+            peer,
+            admitted_by,
+        ))
     };
     // An ordinary handshake ends when the pin bumps the generation; a
     // session-bound one is never preempted.
@@ -1876,17 +2083,18 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             return;
         }
     };
-    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer) = match outcome {
-        Ok(Ok(x)) => x,
-        Ok(Err(e)) => {
-            log::info!("[host] {remote}: handshake failed: {e}");
-            return;
-        }
-        Err(_) => {
-            log::info!("[host] {remote}: handshake timed out");
-            return;
-        }
-    };
+    let (conn, mut send, recv, hello, pubkey, attestation, inbox_relays, peer, admitted_by) =
+        match outcome {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                log::info!("[host] {remote}: handshake failed: {e}");
+                return;
+            }
+            Err(_) => {
+                log::info!("[host] {remote}: handshake timed out");
+                return;
+            }
+        };
 
     drop(slot);
     // Seat under the lock so two simultaneous joiners can't both take the last seat.
@@ -1968,6 +2176,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             rtt_ms: link.rtt_ms(),
             attestation,
             inbox_relays,
+            admitted_by,
         },
     ) {
         return;
@@ -2181,7 +2390,8 @@ mod migration_transition_tests {
                 path: PathKind::Lan,
                 rtt_ms: 0,
                 attestation: None,
-                inbox_relays: vec![]
+                inbox_relays: vec![],
+                admitted_by: Admission::Other,
             }
         ));
         let counter = Arc::new(AtomicUsize::new(0));
