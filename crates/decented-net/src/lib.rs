@@ -150,6 +150,23 @@ pub struct NetConfig {
     /// is `None` if the exporter fails. A host that resumes or stands by gives
     /// each peer's new connection its own value, the same way.
     pub app_binding_label: Option<String>,
+    /// Extra addresses the host announces in its answer, after the ones it
+    /// gathered: a router port forward, or a VPN's forwarded port. The host
+    /// still binds [`NetConfig::quic_port`]; the app sets that to the port the
+    /// forward targets. Each address is sent as the candidate kind a joiner
+    /// accepts for it: private (RFC 1918) and carrier-NAT (100.64/10) IPv4 and
+    /// IPv6 unique-local as `lan`, global IPv4 as `upnp`, global IPv6 as `v6`.
+    /// Loopback, unspecified, link-local, multicast, documentation and other
+    /// reserved addresses, and ports below 1024, fail the host at start (a
+    /// joiner would drop them), as do more than 8 addresses, and a non-`lan`
+    /// address while [`NetConfig::lan_socket_hook`] is set (the hooked socket
+    /// serves local peers only). Default empty.
+    pub advertise: Vec<SocketAddr>,
+    /// Announce only [`NetConfig::advertise`]: the host skips its own LAN,
+    /// STUN, UPnP and IPv6 gathering, starts no router mapping, and sends no
+    /// LAN beacon, so nothing it discovers is announced. Fails the host at
+    /// start if `advertise` is empty. Default false.
+    pub advertise_only: bool,
     /// Tests only: whether the hooked LAN endpoint treats loopback sources as
     /// local (always so outside tests: loopback is this device).
     #[cfg(test)]
@@ -175,6 +192,8 @@ impl NetConfig {
             idle_timeout: quic::IDLE_TIMEOUT,
             keep_alive: quic::KEEP_ALIVE,
             app_binding_label: None,
+            advertise: Vec::new(),
+            advertise_only: false,
             #[cfg(test)]
             lan_allow_loopback: true,
         }
@@ -193,6 +212,27 @@ impl NetConfig {
             quic::check_app_label(label)?;
         }
         self.liveness()
+    }
+
+    /// The candidates for [`NetConfig::advertise`], checked where a host
+    /// starts (a joiner's config is not held to it): see the field for the
+    /// rules.
+    pub(crate) fn advertised(&self) -> Result<Vec<rendezvous::Candidate>, String> {
+        if self.advertise_only && self.advertise.is_empty() {
+            return Err("advertise_only is set but advertise is empty".into());
+        }
+        let list = nat::candidates::advertised_candidates(&self.advertise)?;
+        if self.lan_socket_hook.is_some() {
+            let lan = nat::candidates::CandidateKind::Lan.as_str();
+            if let Some(c) = list.iter().find(|c| c.kind != lan) {
+                return Err(format!(
+                    "advertise {}: with a lan_socket_hook the host's QUIC port is bound for \
+                     local peers only, so only private addresses can be announced",
+                    c.addr
+                ));
+            }
+        }
+        Ok(list)
     }
 
     /// No relays and no STUN: a host or joiner that never touches the internet.

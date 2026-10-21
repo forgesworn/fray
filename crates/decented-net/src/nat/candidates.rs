@@ -401,6 +401,82 @@ pub fn dialable(list: &[Candidate]) -> Vec<Candidate> {
         .collect()
 }
 
+/// The candidates for addresses the host was told to announce
+/// ([`crate::NetConfig::advertise`]), each under the kind [`dialable`] accepts
+/// it as, so no new wire kind is needed: private (RFC 1918), carrier-NAT
+/// (100.64/10) and unique-local addresses are `lan`, global IPv4 is `upnp`,
+/// global IPv6 is `v6`. Canonical spelling, repeats dropped, in the given
+/// order.
+///
+/// Refused, naming the address: loopback, unspecified, a port below 1024,
+/// anything else not routable (link-local, multicast, documentation,
+/// reserved: a joiner drops all of them, as `lan` too), and more than
+/// [`MAX_CANDIDATE_ADDRS`] addresses. Each result is run through [`dialable`]
+/// as a last gate, so what this returns is always accepted by a joiner.
+pub fn advertised_candidates(addrs: &[SocketAddr]) -> Result<Vec<Candidate>, String> {
+    let mut out: Vec<Candidate> = Vec::new();
+    for &given in addrs {
+        let a = crate::nat::addr::canonical(given);
+        if a.ip().is_loopback() || a.ip().is_unspecified() {
+            return Err(format!(
+                "advertise {given}: loopback and unspecified addresses cannot be announced"
+            ));
+        }
+        if a.port() < 1024 {
+            return Err(format!(
+                "advertise {given}: ports below 1024 cannot be announced (a joiner drops them)"
+            ));
+        }
+        let kind = match a.ip() {
+            IpAddr::V4(ip)
+                if ip.is_private() || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64) =>
+            {
+                CandidateKind::Lan
+            }
+            IpAddr::V4(ip) if is_global_v4(ip) => CandidateKind::Upnp,
+            IpAddr::V6(ip) if (ip.octets()[0] & 0xfe) == 0xfc => CandidateKind::Lan,
+            IpAddr::V6(ip) if is_global_v6(ip) => CandidateKind::V6,
+            _ => {
+                return Err(format!(
+                    "advertise {given}: not a private, unique-local, carrier-NAT or global \
+                     unicast address (a joiner drops it)"
+                ))
+            }
+        };
+        let cand = Candidate {
+            kind: kind.as_str().to_string(),
+            addr: a.to_string(),
+        };
+        if dialable(std::slice::from_ref(&cand)).is_empty() {
+            return Err(format!("advertise {given}: a joiner would drop it"));
+        }
+        if !out.iter().any(|c| c.addr == cand.addr) {
+            out.push(cand);
+        }
+    }
+    if out.len() > MAX_CANDIDATE_ADDRS {
+        return Err(format!(
+            "advertise lists {} addresses; a joiner reads at most {MAX_CANDIDATE_ADDRS}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// `gathered` with `advertised` appended after it, for an answer. An
+/// advertised address is never cut: a gathered entry for the same address is
+/// dropped in favour of it, and `gathered` gives up its tail if the two
+/// together would pass [`MAX_CANDIDATE_ADDRS`].
+pub fn append_advertised(gathered: Vec<Candidate>, advertised: &[Candidate]) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = gathered
+        .into_iter()
+        .filter(|c| !advertised.iter().any(|a| a.addr == c.addr))
+        .collect();
+    out.truncate(MAX_CANDIDATE_ADDRS.saturating_sub(advertised.len()));
+    out.extend(advertised.iter().cloned());
+    out
+}
+
 /// Gather every candidate for `sock`.
 ///
 /// `upnp` is a mapping already obtained by [`crate::nat::upnp::map_port`] (the

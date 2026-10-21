@@ -2715,3 +2715,304 @@ fn a_bad_app_label_is_refused_by_host_and_join() {
     c.app_binding_label = Some(format!("EXPORTER-{}", "a".repeat(240)));
     assert!(c.checked().is_ok());
 }
+
+// ─── Announcing addresses the host is given (`advertise`) ──────────────────
+
+fn sa(s: &str) -> std::net::SocketAddr {
+    s.parse().unwrap()
+}
+
+fn cand(kind: &str, addr: &str) -> Candidate {
+    Candidate {
+        kind: kind.into(),
+        addr: addr.into(),
+    }
+}
+
+#[test]
+fn advertised_addresses_get_the_kind_a_joiner_accepts_for_them() {
+    use crate::nat::candidates::{advertised_candidates, dialable};
+    let given = [
+        sa("192.168.1.20:40000"),      // RFC 1918: lan
+        sa("10.1.2.3:40000"),          // RFC 1918: lan
+        sa("172.16.0.9:40000"),        // RFC 1918: lan
+        sa("100.64.0.7:40000"), // carrier-NAT / VPN overlay: lan (the joiner takes it as lan only)
+        sa("[fd00::5]:40000"),  // unique-local: lan
+        sa("81.2.69.160:40000"), // global v4: upnp
+        sa("[2a00:1450::1]:40000"), // global v6: v6
+        sa("[::ffff:10.0.0.4]:40001"), // v4-mapped: spelled as v4
+    ];
+    let got = advertised_candidates(&given).unwrap();
+    let want = vec![
+        cand("lan", "192.168.1.20:40000"),
+        cand("lan", "10.1.2.3:40000"),
+        cand("lan", "172.16.0.9:40000"),
+        cand("lan", "100.64.0.7:40000"),
+        cand("lan", "[fd00::5]:40000"),
+        cand("upnp", "81.2.69.160:40000"),
+        cand("v6", "[2a00:1450::1]:40000"),
+        cand("lan", "10.0.0.4:40001"),
+    ];
+    assert_eq!(got, want);
+    // The joiner's own filter keeps every one, in order.
+    assert_eq!(dialable(&got), want);
+    // A repeat (also in another spelling) is announced once.
+    let twice =
+        advertised_candidates(&[sa("10.1.2.3:40000"), sa("[::ffff:10.1.2.3]:40000")]).unwrap();
+    assert_eq!(twice, vec![cand("lan", "10.1.2.3:40000")]);
+}
+
+#[test]
+fn advertised_addresses_a_joiner_would_drop_are_refused() {
+    use crate::nat::candidates::advertised_candidates;
+    for bad in [
+        "127.0.0.1:40000",
+        "[::1]:40000",
+        "0.0.0.0:40000",
+        "[::]:40000",
+        "192.168.1.20:1023", // below 1024
+        "81.2.69.160:80",
+        "192.168.1.20:0",
+        "169.254.3.4:40000", // link-local: the joiner drops it even as lan
+        "[fe80::1]:40000",
+        "224.0.0.1:40000",
+        "[ff02::1]:40000",
+        "203.0.113.9:40000", // documentation
+        "[2001:db8::1]:40000",
+        "255.255.255.255:40000",
+        "240.0.0.1:40000",
+    ] {
+        let err = advertised_candidates(&[sa(bad)]).expect_err(bad);
+        assert!(err.contains(bad), "{bad}: {err}");
+    }
+    let nine: Vec<_> = (1..=9).map(|i| sa(&format!("81.2.69.{i}:40000"))).collect();
+    assert!(advertised_candidates(&nine).is_err());
+    assert_eq!(advertised_candidates(&nine[..8]).unwrap().len(), 8);
+    assert!(advertised_candidates(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn a_host_config_with_bad_advertise_fails_at_start() {
+    let cases: Vec<(NetConfig, &str)> = {
+        let mut empty = cfg();
+        empty.advertise_only = true;
+        let mut loopback = cfg();
+        loopback.advertise = vec![sa("127.0.0.1:40000")];
+        let mut low = cfg();
+        low.advertise = vec![sa("192.168.1.20:443")];
+        let mut only_loopback = cfg();
+        only_loopback.advertise_only = true;
+        only_loopback.advertise = vec![sa("[::1]:40000")];
+        let mut hooked = cfg();
+        hooked.advertise = vec![sa("81.2.69.160:40000")];
+        hooked.lan_socket_hook = Some(recording_hook().0);
+        vec![
+            (empty, "advertise is empty"),
+            (loopback, "127.0.0.1:40000"),
+            (low, "1024"),
+            (only_loopback, "::1"),
+            (hooked, "lan_socket_hook"),
+        ]
+    };
+    for (c, word) in cases {
+        let h = host(&c, &Identity::ephemeral(), room(4));
+        let ev = wait_host(&h, 5, |e| {
+            matches!(e, HostEvent::Failed { .. } | HostEvent::Ready { .. })
+        });
+        assert!(
+            matches!(&ev, HostEvent::Failed { reason } if reason.contains(word)),
+            "{word}: {ev:?}"
+        );
+    }
+    // A joiner never fails over a host-only setting.
+    let mut c = cfg();
+    c.advertise_only = true;
+    assert!(c.checked().is_ok());
+}
+
+#[test]
+fn advertise_is_appended_after_what_the_host_discovered() {
+    use crate::host::{prepare_advertising, Advertise};
+    let list = crate::nat::candidates::advertised_candidates(&[sa("81.2.69.160:40000")]).unwrap();
+    let prep = futures_block(prepare_advertising(
+        0,
+        false,
+        Vec::new(),
+        None,
+        Advertise {
+            list: list.clone(),
+            only: false,
+        },
+    ))
+    .unwrap();
+    assert!(
+        !prep.candidates.is_empty(),
+        "the host still gathers its own"
+    );
+    assert!(!prep.candidates.contains(&list[0]));
+    let all = prep.announced();
+    assert_eq!(all[..prep.candidates.len()], prep.candidates[..]);
+    assert_eq!(all[prep.candidates.len()..], list[..]);
+}
+
+#[test]
+fn advertise_only_announces_exactly_the_configured_set() {
+    use crate::host::{current_candidates, prepare_advertising, Advertise};
+    let list = crate::nat::candidates::advertised_candidates(&[
+        sa("81.2.69.160:40000"),
+        sa("192.168.1.20:40000"),
+        sa("[2a00:1450::1]:40000"),
+    ])
+    .unwrap();
+    // A STUN server and a UPnP request are given and must be ignored.
+    let prep = futures_block(prepare_advertising(
+        0,
+        true,
+        vec!["127.0.0.1:9".into()],
+        None,
+        Advertise {
+            list: list.clone(),
+            only: true,
+        },
+    ))
+    .unwrap();
+    assert!(prep.candidates.is_empty());
+    assert!(prep.mapping.is_none() && !prep.upnp_attempted);
+    assert_eq!(prep.announced(), list);
+    // At answer time too, on a dual-stack socket whose kernel-side IPv6
+    // address would otherwise be re-read, and on an IPv4 one.
+    for bind in ["[::]:0", "0.0.0.0:0"] {
+        let Ok(sock) = std::net::UdpSocket::bind(bind) else {
+            continue;
+        };
+        let stale = vec![
+            cand("v6", "[2a00:1450::99]:40000"),
+            cand("lan", "10.9.9.9:40000"),
+        ];
+        assert_eq!(
+            current_candidates(&stale, &list, true, &sock),
+            list,
+            "{bind}"
+        );
+        // Without advertise_only the gathered ones stay first, then the list.
+        let mixed = current_candidates(&[cand("lan", "10.9.9.9:40000")], &list, false, &sock);
+        let split = mixed.len() - list.len();
+        assert!(
+            mixed[..split].contains(&cand("lan", "10.9.9.9:40000")),
+            "{bind}"
+        );
+        assert_eq!(mixed[split..], list[..], "{bind}");
+    }
+    // An advertised IPv6 address survives the IPv6 re-read on a dual-stack socket.
+    if let Ok(sock) = std::net::UdpSocket::bind("[::]:0") {
+        let v6 = cand("v6", "[2a00:1450::1]:40000");
+        let out = current_candidates(&[], std::slice::from_ref(&v6), false, &sock);
+        assert!(out.contains(&v6), "{out:?}");
+    }
+    // Gathered entries give way before an advertised one is cut.
+    let gathered: Vec<Candidate> = (1..=8)
+        .map(|i| cand("stun", &format!("81.2.70.{i}:40000")))
+        .collect();
+    let out = crate::nat::candidates::append_advertised(gathered, &list);
+    assert_eq!(out.len(), 8);
+    assert_eq!(out[5..], list[..]);
+}
+
+#[test]
+fn an_advertised_ipv6_address_needs_a_socket_that_can_answer_it() {
+    use crate::host::{prepare_advertising, Advertise};
+    let list =
+        crate::nat::candidates::advertised_candidates(&[sa("[2a00:1450::1]:40000")]).unwrap();
+    let r = futures_block(prepare_advertising(
+        0,
+        false,
+        Vec::new(),
+        None,
+        Advertise { list, only: true },
+    ));
+    // Dual-stack machines succeed; an IPv4-only bind fallback says why not.
+    if let Err(e) = r {
+        assert!(e.contains("IPv4-only"), "{e}");
+    }
+}
+
+#[test]
+fn an_advertise_only_host_sends_no_lan_beacon() {
+    let mut c = cfg();
+    c.advertise_only = true;
+    c.advertise = vec![sa("10.1.2.3:40000")];
+    let mut browser = lan_browse(&c);
+    let h = host(&c, &Identity::ephemeral(), room(4));
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        assert!(browser.poll().is_empty(), "an advertise-only host beaconed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Positive control: the same browser does hear an ordinary host.
+    let mut plain = c.clone();
+    plain.advertise_only = false;
+    plain.advertise.clear();
+    let h2 = host(&plain, &Identity::ephemeral(), room(4));
+    wait_host(&h2, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if browser.poll().iter().any(|r| r.code == h2.code()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "control beacon not heard");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    h.shutdown();
+    h2.shutdown();
+}
+
+/// A joiner reaches an advertise-only host through the one address it was
+/// told to announce: the machine's own LAN address on the port it binds. The
+/// host announces nothing it discovered, so the join proves the answer carried
+/// the configured candidate.
+#[test]
+fn a_joiner_reaches_an_advertise_only_host_through_its_advertised_address() {
+    let Some(lan_ip) = crate::nat::candidates::local_outbound_v4() else {
+        eprintln!("skipped: this machine has no LAN IPv4 address");
+        return;
+    };
+    // A free port for the host to bind (the caller sets quic_port to the port
+    // a forward targets).
+    let port = std::net::UdpSocket::bind("0.0.0.0:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let hub = FakeRelayHub::new();
+    let joiner_cfg = cfg();
+    let mut host_cfg = joiner_cfg.clone();
+    host_cfg.quic_port = port;
+    host_cfg.advertise_only = true;
+    host_cfg.advertise = vec![std::net::SocketAddr::new(lan_ip.into(), port)];
+    let h = host_with_relay(
+        &host_cfg,
+        &Identity::ephemeral(),
+        room(4),
+        Some(Box::new(hub.client())),
+    );
+    let code = wait_ready(&h);
+    assert_eq!(
+        h.local_addr().unwrap().port(),
+        port,
+        "advertise does not change binding"
+    );
+    let cl = join_with_relay(
+        &joiner_cfg,
+        &Identity::ephemeral(),
+        &code,
+        Box::new(hub.client()),
+    );
+    let ev = join_outcome(&cl);
+    let ClientEvent::Connected { path, .. } = ev else {
+        panic!("{ev:?}");
+    };
+    assert_eq!(path, PathKind::Lan);
+    wait_host(&h, 5, |e| matches!(e, HostEvent::PeerJoined { .. }));
+    h.shutdown();
+}

@@ -350,6 +350,7 @@ pub(crate) fn start_session_endpoint(
     policy: crate::migration::EndpointPolicy,
 ) -> Result<HostHandle, String> {
     cfg.checked()?;
+    cfg.advertised()?;
     policy
         .validate(id.pubkey().to_bytes(), code, &cfg.app_tag)
         .map_err(|e| e.to_string())?;
@@ -930,12 +931,24 @@ impl HostTask {
                 return;
             }
         };
-        let online = upnp_wanted(relay.is_some(), self.cfg.vpn_active);
-        let prep = match prepare(
+        let advertised = match self.cfg.advertised() {
+            Ok(a) => a,
+            Err(e) => {
+                self.shared.emit(HostEvent::Failed { reason: e });
+                return;
+            }
+        };
+        let only = self.cfg.advertise_only;
+        let online = upnp_wanted(relay.is_some(), self.cfg.vpn_active) && !only;
+        let prep = match prepare_advertising(
             self.cfg.quic_port,
             online,
             self.cfg.stun.clone(),
             self.cfg.lan_socket_hook.clone(),
+            Advertise {
+                list: advertised,
+                only,
+            },
         )
         .await
         {
@@ -945,6 +958,7 @@ impl HostTask {
                 return;
             }
         };
+        let announced = prep.announced();
         // With a LAN hook there are two endpoints: the LAN one (hooked; its
         // port goes in the LAN candidates and the beacon) and the online one
         // (never hooked; STUN, UPnP and IPv6). Without a hook there is one.
@@ -979,7 +993,7 @@ impl HostTask {
             "[host] listening on {local:?} (online {:?}), code {}, candidates {:?}",
             online_ep.as_ref().and_then(|e| e.local_addr().ok()),
             self.code,
-            prep.candidates
+            announced
         );
 
         // Listen on today's and yesterday's room tag (a joiner whose clock has
@@ -1095,7 +1109,8 @@ impl HostTask {
                             self.on_offer(&ev, &secrets, r.as_ref(), &prep.candidates, &mut offers, &punchers, open);
                         }
                     }
-                    if open && last_beacon.elapsed() >= BEACON_EVERY {
+                    // An advertise-only host announces nothing it discovered: no beacon.
+                    if open && !only && last_beacon.elapsed() >= BEACON_EVERY {
                         last_beacon = Instant::now();
                         if let Some(local) = local {
                             let players = usize::from(self.cfg.host_has_player)
@@ -1259,7 +1274,12 @@ impl HostTask {
             accepted: refusal.is_none(),
             reason: refusal.map(str::to_string),
             candidates: if refusal.is_none() {
-                current_candidates(my_candidates, &punchers.online)
+                current_candidates(
+                    my_candidates,
+                    &self.cfg.advertised().unwrap_or_default(),
+                    self.cfg.advertise_only,
+                    &punchers.online,
+                )
             } else {
                 Vec::new()
             },
@@ -1328,16 +1348,25 @@ fn offer_filter(secrets: &[RoomSecrets]) -> TagFilter {
 
 /// The candidates to put in an answer now: those gathered at start, with the
 /// `v6` entry re-read from the kernel (review-ipv6-1 I3), so a temporary
-/// address that rotated while the room was open is not advertised stale.
-fn current_candidates(gathered: &[Candidate], socket: &UdpSocket) -> Vec<Candidate> {
-    match socket.local_addr() {
+/// address that rotated while the room was open is not advertised stale; then
+/// the configured `advertised` ones. An advertise-only host re-reads nothing:
+/// the kernel's address is not one it was told to announce.
+pub(crate) fn current_candidates(
+    gathered: &[Candidate],
+    advertised: &[Candidate],
+    advertise_only: bool,
+    socket: &UdpSocket,
+) -> Vec<Candidate> {
+    let base = match socket.local_addr() {
+        _ if advertise_only => Vec::new(),
         Ok(local) if local.is_ipv6() => crate::nat::candidates::refresh_v6(
             gathered,
             crate::nat::candidates::local_outbound_v6(),
             local.port(),
         ),
         _ => gathered.to_vec(),
-    }
+    };
+    crate::nat::candidates::append_advertised(base, advertised)
 }
 
 /// Clones of the QUIC sockets that send punches. Targets on the local network
@@ -1392,11 +1421,31 @@ pub(crate) struct Prepared {
     /// local peers (LAN candidates and the beacon's port).
     pub lan_socket: Option<UdpSocket>,
     pub lan_punch_socket: Option<UdpSocket>,
+    /// What was gathered (nothing for an advertise-only host).
     pub candidates: Vec<Candidate>,
+    /// The configured addresses to announce after them (already checked).
+    pub advertised: Vec<Candidate>,
     pub mapping: Option<crate::nat::upnp::PortMapping>,
     /// Whether a router mapping was asked for (see [`upnp_wanted`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub upnp_attempted: bool,
+}
+
+impl Prepared {
+    /// What the first answer carries: the gathered candidates, then the
+    /// advertised ones.
+    pub fn announced(&self) -> Vec<Candidate> {
+        crate::nat::candidates::append_advertised(self.candidates.clone(), &self.advertised)
+    }
+}
+
+/// The addresses a host was told to announce ([`crate::NetConfig::advertise`]),
+/// already checked by [`crate::NetConfig::advertised`].
+#[derive(Default)]
+pub(crate) struct Advertise {
+    pub list: Vec<Candidate>,
+    /// Gather nothing: announce `list` alone.
+    pub only: bool,
 }
 
 /// Whether to ask the router for a port mapping: an online host, and no VPN
@@ -1422,6 +1471,20 @@ pub(crate) async fn prepare(
     stun: Vec<String>,
     lan_hook: Option<crate::LanSocketHook>,
 ) -> Result<Prepared, String> {
+    prepare_advertising(port, upnp, stun, lan_hook, Advertise::default()).await
+}
+
+/// [`prepare`] for a host with configured addresses to announce. With
+/// `advertise.only` nothing is gathered: no STUN, no UPnP mapping, no LAN or
+/// IPv6 lookup. The sockets bind the same ports either way.
+pub(crate) async fn prepare_advertising(
+    port: u16,
+    upnp: bool,
+    stun: Vec<String>,
+    lan_hook: Option<crate::LanSocketHook>,
+    advertise: Advertise,
+) -> Result<Prepared, String> {
+    let upnp = upnp && !advertise.only;
     tokio::task::spawn_blocking(move || {
         let split = lan_hook.is_some();
         // The online socket (the only one without a hook).
@@ -1440,7 +1503,11 @@ pub(crate) async fn prepare(
                     .ok()
             })
         });
-        let mut candidates = gather(&socket, None, &stun, Duration::from_secs(1));
+        let mut candidates = if advertise.only {
+            Vec::new()
+        } else {
+            gather(&socket, None, &stun, Duration::from_secs(1))
+        };
         let mapping = mapping_thread.and_then(|h| h.join().ok().flatten());
         if let Some(m) = &mapping {
             candidates.push(Candidate {
@@ -1458,6 +1525,20 @@ pub(crate) async fn prepare(
                     .map(|a| a.is_ipv4())
                     .unwrap_or(false)
             });
+        }
+        // An IPv6 address to announce needs a socket that can answer it.
+        if !local.is_ipv6() {
+            if let Some(c) = advertise.list.iter().find(|c| {
+                c.addr
+                    .parse::<SocketAddr>()
+                    .map(|a| a.is_ipv6())
+                    .unwrap_or(false)
+            }) {
+                return Err(format!(
+                    "advertise {}: the UDP socket is IPv4-only, so it cannot answer IPv6",
+                    c.addr
+                ));
+            }
         }
         let punch_socket = socket
             .try_clone()
@@ -1478,11 +1559,14 @@ pub(crate) async fn prepare(
                 .map_err(|e| format!("socket has no address: {e}"))?;
             // Its own gather names only itself (no STUN servers, no UPnP);
             // of that, only the LAN candidate is used.
-            let mut lan_candidates: Vec<Candidate> =
+            let mut lan_candidates: Vec<Candidate> = if advertise.only {
+                Vec::new()
+            } else {
                 gather(&lan, None, &[], Duration::from_millis(1))
                     .into_iter()
                     .filter(|c| c.kind == crate::nat::candidates::CandidateKind::Lan.as_str())
-                    .collect();
+                    .collect()
+            };
             if !lan_local.is_ipv6() {
                 lan_candidates.retain(|c| {
                     c.addr
@@ -1514,6 +1598,7 @@ pub(crate) async fn prepare(
             lan_socket,
             lan_punch_socket,
             candidates,
+            advertised: advertise.list,
             mapping,
             upnp_attempted: upnp,
         })
