@@ -470,7 +470,7 @@ impl std::fmt::Display for FailReason {
                 "Code not found (check the code, or the host may have started)."
             ),
             FailReason::PunchFailed => {
-                write!(f, "Found the host but couldn't connect to their phone.")
+                write!(f, "Found the host but couldn't connect to it.")
             }
             FailReason::RoomFull => write!(f, "Room full."),
             FailReason::RoomClosed => write!(f, "That game has already started."),
