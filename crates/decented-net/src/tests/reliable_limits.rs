@@ -570,3 +570,171 @@ fn a1_the_edges_of_the_allowed_range_are_accepted() {
     assert!(c.checked().is_ok());
     assert!(big_cfg().checked().is_ok());
 }
+
+// ─── Review fixes: the release path, the default boundary, the race ─────────
+
+use crate::quic::{Inbound, Refused};
+
+#[test]
+fn a1_inbound_admits_exactly_the_bound_and_refuses_the_next() {
+    let q = Inbound::default();
+    // The default host bound: 256 messages of 1024 bytes, 256 KiB.
+    for i in 0..256 {
+        assert_eq!(q.admit(1024, 256, 256 * 1024), Ok(()), "message {i}");
+    }
+    assert_eq!(q.admit(1024, 256, 256 * 1024), Err(Refused::Messages));
+    assert_eq!(q.messages(), 256, "a refusal counts nothing");
+    // Freeing one makes room for exactly one.
+    q.release(1024);
+    assert_eq!(q.admit(1024, 256, 256 * 1024), Ok(()));
+    assert_eq!(q.admit(1024, 256, 256 * 1024), Err(Refused::Messages));
+    // The byte bound refuses on its own when the count has room.
+    let b = Inbound::default();
+    assert_eq!(b.admit(40_000, 100, 64 * 1024), Ok(()));
+    assert_eq!(b.admit(40_000, 100, 64 * 1024), Err(Refused::Bytes));
+    assert_eq!(b.messages(), 1);
+    // The byte bound is inclusive.
+    assert_eq!(b.admit(64 * 1024 - 40_000, 100, 64 * 1024), Ok(()));
+}
+
+#[test]
+fn a1_inbound_release_frees_the_bytes_so_a_bound_can_be_refilled() {
+    let q = Inbound::default();
+    for _ in 0..50 {
+        for _ in 0..4 {
+            assert_eq!(q.admit(16 * 1024, 100, 64 * 1024), Ok(()));
+        }
+        assert_eq!(q.admit(1, 100, 64 * 1024), Err(Refused::Bytes));
+        for _ in 0..4 {
+            q.release(16 * 1024);
+        }
+        assert_eq!(q.messages(), 0);
+    }
+}
+
+/// With the default bounds and max-size messages, the byte bound must never
+/// refuse a message the count bound would have taken, even while the app's
+/// `poll` is releasing at the same moment.
+#[test]
+fn a1_a_release_racing_an_admit_never_trips_the_byte_bound_first() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const ROUNDS: usize = 200_000;
+    let q = Arc::new(Inbound::default());
+    for _ in 0..256 {
+        q.admit(1024, 256, 256 * 1024).unwrap();
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let (q, done) = (Arc::clone(&q), Arc::clone(&done));
+        std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                while q.messages() < 256 && !done.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                q.release(1024);
+            }
+        })
+    };
+    let mut spurious = 0usize;
+    for _ in 0..ROUNDS {
+        loop {
+            match q.admit(1024, 256, 256 * 1024) {
+                Ok(()) => break,
+                Err(Refused::Messages) => std::hint::spin_loop(),
+                Err(Refused::Bytes) => {
+                    spurious += 1;
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    done.store(true, Ordering::Release);
+    poller.join().unwrap();
+    assert_eq!(spurious, 0, "the byte bound refused before the count bound");
+}
+
+/// Messages of `len` bytes, `per_round` at a time, with the receiver polling
+/// every one of them between rounds: `total` bytes pass through a queue whose
+/// bound is far smaller, so only a `release` that frees bytes lets it live.
+const ROUND_LEN: usize = 1024;
+
+#[test]
+fn a1_a_host_that_polls_survives_many_times_the_default_byte_bound() {
+    let (h, cl, peer, _) = connected_pair(4);
+    // 64 KiB per round, 16 rounds: 1 MiB through a 256 KiB bound.
+    for round in 0..16u8 {
+        for i in 0..64u8 {
+            cl.send_reliable(pattern(ROUND_LEN, round ^ i));
+        }
+        for _ in 0..64 {
+            assert_eq!(next_host_reliable(&h).len(), ROUND_LEN);
+        }
+    }
+    while let Some(ev) = cl.poll() {
+        assert!(!matches!(ev, ClientEvent::Disconnected { .. }), "{ev:?}");
+    }
+    assert_eq!(h.peer_count(), 1);
+    let _ = peer;
+    h.shutdown();
+}
+
+#[test]
+fn a1_a_client_that_polls_survives_many_times_the_default_byte_bound() {
+    let (h, cl, peer, _) = connected_pair(4);
+    // 64 KiB per round, 40 rounds: 2.5 MiB through a 1 MiB bound.
+    for round in 0..40u8 {
+        for i in 0..64u8 {
+            h.send_reliable(peer, pattern(ROUND_LEN, round ^ i));
+        }
+        for _ in 0..64 {
+            assert_eq!(next_client_reliable(&cl).len(), ROUND_LEN);
+        }
+    }
+    assert_eq!(h.peer_count(), 1);
+    h.shutdown();
+}
+
+#[test]
+fn a1_the_default_host_bound_admits_exactly_256_full_messages_and_trips_on_one_more() {
+    // Exactly 256 x 1024 bytes, unpolled: all admitted, the peer stays.
+    let (h, cl, peer, _) = connected_pair(4);
+    for i in 0..256usize {
+        cl.send_reliable(pattern(1024, i as u8));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(h.peer_count(), 1, "256 messages are within the bound");
+    let mut got = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while got < 256 {
+        assert!(Instant::now() < deadline, "only {got} of 256 arrived");
+        while let Some(ev) = h.poll() {
+            match ev {
+                HostEvent::Reliable { .. } => got += 1,
+                HostEvent::PeerLeft { peer: p, .. } if p == peer => {
+                    panic!("dropped inside the bound after {got}")
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.shutdown();
+
+    // One more than that, unpolled: the peer is dropped, and at most 256 were queued.
+    let (h, cl, peer, _) = connected_pair(4);
+    for i in 0..257usize {
+        cl.send_reliable(pattern(1024, i as u8));
+    }
+    wait_client(&cl, 10, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    let (mut got, mut left) = (0, false);
+    while let Some(ev) = h.poll() {
+        match ev {
+            HostEvent::Reliable { .. } => got += 1,
+            HostEvent::PeerLeft { peer: p, .. } if p == peer => left = true,
+            _ => {}
+        }
+    }
+    assert!(left, "the 257th message trips the bound");
+    assert_eq!(got, 256, "exactly the bound was queued");
+    h.shutdown();
+}
