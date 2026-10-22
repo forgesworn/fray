@@ -273,7 +273,7 @@ pub(crate) async fn read_frame(
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > cap {
-        return Err(format!("frame of {len} bytes exceeds the cap"));
+        return Err(format!("frame of {len} bytes exceeds the cap of {cap}"));
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf)
@@ -1010,26 +1010,43 @@ pub(crate) struct Inbound {
     bytes: AtomicUsize,
 }
 
+/// Which bound refused a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    Messages,
+    Bytes,
+}
+
 impl Inbound {
     /// Count one `len`-byte message in, unless that would pass `max_messages`
-    /// or `max_bytes` (then nothing is counted and this is `false`).
-    pub(crate) fn admit(&self, len: usize, max_messages: usize, max_bytes: usize) -> bool {
+    /// or `max_bytes` (then nothing is counted and the bound that refused it
+    /// is named).
+    pub(crate) fn admit(
+        &self,
+        len: usize,
+        max_messages: usize,
+        max_bytes: usize,
+    ) -> Result<(), Refused> {
         if self.messages.fetch_add(1, Ordering::AcqRel) >= max_messages {
             self.messages.fetch_sub(1, Ordering::AcqRel);
-            return false;
+            return Err(Refused::Messages);
         }
         if self.bytes.fetch_add(len, Ordering::AcqRel) + len > max_bytes {
             self.bytes.fetch_sub(len, Ordering::AcqRel);
             self.messages.fetch_sub(1, Ordering::AcqRel);
-            return false;
+            return Err(Refused::Bytes);
         }
-        true
+        Ok(())
     }
 
-    /// The app took a `len`-byte message off the queue.
+    /// The app took a `len`-byte message off the queue. The bytes go first:
+    /// `admit` checks the count first, so one that sees the freed message slot
+    /// also sees the freed bytes, and the byte bound can never refuse a
+    /// message the count bound would have taken (the default byte bounds are
+    /// count times the default cap).
     pub(crate) fn release(&self, len: usize) {
-        self.messages.fetch_sub(1, Ordering::AcqRel);
         self.bytes.fetch_sub(len, Ordering::AcqRel);
+        self.messages.fetch_sub(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -1150,6 +1167,15 @@ pub(crate) async fn pump(
                     }
                 }
                 Ok(None) => break,
+                Err(e) if e.starts_with("frame of ") => {
+                    // The peer sent a frame above our cap. A hostile peer, or
+                    // an app whose two ends were built with different
+                    // `max_reliable_len`: the connection ends either way.
+                    log::warn!(
+                        "[net] {e}; closing (both ends of an app must use the same max_reliable_len)"
+                    );
+                    break;
+                }
                 Err(e) => {
                     log::debug!("[net] read ended: {e}");
                     break;

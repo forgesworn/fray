@@ -66,7 +66,7 @@ impl Shared {
             ClientEvent::Reliable(b) | ClientEvent::Lossy(b) => b.len(),
             _ => 0,
         };
-        if !counter.admit(len, cap, max_bytes) {
+        if counter.admit(len, cap, max_bytes).is_err() {
             return false;
         }
         if let Ok(tx) = self.ev_tx.lock() {

@@ -262,7 +262,7 @@ impl Shared {
             HostEvent::Reliable { bytes, .. } | HostEvent::Lossy { bytes, .. } => bytes.len(),
             _ => 0,
         };
-        if !counter.admit(len, cap, max_bytes) {
+        if counter.admit(len, cap, max_bytes).is_err() {
             return Emitted::Full;
         }
         if let Ok(tx) = self.ev_tx.lock() {

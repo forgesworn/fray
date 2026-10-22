@@ -205,9 +205,13 @@ pub struct NetConfig {
     /// Largest reliable message this app sends or accepts, in bytes. Allowed
     /// range 1024 ..= 1 MiB; default [`MAX_RELIABLE_LEN`] (1024). There is no
     /// negotiation and the wire does not change: both ends of one app set the
-    /// same value. A send above it is dropped and logged. A frame above it
-    /// from the peer is a protocol error and ends the connection, so an end
-    /// left at the default drops a connection whose other end sends more. The
+    /// same value, and an app that changes its cap should change its
+    /// `app_tag` (or ALPN version) at the same time, so builds with different
+    /// caps never meet. A send above it is dropped and logged. A frame above
+    /// it from the peer is a protocol error: the receiver logs a warning with
+    /// the frame size and its own cap, and ends the connection (the sender
+    /// sees the peer leave, not a distinct error). An end left at the default
+    /// therefore drops a connection whose other end sends more. The
     /// handshake keeps its own small frame cap whatever this is: a stranger
     /// cannot send a large frame before admission. Host migration always uses
     /// the default size: a non-default value is for apps that do not migrate,
