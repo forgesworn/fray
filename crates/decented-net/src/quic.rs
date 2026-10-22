@@ -244,7 +244,13 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 // ─── Framing ────────────────────────────────────────────────────────────────
 
 pub(crate) fn encode_frame(payload: &[u8]) -> Option<Vec<u8>> {
-    if payload.len() > HANDSHAKE_FRAME_CAP.max(MAX_RELIABLE_LEN) {
+    encode_frame_capped(payload, HANDSHAKE_FRAME_CAP.max(MAX_RELIABLE_LEN))
+}
+
+/// A frame of at most `cap` payload bytes (`cap` is the link's reliable cap
+/// once the session is up; handshake frames use [`encode_frame`]).
+pub(crate) fn encode_frame_capped(payload: &[u8], cap: usize) -> Option<Vec<u8>> {
+    if payload.len() > cap {
         return None;
     }
     let mut out = Vec::with_capacity(4 + payload.len());
@@ -278,6 +284,17 @@ pub(crate) async fn read_frame(
 
 async fn write_frame(send: &mut quinn::SendStream, payload: &[u8]) -> Result<(), String> {
     let frame = encode_frame(payload).ok_or("frame too large")?;
+    send.write_all(&frame)
+        .await
+        .map_err(|e| format!("write: {e}"))
+}
+
+async fn write_frame_capped(
+    send: &mut quinn::SendStream,
+    payload: &[u8],
+    cap: usize,
+) -> Result<(), String> {
+    let frame = encode_frame_capped(payload, cap).ok_or("frame too large")?;
     send.write_all(&frame)
         .await
         .map_err(|e| format!("write: {e}"))
@@ -750,6 +767,19 @@ pub(crate) async fn client_identify(
     inbox_relays: &[String],
     session: Option<&str>,
 ) -> Result<(), HandshakeError> {
+    let json = identify_json(opened, keys, attestation, inbox_relays, session)?;
+    write_frame(&mut opened.send, &json).await?;
+    read_accepted(opened).await
+}
+
+/// The signed identify frame for the verified host in `opened`.
+pub(crate) fn identify_json(
+    opened: &Opened,
+    keys: &Keys,
+    attestation: Option<&str>,
+    inbox_relays: &[String],
+    session: Option<&str>,
+) -> Result<Vec<u8>, HandshakeError> {
     let attestation = attestation.filter(|a| a.len() <= crate::identity::MAX_ATTESTATION_LEN);
     let inbox_relays = crate::identity::sanitize_inbox_relays(inbox_relays);
     let base = identify_digest(
@@ -770,8 +800,10 @@ pub(crate) async fn client_identify(
         attestation: attestation.map(str::to_string),
         inbox_relays,
     };
-    let json = serde_json::to_vec(&id).map_err(|e| e.to_string())?;
-    write_frame(&mut opened.send, &json).await?;
+    Ok(serde_json::to_vec(&id).map_err(|e| e.to_string())?)
+}
+
+async fn read_accepted(opened: &mut Opened) -> Result<(), HandshakeError> {
     let frame = read_frame(&mut opened.recv, HANDSHAKE_FRAME_CAP)
         .await?
         .ok_or("host closed the stream")?;
@@ -964,10 +996,53 @@ pub(crate) struct Link {
     pub generation: u64,
     pub tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     pub queued: Arc<AtomicUsize>,
+    /// Largest reliable message this link sends or accepts.
+    pub max_reliable_len: usize,
+    /// Reliable bytes that may queue before the link is closed as too slow.
+    pub outbound_queue_bytes: usize,
+}
+
+/// Received messages waiting for the app to `poll`, counted in messages and
+/// payload bytes. Shared between the pump (admits) and `poll` (releases).
+#[derive(Default)]
+pub(crate) struct Inbound {
+    messages: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Inbound {
+    /// Count one `len`-byte message in, unless that would pass `max_messages`
+    /// or `max_bytes` (then nothing is counted and this is `false`).
+    pub(crate) fn admit(&self, len: usize, max_messages: usize, max_bytes: usize) -> bool {
+        if self.messages.fetch_add(1, Ordering::AcqRel) >= max_messages {
+            self.messages.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        if self.bytes.fetch_add(len, Ordering::AcqRel) + len > max_bytes {
+            self.bytes.fetch_sub(len, Ordering::AcqRel);
+            self.messages.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
+    }
+
+    /// The app took a `len`-byte message off the queue.
+    pub(crate) fn release(&self, len: usize) {
+        self.messages.fetch_sub(1, Ordering::AcqRel);
+        self.bytes.fetch_sub(len, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> usize {
+        self.messages.load(Ordering::Acquire)
+    }
 }
 
 impl Link {
-    pub fn new(conn: quinn::Connection) -> (Link, tokio::sync::mpsc::UnboundedReceiver<Bytes>) {
+    pub fn new(
+        conn: quinn::Connection,
+        limits: crate::ReliableLimits,
+    ) -> (Link, tokio::sync::mpsc::UnboundedReceiver<Bytes>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Link {
@@ -983,21 +1058,24 @@ impl Link {
                 )),
                 tx,
                 queued: Arc::new(AtomicUsize::new(0)),
+                max_reliable_len: limits.max_len,
+                outbound_queue_bytes: limits.outbound_bytes,
             },
             rx,
         )
     }
 
     pub fn send_reliable(&self, bytes: Bytes) {
-        if bytes.len() > MAX_RELIABLE_LEN {
+        if bytes.len() > self.max_reliable_len {
             log::warn!(
-                "[net] dropping a {}-byte reliable message (cap {MAX_RELIABLE_LEN})",
-                bytes.len()
+                "[net] dropping a {}-byte reliable message (cap {})",
+                bytes.len(),
+                self.max_reliable_len
             );
             return;
         }
         let q = self.queued.fetch_add(bytes.len(), Ordering::Relaxed) + bytes.len();
-        if q > MAX_OUTBOUND_QUEUE_BYTES {
+        if q > self.outbound_queue_bytes {
             log::warn!("[net] {q} bytes queued for a peer that isn't reading; closing");
             self.conn.close(close::TOO_SLOW.into(), b"too slow");
             return;
@@ -1055,12 +1133,13 @@ pub(crate) async fn pump(
     mut recv: quinn::RecvStream,
     mut out: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     queued: Arc<AtomicUsize>,
+    max_reliable_len: usize,
     on_reliable: impl Fn(Bytes) -> bool + Send,
     on_lossy: impl Fn(Bytes) + Send,
 ) -> Ended {
     let reader = async {
         loop {
-            match read_frame(&mut recv, MAX_RELIABLE_LEN).await {
+            match read_frame(&mut recv, max_reliable_len).await {
                 Ok(Some(p)) => {
                     if !on_reliable(p) {
                         // The app can't keep up with this peer: drop it rather
@@ -1088,7 +1167,7 @@ pub(crate) async fn pump(
     let writer = async {
         while let Some(data) = out.recv().await {
             queued.fetch_sub(data.len(), Ordering::Relaxed);
-            if let Err(e) = write_frame(&mut send, &data).await {
+            if let Err(e) = write_frame_capped(&mut send, &data, max_reliable_len).await {
                 log::debug!("[net] write ended: {e}");
                 return;
             }

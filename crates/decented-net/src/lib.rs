@@ -80,14 +80,40 @@ pub const DEFAULT_LAN_PORT: u16 = 7715;
 /// bump keeps an older LAN browser from listing a v5 beacon (a code of letters
 /// outside I and O is valid in both alphabets) and joining it by beacon token.
 pub const NET_PROTOCOL_VERSION: u32 = 7;
-/// Largest reliable message `send_reliable` will carry (and accept: a bigger
-/// frame from a peer ends the connection).
+/// Default for [`NetConfig::max_reliable_len`]: the largest reliable message
+/// `send_reliable` will carry (and accept: a bigger frame from a peer ends the
+/// connection). Host migration always uses this size.
 pub const MAX_RELIABLE_LEN: usize = 1024;
+/// The largest [`NetConfig::max_reliable_len`] an app can ask for.
+pub(crate) const MAX_RELIABLE_LEN_CEILING: usize = 1024 * 1024;
 /// Largest lossy message `send_lossy` will carry (always fits a QUIC datagram
 /// at the minimum 1200-byte path MTU).
 pub const MAX_LOSSY_LEN: usize = 1024;
 /// Most player seats in a room. A playing host occupies one seat.
 pub const MAX_PLAYERS: u8 = 8;
+
+/// A bound on reliable messages waiting for the app to `poll`: at most
+/// `messages` of them and `bytes` of payload. One more of either disconnects
+/// the sender (it is flooding, or the app has stalled). Both must be non-zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueBound {
+    /// Most messages waiting.
+    pub messages: usize,
+    /// Most payload bytes waiting (framing is not counted).
+    pub bytes: usize,
+}
+
+/// The reliable-message limits one link runs with, read from a [`NetConfig`]
+/// (already checked) when the link comes up.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReliableLimits {
+    /// Largest reliable message sent or accepted on the link.
+    pub max_len: usize,
+    /// Received reliable messages waiting for `poll` (per peer on a host).
+    pub inbound: QueueBound,
+    /// Reliable bytes queued to send before the link is closed as too slow.
+    pub outbound_bytes: usize,
+}
 
 /// Everything the transport needs to know about this install.
 #[derive(Clone, Debug)]
@@ -176,6 +202,31 @@ pub struct NetConfig {
     /// advertised addresses. Its relay connections still leave by the default
     /// route (relay operators see its address; players do not). Default false.
     pub advertise_only: bool,
+    /// Largest reliable message this app sends or accepts, in bytes. Allowed
+    /// range 1024 ..= 1 MiB; default [`MAX_RELIABLE_LEN`] (1024). There is no
+    /// negotiation and the wire does not change: both ends of one app set the
+    /// same value. A send above it is dropped and logged. A frame above it
+    /// from the peer is a protocol error and ends the connection, so an end
+    /// left at the default drops a connection whose other end sends more. The
+    /// handshake keeps its own small frame cap whatever this is: a stranger
+    /// cannot send a large frame before admission. Host migration always uses
+    /// the default size: a non-default value is for apps that do not migrate,
+    /// and [`host_standby`], [`resume_host`], [`HostHandle::pin_session`] and
+    /// [`join_session_addr`] refuse it. Checked where the config is first
+    /// used, like the idle-timeout pair.
+    pub max_reliable_len: usize,
+    /// Reliable messages from one joined peer waiting for the host app to
+    /// `poll`. Default 256 messages and 256 KiB. Each byte bound must be at
+    /// least `max_reliable_len` and no bound may be zero (checked where the
+    /// config is first used). Lossy limits are unchanged.
+    pub host_inbound: QueueBound,
+    /// Reliable messages from the host waiting for the client app to `poll`.
+    /// Default 1024 messages and 1 MiB. Checked as `host_inbound` is.
+    pub client_inbound: QueueBound,
+    /// Reliable bytes queued to one link before it is closed as too slow (the
+    /// peer is not reading). Default 1 MiB; at least `max_reliable_len` and
+    /// non-zero (checked where the config is first used).
+    pub outbound_queue_bytes: usize,
     /// Tests only: whether the hooked LAN endpoint treats loopback sources as
     /// local (always so outside tests: loopback is this device).
     #[cfg(test)]
@@ -203,6 +254,16 @@ impl NetConfig {
             app_binding_label: None,
             advertise: Vec::new(),
             advertise_only: false,
+            max_reliable_len: MAX_RELIABLE_LEN,
+            host_inbound: QueueBound {
+                messages: host::MAX_QUEUED_RELIABLE,
+                bytes: host::MAX_QUEUED_RELIABLE * MAX_RELIABLE_LEN,
+            },
+            client_inbound: QueueBound {
+                messages: client::MAX_QUEUED_RELIABLE,
+                bytes: client::MAX_QUEUED_RELIABLE * MAX_RELIABLE_LEN,
+            },
+            outbound_queue_bytes: quic::MAX_OUTBOUND_QUEUE_BYTES,
             #[cfg(test)]
             lan_allow_loopback: true,
         }
@@ -214,13 +275,80 @@ impl NetConfig {
         quic::Liveness::new(self.idle_timeout, self.keep_alive)
     }
 
-    /// Everything checked where the config is first used: the liveness pair
-    /// and the app's exporter label.
+    /// The reliable limits: the cap in range, no zero bound, and every byte
+    /// bound at least one legal message. Checked where the config is first used.
+    fn check_reliable_limits(&self) -> Result<(), String> {
+        let cap = self.max_reliable_len;
+        if !(MAX_RELIABLE_LEN..=MAX_RELIABLE_LEN_CEILING).contains(&cap) {
+            return Err(format!(
+                "max_reliable_len {cap} is outside {MAX_RELIABLE_LEN}..={MAX_RELIABLE_LEN_CEILING}"
+            ));
+        }
+        for (name, bound) in [
+            ("host_inbound", self.host_inbound),
+            ("client_inbound", self.client_inbound),
+        ] {
+            if bound.messages == 0 || bound.bytes == 0 {
+                return Err(format!("{name} has a zero bound"));
+            }
+            if bound.bytes < cap {
+                return Err(format!(
+                    "{name}.bytes {} is below max_reliable_len {cap}: one message must fit",
+                    bound.bytes
+                ));
+            }
+        }
+        if self.outbound_queue_bytes == 0 {
+            return Err("outbound_queue_bytes is zero".into());
+        }
+        if self.outbound_queue_bytes < cap {
+            return Err(format!(
+                "outbound_queue_bytes {} is below max_reliable_len {cap}: one message must fit",
+                self.outbound_queue_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    /// Host migration (standby, resume, pin, session joins) runs at the
+    /// default reliable size only; refused for any other.
+    pub(crate) fn check_migration_cap(&self) -> Result<(), String> {
+        if self.max_reliable_len != MAX_RELIABLE_LEN {
+            return Err(format!(
+                "max_reliable_len {} is not the default {MAX_RELIABLE_LEN}: host migration \
+                 keeps its journal at the default size, so an app that migrates cannot raise it",
+                self.max_reliable_len
+            ));
+        }
+        Ok(())
+    }
+
+    /// Everything checked where the config is first used: the liveness pair,
+    /// the app's exporter label and the reliable limits.
     pub(crate) fn checked(&self) -> Result<quic::Liveness, String> {
         if let Some(label) = &self.app_binding_label {
             quic::check_app_label(label)?;
         }
+        self.check_reliable_limits()?;
         self.liveness()
+    }
+
+    /// The reliable limits for a host's links (call after [`Self::checked`]).
+    pub(crate) fn host_limits(&self) -> ReliableLimits {
+        ReliableLimits {
+            max_len: self.max_reliable_len,
+            inbound: self.host_inbound,
+            outbound_bytes: self.outbound_queue_bytes,
+        }
+    }
+
+    /// The reliable limits for a client's link (call after [`Self::checked`]).
+    pub(crate) fn client_limits(&self) -> ReliableLimits {
+        ReliableLimits {
+            max_len: self.max_reliable_len,
+            inbound: self.client_inbound,
+            outbound_bytes: self.outbound_queue_bytes,
+        }
     }
 
     /// The candidates for [`NetConfig::advertise`], checked where a host

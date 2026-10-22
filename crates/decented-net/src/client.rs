@@ -2,7 +2,7 @@
 //! straight to a LAN beacon's address.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use nostr::{Keys, PublicKey};
 
 use crate::nat::candidates::{dialable, parse_addrs};
-use crate::quic::{self, close, Ended, Link};
+use crate::quic::{self, close, Ended, Inbound, Link};
 use crate::relay::{MultiRelay, RendezvousRelay, TagFilter};
 use crate::rendezvous::{new_session_id, open_answer, seal_offer, Answer, Offer, KIND_JOIN_ANSWER};
 use crate::room::{derive_days, derive_invite_days, normalize_code, utc_today, RoomSecrets};
@@ -36,7 +36,9 @@ pub const MAX_QUEUED_RELIABLE: usize = 1024;
 /// Datagrams from the host waiting for `poll`; more are dropped.
 pub const MAX_QUEUED_LOSSY: usize = 128;
 
-type Queued = (ClientEvent, Option<Arc<AtomicUsize>>);
+/// An event for `poll`; the counter, when set, is the inbound queue it was
+/// counted in and the payload bytes to release when it leaves.
+type Queued = (ClientEvent, Option<(Arc<Inbound>, usize)>);
 
 struct Shared {
     local_key: [u8; 32],
@@ -53,13 +55,22 @@ impl Shared {
         }
     }
 
-    fn emit_counted(&self, ev: ClientEvent, counter: &Arc<AtomicUsize>, cap: usize) -> bool {
-        if counter.fetch_add(1, Ordering::AcqRel) >= cap {
-            counter.fetch_sub(1, Ordering::AcqRel);
+    fn emit_counted(
+        &self,
+        ev: ClientEvent,
+        counter: &Arc<Inbound>,
+        cap: usize,
+        max_bytes: usize,
+    ) -> bool {
+        let len = match &ev {
+            ClientEvent::Reliable(b) | ClientEvent::Lossy(b) => b.len(),
+            _ => 0,
+        };
+        if !counter.admit(len, cap, max_bytes) {
             return false;
         }
         if let Ok(tx) = self.ev_tx.lock() {
-            let _ = tx.send((ev, Some(Arc::clone(counter))));
+            let _ = tx.send((ev, Some((Arc::clone(counter), len))));
         }
         true
     }
@@ -194,6 +205,7 @@ pub fn join_session_addr(
     binding: crate::migration::ConnectionBinding,
     host: PublicKey,
 ) -> Result<ClientHandle, String> {
+    cfg.check_migration_cap()?;
     binding.validate().map_err(|e| e.to_string())?;
     Ok(spawn(
         cfg,
@@ -333,8 +345,8 @@ impl ClientHandle {
 
     pub fn poll(&self) -> Option<ClientEvent> {
         let (ev, counter) = self.events.lock().ok()?.try_recv().ok()?;
-        if let Some(c) = counter {
-            c.fetch_sub(1, Ordering::AcqRel);
+        if let Some((c, len)) = counter {
+            c.release(len);
         }
         Some(ev)
     }
@@ -709,7 +721,7 @@ async fn run(
     let quic::Opened {
         send, recv, proof, ..
     } = opened;
-    let (mut link, out_rx) = Link::new(conn.clone());
+    let (mut link, out_rx) = Link::new(conn.clone(), cfg.client_limits());
     link.migration = proof.migration.clone();
     link.app_binding = quic::app_binding(&conn, cfg.app_binding_label.as_deref());
     link.session_key = Some(proof.pubkey.to_bytes());
@@ -731,16 +743,30 @@ async fn run(
         inbox_relays: proof.inbox_relays.clone(),
     });
     let (s1, s2) = (Arc::clone(&shared), Arc::clone(&shared));
-    let (reliable_q, lossy_q) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (reliable_q, lossy_q) = (Arc::new(Inbound::default()), Arc::new(Inbound::default()));
+    let inbound = cfg.client_inbound;
     let ended = quic::pump(
         conn,
         send,
         recv,
         out_rx,
         Arc::clone(&link.queued),
-        move |b| s1.emit_counted(ClientEvent::Reliable(b), &reliable_q, MAX_QUEUED_RELIABLE),
+        link.max_reliable_len,
         move |b| {
-            s2.emit_counted(ClientEvent::Lossy(b), &lossy_q, MAX_QUEUED_LOSSY);
+            s1.emit_counted(
+                ClientEvent::Reliable(b),
+                &reliable_q,
+                inbound.messages,
+                inbound.bytes,
+            )
+        },
+        move |b| {
+            s2.emit_counted(
+                ClientEvent::Lossy(b),
+                &lossy_q,
+                MAX_QUEUED_LOSSY,
+                usize::MAX,
+            );
         },
     )
     .await;

@@ -427,13 +427,20 @@ address, so this is often the only path that works phone to phone.
 
 ## Bounded resources
 
-- **Message sizes.** App messages are capped at 1 KiB (`MAX_RELIABLE_LEN`); a
-  bigger frame ends the connection. Handshake frames are capped at 4 KiB, and
-  datagrams at 1 KiB.
-- **Queues.** The host's app may have at most 256 reliable messages from one
-  peer waiting in `poll` (the client allows 1024). One more disconnects that
-  peer (`FLOOD`). Datagrams over the per-peer cap are dropped. One flooding
-  peer cannot starve or bloat the others.
+- **Message sizes.** App messages are capped at 1 KiB (`MAX_RELIABLE_LEN`)
+  unless the app sets `NetConfig::max_reliable_len` (1 KiB to 1 MiB, the same
+  on both ends: there is no negotiation); a bigger frame ends the connection.
+  The handshake keeps its own caps whatever the app sets (2 KiB for the hello,
+  8 KiB for the rest), so a stranger cannot send a large frame before
+  admission. Datagrams are capped at 1 KiB. Host migration needs the default
+  size and refuses a raised one.
+- **Queues.** The host's app may have at most 256 reliable messages (and
+  256 KiB) from one peer waiting in `poll`; the client allows 1024 (and 1 MiB).
+  One more of either disconnects that peer (`FLOOD`). `NetConfig::host_inbound`
+  and `client_inbound` change the bounds. A link with more than 1 MiB queued to
+  send (`NetConfig::outbound_queue_bytes`) is closed as too slow. Datagrams over
+  the per-peer cap are dropped. One flooding peer cannot starve or bloat the
+  others.
 - **Punches.** The host sends hole-punch packets only to:
   - `lan` candidates inside one of its own IPv4 subnets;
   - otherwise, globally routable IPv4 addresses, or global unicast IPv6

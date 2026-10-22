@@ -156,6 +156,7 @@ pub fn host_virtual(
         Some(PathKind::Virtual),
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
+        cfg.host_limits(),
         None,
         move |code, _room, shared, cmd_rx| run_host(app_tag, live, code, links, shared, cmd_rx),
     )

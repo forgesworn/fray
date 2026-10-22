@@ -11,7 +11,7 @@ use nostr::{Keys, PublicKey};
 
 use crate::lan::{Beacon, BeaconSender};
 use crate::nat::candidates::{gather, punch_targets};
-use crate::quic::{self, close, Ended, Link};
+use crate::quic::{self, close, Ended, Inbound, Link};
 use crate::relay::{MultiRelay, RendezvousRelay, TagFilter};
 use crate::rendezvous::{open_offer, seal_answer, Answer, Candidate, KIND_JOIN_OFFER};
 use crate::room::{
@@ -44,7 +44,14 @@ const UPNP_RENEW_CHECK: Duration = Duration::from_secs(60);
 pub const MAX_INVITES: usize = 256;
 
 /// An event plus the per-peer counter it occupies until polled.
-type Queued<E> = (E, Option<Arc<AtomicUsize>>, u64, Option<PeerEventFence>);
+/// An event for `poll`; the counter, when set, is the inbound queue it was
+/// counted in and the payload bytes to release when it leaves.
+type Queued<E> = (
+    E,
+    Option<(Arc<Inbound>, usize)>,
+    u64,
+    Option<PeerEventFence>,
+);
 struct PeerEventFence {
     live: Arc<AtomicBool>,
     binding: Option<crate::migration::ConnectionBinding>,
@@ -107,6 +114,9 @@ pub(crate) struct Shared {
     app_tag: String,
     /// The app's exporter label ([`NetConfig::app_binding_label`]).
     app_binding_label: Option<String>,
+    /// The reliable limits every peer link runs with ([`NetConfig::max_reliable_len`]
+    /// and the bounds beside it).
+    limits: crate::ReliableLimits,
     pending_handshakes: AtomicUsize,
     generation: AtomicU64,
     /// The generation, published when the pin bumps it: a pending ordinary
@@ -227,14 +237,16 @@ impl Shared {
         true
     }
 
-    /// Queue a peer message if that peer is still registered and under `cap`.
+    /// Queue a peer message if that peer is still registered and under `cap`
+    /// messages and `max_bytes` payload bytes.
     fn emit_counted(
         &self,
         peer: PeerId,
         generation: u64,
         ev: HostEvent,
-        counter: &Arc<AtomicUsize>,
+        counter: &Arc<Inbound>,
         cap: usize,
+        max_bytes: usize,
     ) -> Emitted {
         let Ok(peers) = self.peers.lock() else {
             return Emitted::Full;
@@ -246,14 +258,17 @@ impl Shared {
         {
             return Emitted::Detached;
         }
-        if counter.fetch_add(1, Ordering::AcqRel) >= cap {
-            counter.fetch_sub(1, Ordering::AcqRel);
+        let len = match &ev {
+            HostEvent::Reliable { bytes, .. } | HostEvent::Lossy { bytes, .. } => bytes.len(),
+            _ => 0,
+        };
+        if !counter.admit(len, cap, max_bytes) {
             return Emitted::Full;
         }
         if let Ok(tx) = self.ev_tx.lock() {
             let _ = tx.send((
                 ev,
-                Some(Arc::clone(counter)),
+                Some((Arc::clone(counter), len)),
                 generation,
                 Some(PeerEventFence::new(&peers[&peer])),
             ));
@@ -407,6 +422,7 @@ fn host_inner(
         None,
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
+        cfg.host_limits(),
         None,
         move |code, room, shared, cmd_rx| {
             HostTask {
@@ -431,6 +447,7 @@ pub(crate) fn start_session_endpoint(
     policy: crate::migration::EndpointPolicy,
 ) -> Result<HostHandle, String> {
     cfg.checked()?;
+    cfg.check_migration_cap()?;
     cfg.advertised()?;
     policy
         .validate(id.pubkey().to_bytes(), code, &cfg.app_tag)
@@ -471,6 +488,7 @@ pub(crate) fn start_session_endpoint(
         None,
         cfg.app_tag.clone(),
         cfg.app_binding_label.clone(),
+        cfg.host_limits(),
         Some((code, policy)),
         move |code, room, shared, cmd_rx| {
             HostTask {
@@ -497,6 +515,7 @@ pub(crate) fn start_host<F, Fut>(
     path_override: Option<PathKind>,
     app_tag: String,
     app_binding_label: Option<String>,
+    limits: crate::ReliableLimits,
     pinned: Option<(String, crate::migration::EndpointPolicy)>,
     task: F,
 ) -> HostHandle
@@ -516,6 +535,7 @@ where
         session_policy: Mutex::new(pinned.as_ref().map(|(_, p)| p.clone())),
         app_tag,
         app_binding_label,
+        limits,
         pending_handshakes: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
         generation_tx: tokio::sync::watch::Sender::new(0),
@@ -612,6 +632,14 @@ impl HostHandle {
     pub fn pin_session(&self, descriptor: crate::migration::Descriptor) -> Result<(), String> {
         if self.shared.path_override == Some(PathKind::Virtual) {
             return Err("virtual migration is unsupported".into());
+        }
+        if self.shared.limits.max_len != crate::MAX_RELIABLE_LEN {
+            return Err(format!(
+                "max_reliable_len {} is not the default {}: host migration keeps its \
+                 journal at the default size, so an app that migrates cannot raise it",
+                self.shared.limits.max_len,
+                crate::MAX_RELIABLE_LEN
+            ));
         }
         let policy = crate::migration::EndpointPolicy {
             descriptor,
@@ -875,8 +903,8 @@ impl HostHandle {
         let receiver = self.events.lock().ok()?;
         loop {
             let (ev, counter, generation, session_live) = receiver.try_recv().ok()?;
-            if let Some(c) = counter {
-                c.fetch_sub(1, Ordering::AcqRel);
+            if let Some((c, len)) = counter {
+                c.release(len);
             }
             if generation == self.shared.generation.load(Ordering::Acquire)
                 && session_live.is_none_or(|fence| fence.valid(&self.shared))
@@ -2172,7 +2200,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
 
     drop(slot);
     // Seat under the lock so two simultaneous joiners can't both take the last seat.
-    let (mut link, out_rx) = Link::new(conn.clone());
+    let (mut link, out_rx) = Link::new(conn.clone(), shared.limits);
     link.migration = hello.migration.clone();
     link.app_binding = quic::app_binding(&conn, shared.app_binding_label.as_deref());
     link.generation = generation;
@@ -2262,13 +2290,15 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
     guard.announced = true;
 
     let (s1, s2) = (Arc::clone(&shared), Arc::clone(&shared));
-    let (reliable_q, lossy_q) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (reliable_q, lossy_q) = (Arc::new(Inbound::default()), Arc::new(Inbound::default()));
+    let inbound = shared.limits.inbound;
     let ended = quic::pump(
         conn,
         send,
         recv,
         out_rx,
         Arc::clone(&link.queued),
+        link.max_reliable_len,
         move |bytes| {
             // A detached peer's frames were on the way before its kick: drop
             // them and keep the stream open, so the kick's flush still runs.
@@ -2277,7 +2307,8 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                 generation,
                 HostEvent::Reliable { peer, bytes },
                 &reliable_q,
-                MAX_QUEUED_RELIABLE,
+                inbound.messages,
+                inbound.bytes,
             ) != Emitted::Full
         },
         move |bytes| {
@@ -2288,6 +2319,7 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
                 HostEvent::Lossy { peer, bytes },
                 &lossy_q,
                 MAX_QUEUED_LOSSY,
+                usize::MAX,
             );
         },
     )
@@ -2411,6 +2443,64 @@ mod migration_transition_tests {
         drop(opened);
         drop(endpoint);
     }
+    /// A1 decision 4: migration keeps its journal at the default reliable
+    /// size, so every way of arming a room refuses a raised cap.
+    #[test]
+    fn arming_is_refused_when_the_reliable_cap_is_not_the_default() {
+        let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-cap-test").lan_only();
+        cfg.lan_port = 0;
+        cfg.max_reliable_len = 65_537;
+        let original = Identity::ephemeral();
+        let standby = Identity::ephemeral();
+        let player = Identity::ephemeral();
+        let h = host(
+            &cfg,
+            &original,
+            RoomInfo {
+                name: "Original".into(),
+                max_players: 8,
+            },
+        );
+        wait_until(|| matches!(h.poll(), Some(HostEvent::Ready { .. })));
+        let descriptor = descriptor(&h, &cfg, &original, &standby, &player);
+        let refused = |e: String| e.contains("max_reliable_len") && e.contains("migration");
+        // Pinning the original host.
+        assert!(h.pin_session(descriptor.clone()).is_err_and(refused));
+        // The standby's control listener (resume_host shares its entry).
+        assert!(
+            crate::host_standby(&cfg, &standby, h.code(), descriptor.clone())
+                .err()
+                .is_some_and(refused)
+        );
+        // A session join.
+        let binding = ConnectionBinding {
+            session: descriptor.root.session,
+            descriptor: descriptor.root.digest().unwrap(),
+            term: 0,
+            client: LinkRole::Player,
+            server: LinkRole::Original,
+        };
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            h.local_addr().unwrap().port(),
+        );
+        assert!(crate::join_session_addr(
+            &cfg,
+            &player,
+            addr,
+            &h.lan_token(),
+            binding,
+            original.pubkey()
+        )
+        .err()
+        .is_some_and(refused));
+        // Nothing was pinned: ordinary joins still work at the raised cap.
+        assert!(h.is_open());
+        // The default cap arms as before.
+        cfg.max_reliable_len = crate::MAX_RELIABLE_LEN;
+        assert!(cfg.check_migration_cap().is_ok());
+        h.shutdown();
+    }
     #[test]
     fn pin_fences_detached_pumps_and_queued_events() {
         let mut cfg = NetConfig::new(std::env::temp_dir(), "migration-pin-test").lan_only();
@@ -2474,7 +2564,7 @@ mod migration_transition_tests {
                 admitted_by: Admission::Other,
             }
         ));
-        let counter = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::new(Inbound::default());
         assert_eq!(
             h.shared.emit_counted(
                 peer,
@@ -2484,11 +2574,12 @@ mod migration_transition_tests {
                     bytes: Bytes::from_static(b"late")
                 },
                 &counter,
-                16
+                16,
+                usize::MAX
             ),
             Emitted::Detached
         );
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(counter.messages(), 0);
         let binding = ConnectionBinding {
             session: descriptor.root.session,
             descriptor: descriptor.root.digest().unwrap(),
@@ -2812,7 +2903,7 @@ mod migration_transition_tests {
                     *keys.iter().find(|(_, k)| **k == second.pubkey()).unwrap().0,
                 )
             };
-            let count = Arc::new(AtomicUsize::new(0));
+            let count = Arc::new(Inbound::default());
             let generation = h.shared.generation.load(Ordering::Acquire);
             for peer in [pa, pb] {
                 assert_eq!(
@@ -2824,7 +2915,8 @@ mod migration_transition_tests {
                             bytes: Bytes::from_static(b"queued")
                         },
                         &count,
-                        10
+                        10,
+                        usize::MAX
                     ),
                     Emitted::Queued
                 );
@@ -2837,7 +2929,8 @@ mod migration_transition_tests {
                             bytes: Bytes::from_static(b"queued")
                         },
                         &count,
-                        10
+                        10,
+                        usize::MAX
                     ),
                     Emitted::Queued
                 );
@@ -2878,7 +2971,7 @@ mod migration_transition_tests {
                 }
             }
             assert_eq!((left, survivor_data, survivor_joined), (1, 2, 1));
-            assert_eq!(count.load(Ordering::Acquire), 0);
+            assert_eq!(count.messages(), 0);
             assert_eq!(h.peer_count(), 1);
             h.shutdown();
         }
