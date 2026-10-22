@@ -227,7 +227,7 @@ impl Shared {
         true
     }
 
-    /// Queue a peer message if that peer is under `cap`. `false` = over.
+    /// Queue a peer message if that peer is still registered and under `cap`.
     fn emit_counted(
         &self,
         peer: PeerId,
@@ -235,20 +235,20 @@ impl Shared {
         ev: HostEvent,
         counter: &Arc<AtomicUsize>,
         cap: usize,
-    ) -> bool {
+    ) -> Emitted {
         let Ok(peers) = self.peers.lock() else {
-            return false;
+            return Emitted::Full;
         };
         if self.generation.load(Ordering::Acquire) != generation
             || !peers
                 .get(&peer)
                 .is_some_and(|link| link.generation == generation)
         {
-            return false;
+            return Emitted::Detached;
         }
         if counter.fetch_add(1, Ordering::AcqRel) >= cap {
             counter.fetch_sub(1, Ordering::AcqRel);
-            return false;
+            return Emitted::Full;
         }
         if let Ok(tx) = self.ev_tx.lock() {
             let _ = tx.send((
@@ -258,7 +258,7 @@ impl Shared {
                 Some(PeerEventFence::new(&peers[&peer])),
             ));
         }
-        true
+        Emitted::Queued
     }
 
     /// The LAN admission token now (what the beacon, or a virtual link's
@@ -325,6 +325,17 @@ impl Shared {
             l.conn.close(code.into(), why);
         }
     }
+}
+
+/// What became of a message from a peer ([`Shared::emit_counted`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Emitted {
+    Queued,
+    /// The peer is no longer registered (kicked, retired or gone): dropped.
+    /// Its connection is already closing.
+    Detached,
+    /// The peer is over its queue cap: it is flooding.
+    Full,
 }
 
 pub(crate) enum Cmd {
@@ -2259,13 +2270,15 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
         out_rx,
         Arc::clone(&link.queued),
         move |bytes| {
+            // A detached peer's frames were on the way before its kick: drop
+            // them and keep the stream open, so the kick's flush still runs.
             s1.emit_counted(
                 peer,
                 generation,
                 HostEvent::Reliable { peer, bytes },
                 &reliable_q,
                 MAX_QUEUED_RELIABLE,
-            )
+            ) != Emitted::Full
         },
         move |bytes| {
             // Over the cap: dropped, as the network might have.
@@ -2462,16 +2475,19 @@ mod migration_transition_tests {
             }
         ));
         let counter = Arc::new(AtomicUsize::new(0));
-        assert!(!h.shared.emit_counted(
-            peer,
-            old_generation,
-            HostEvent::Reliable {
+        assert_eq!(
+            h.shared.emit_counted(
                 peer,
-                bytes: Bytes::from_static(b"late")
-            },
-            &counter,
-            16
-        ));
+                old_generation,
+                HostEvent::Reliable {
+                    peer,
+                    bytes: Bytes::from_static(b"late")
+                },
+                &counter,
+                16
+            ),
+            Emitted::Detached
+        );
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         let binding = ConnectionBinding {
             session: descriptor.root.session,
@@ -2799,26 +2815,32 @@ mod migration_transition_tests {
             let count = Arc::new(AtomicUsize::new(0));
             let generation = h.shared.generation.load(Ordering::Acquire);
             for peer in [pa, pb] {
-                assert!(h.shared.emit_counted(
-                    peer,
-                    generation,
-                    HostEvent::Reliable {
+                assert_eq!(
+                    h.shared.emit_counted(
                         peer,
-                        bytes: Bytes::from_static(b"queued")
-                    },
-                    &count,
-                    10
-                ));
-                assert!(h.shared.emit_counted(
-                    peer,
-                    generation,
-                    HostEvent::Lossy {
+                        generation,
+                        HostEvent::Reliable {
+                            peer,
+                            bytes: Bytes::from_static(b"queued")
+                        },
+                        &count,
+                        10
+                    ),
+                    Emitted::Queued
+                );
+                assert_eq!(
+                    h.shared.emit_counted(
                         peer,
-                        bytes: Bytes::from_static(b"queued")
-                    },
-                    &count,
-                    10
-                ));
+                        generation,
+                        HostEvent::Lossy {
+                            peer,
+                            bytes: Bytes::from_static(b"queued")
+                        },
+                        &count,
+                        10
+                    ),
+                    Emitted::Queued
+                );
             }
             if detach_before_retirement {
                 h.disconnect(pa);

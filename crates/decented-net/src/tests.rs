@@ -257,6 +257,53 @@ fn kick_disconnects_the_client_with_a_reason() {
 }
 
 #[test]
+fn a_kicked_client_that_is_still_sending_hears_it_was_kicked() {
+    // A racing player sends every frame; frames already on the way after the
+    // kick must not be taken for a flood, which would close the connection
+    // as "host left" and cut off the host's last words.
+    let (h, cl, peer, _) = connected_pair(4);
+    let sender = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut heard = Vec::new();
+        while Instant::now() < deadline {
+            cl.send_reliable(Bytes::from_static(b"input"));
+            while let Some(ev) = cl.poll() {
+                match ev {
+                    ClientEvent::Disconnected { reason } => return (heard, Some(reason)),
+                    ClientEvent::Reliable(b) => heard.push(b),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (heard, None)
+    });
+    // Let the stream run, then say goodbye and kick, as a game does.
+    std::thread::sleep(Duration::from_millis(100));
+    h.send_reliable(peer, Bytes::from_static(b"bye"));
+    h.kick(peer);
+    let (heard, reason) = sender.join().unwrap();
+    assert_eq!(reason, Some(DisconnectReason::Kicked));
+    assert!(
+        heard.iter().any(|b| &b[..] == b"bye"),
+        "the last message was lost"
+    );
+    let mut left = 0;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        while let Some(ev) = h.poll() {
+            if let HostEvent::PeerLeft { peer: p, reason } = ev {
+                assert_eq!((p, reason), (peer, LeaveReason::Kicked));
+                left += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(left, 1);
+    h.shutdown();
+}
+
+#[test]
 fn host_shutdown_tells_clients_the_host_left() {
     let (h, cl, _, _) = connected_pair(4);
     h.shutdown();
