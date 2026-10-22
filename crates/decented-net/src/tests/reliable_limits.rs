@@ -424,10 +424,19 @@ fn flood_a_silent_peer(outbound: usize, messages: usize) -> (Raw, HostHandle) {
 fn a1_a_small_outbound_queue_bound_closes_a_slow_reader_as_too_slow() {
     // 6 MiB for a peer that reads nothing, against a 16 KiB bound.
     let (raw, h) = flood_a_silent_peer(16 * 1024, 6 * 1024);
+    // The host closed the link itself: its own side of the story is firm.
+    let ev = wait_host(&h, 10, |e| matches!(e, HostEvent::PeerLeft { .. }));
+    assert!(
+        matches!(&ev, HostEvent::PeerLeft { reason: LeaveReason::Error(m), .. } if m == "closed locally"),
+        "{ev:?}"
+    );
+    // The peer sees the TOO_SLOW close, or (under load, when the close
+    // packet is lost among the flood) the stateless reset that follows it.
     let ended = raw.wait_closed();
     assert!(
         matches!(&ended, quinn::ConnectionError::ApplicationClosed(c)
-            if c.error_code == quinn::VarInt::from_u32(close::TOO_SLOW)),
+            if c.error_code == quinn::VarInt::from_u32(close::TOO_SLOW))
+            || matches!(ended, quinn::ConnectionError::Reset),
         "{ended:?}"
     );
     h.shutdown();
