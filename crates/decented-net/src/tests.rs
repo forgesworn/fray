@@ -10,6 +10,7 @@ use crate::rendezvous::{open_offer, seal_answer, Answer, Candidate, KIND_JOIN_OF
 use crate::room::{derive, ROOM_TAG_LETTER};
 use crate::*;
 
+mod listener;
 mod reliable_limits;
 
 /// The app tag the room-code vectors were made with.
