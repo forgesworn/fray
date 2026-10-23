@@ -604,3 +604,389 @@ fn announced_is_the_listeners_list_for_every_room() {
     assert_eq!(a.local_addr().unwrap().port(), port);
     l.shutdown();
 }
+
+// ─── Review fixes (K2-1): resource release, a closed room's last word, no
+// migration on a listener, per-room policy, rotation and the day roll ───
+
+/// The reason a join ended in `Failed`.
+fn fail_reason(cl: &ClientHandle) -> FailReason {
+    match join_outcome(cl) {
+        ClientEvent::Failed { reason, .. } => reason,
+        other => panic!("expected a refused join, got {other:?}"),
+    }
+}
+
+/// Review S1: the UDP port is free once the listener has shut down, even while
+/// a handle to one of its rooms is still held (a status table, a manager).
+#[test]
+fn the_port_is_free_after_the_listener_shuts_down_with_a_room_handle_alive() {
+    let port = free_udp_port();
+    let l = Listener::bind(ListenerConfig {
+        quic_port: port,
+        stun: Vec::new(),
+        upnp: false,
+        ..ListenerConfig::new()
+    })
+    .unwrap();
+    let h = open_lan(&l, APP_A);
+    let _other = open_lan(&l, APP_B);
+    let bind = || std::net::UdpSocket::bind(("0.0.0.0", port));
+    assert!(bind().is_err(), "control: the listener holds the port");
+    l.shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let freed = loop {
+        match bind() {
+            Ok(socket) => break socket,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "the port is still held with a room handle alive: {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    drop(freed);
+    // The handle is still usable as a handle: it knows it is closed.
+    assert!(h.is_closed());
+    // A new listener takes the port at once.
+    let again = Listener::bind(ListenerConfig {
+        quic_port: port,
+        stun: Vec::new(),
+        upnp: false,
+        ..ListenerConfig::new()
+    })
+    .unwrap();
+    again.shutdown();
+}
+
+/// Review S2: a listener that closes its rooms tells their handles, once, with
+/// `Failed`, and `is_closed` says so; shutdown and drop both do it.
+#[test]
+fn closing_the_listener_tells_every_room_handle_once() {
+    for by_drop in [false, true] {
+        let l = listener();
+        let at = addr(&l);
+        let a = open_lan(&l, APP_A);
+        let b = open_lan(&l, APP_B);
+        let cl = join_addr(&app(APP_A), &Identity::ephemeral(), at, &a.lan_token());
+        connected(&cl);
+        joined(&a);
+        assert!(!a.is_closed() && !b.is_closed());
+        if by_drop {
+            drop(l);
+        } else {
+            l.shutdown();
+        }
+        for h in [&a, &b] {
+            let ev = wait_host(h, 5, |e| matches!(e, HostEvent::Failed { .. }));
+            assert!(
+                matches!(&ev, HostEvent::Failed { reason } if reason.contains("listener")),
+                "{ev:?}"
+            );
+            assert!(h.is_closed());
+        }
+        // Once, and nothing after it but the peers leaving.
+        std::thread::sleep(Duration::from_millis(300));
+        for h in [&a, &b] {
+            while let Some(ev) = h.poll() {
+                assert!(
+                    matches!(ev, HostEvent::PeerLeft { .. }),
+                    "unexpected after the close: {ev:?}"
+                );
+            }
+        }
+        let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+        assert!(
+            matches!(
+                ev,
+                ClientEvent::Disconnected {
+                    reason: DisconnectReason::HostLeft
+                }
+            ),
+            "{ev:?}"
+        );
+    }
+}
+
+/// A room shut by its own handle leaves the listener's other rooms open and
+/// untold.
+#[test]
+fn a_room_shut_by_its_own_handle_leaves_the_listeners_other_rooms_open() {
+    let l = listener();
+    let a = open_lan(&l, APP_A);
+    let b = open_lan(&l, APP_A);
+    a.shutdown();
+    assert!(!b.is_closed());
+    std::thread::sleep(Duration::from_millis(200));
+    while let Some(ev) = b.poll() {
+        assert!(!matches!(ev, HostEvent::Failed { .. }), "{ev:?}");
+    }
+    l.shutdown();
+}
+
+/// Review S3: a room on a listener does not migrate (its admission of a pinned
+/// room is built on owning the endpoint), and stays an ordinary room.
+#[test]
+fn a_room_on_a_listener_refuses_to_pin_a_session_and_stays_ordinary() {
+    use crate::migration::*;
+    let l = listener();
+    let at = addr(&l);
+    let original = Identity::ephemeral();
+    let standby = Identity::ephemeral();
+    let player = Identity::ephemeral();
+    let c = app(APP_A);
+    let h = l.host(&c, &original, room(8));
+    wait_ready(&h);
+    let root = Root {
+        session: fresh_session().unwrap(),
+        app: c.app_tag.clone(),
+        transport_version: 7,
+        game_version: 13,
+        checkpoint_version: 1,
+        host: original.pubkey().to_bytes(),
+        standby: standby.pubkey().to_bytes(),
+        controller: original.pubkey().to_bytes(),
+        code: room_code_hash(h.code()).unwrap(),
+        created_day: 20741,
+        roster_revision: 1,
+        members: vec![Member {
+            player: 1,
+            seat: 0,
+            key: Some(player.pubkey().to_bytes()),
+        }],
+        config: [1; 32],
+        content: [2; 32],
+        limits: ResourceLimits::default(),
+    };
+    let mut descriptor = Descriptor::offer(root, original.keys()).unwrap();
+    descriptor.consent(standby.keys()).unwrap();
+    let err = h.pin_session(descriptor).unwrap_err();
+    assert!(err.contains("listener"), "{err}");
+    // Still an ordinary, open room.
+    let cl = join_addr(&c, &Identity::ephemeral(), at, &h.lan_token());
+    connected(&cl);
+    assert_eq!(h.peer_count(), 1);
+    l.shutdown();
+}
+
+/// Review coverage: the open flag, the deny list and `max_peers` are each
+/// per room on a listener.
+#[test]
+fn open_flag_deny_list_and_max_peers_are_per_room_on_a_listener() {
+    let l = listener();
+    let at = addr(&l);
+    let mut c = app(APP_A);
+    c.host_has_player = true;
+    // a1: room for one peer (two players, the host one of them).
+    let a1 = l.host(&c, &Identity::ephemeral(), room(2));
+    wait_ready(&a1);
+    let a2 = open_lan(&l, APP_A);
+    let a3 = open_lan(&l, APP_A);
+    let dial = |h: &HostHandle, id: &Identity| join_addr(&c, id, at, &h.lan_token());
+
+    // max_peers: a1 is full after one peer, a2 and a3 take theirs.
+    let first = Identity::ephemeral();
+    let cl1 = dial(&a1, &first);
+    connected(&cl1);
+    joined(&a1);
+    assert_eq!(
+        fail_reason(&dial(&a1, &Identity::ephemeral())),
+        FailReason::RoomFull
+    );
+    let cl2 = dial(&a2, &Identity::ephemeral());
+    connected(&cl2);
+    joined(&a2);
+
+    // The open flag: a2 closed refuses, while a1 (full) and a3 answer as theirs.
+    a2.set_open_keeping_token(false);
+    assert_eq!(
+        fail_reason(&dial(&a2, &Identity::ephemeral())),
+        FailReason::RoomClosed
+    );
+    let kicked = Identity::ephemeral();
+    let cl3 = dial(&a3, &kicked);
+    connected(&cl3);
+    let (peer, _, _) = joined(&a3);
+    assert_eq!(
+        fail_reason(&dial(&a1, &Identity::ephemeral())),
+        FailReason::RoomFull
+    );
+
+    // The deny list: a key kicked from a3 is refused there, and seated in a2
+    // once a2 opens again.
+    a3.kick(peer);
+    wait_host(&a3, 5, |e| matches!(e, HostEvent::PeerLeft { .. }));
+    assert_eq!(fail_reason(&dial(&a3, &kicked)), FailReason::NotAdmitted);
+    a2.set_open_keeping_token(true);
+    let again = dial(&a2, &kicked);
+    connected(&again);
+    joined(&a2);
+    assert_eq!(
+        (a1.peer_count(), a2.peer_count(), a3.peer_count()),
+        (1, 2, 0)
+    );
+    drop((cl1, cl2, cl3));
+    l.shutdown();
+}
+
+/// Review coverage (93901d1): a room rotated before its first derivation
+/// finishes reports the newest code in `Ready` and answers only that one.
+#[test]
+fn rotating_before_ready_answers_only_the_newest_code() {
+    let hub = FakeRelayHub::new();
+    let l = listener();
+    let at = addr(&l);
+    let id = Identity::ephemeral();
+    let mut h = l.host_with_relay(&app(APP_A), &id, room(8), Some(Box::new(hub.client())));
+    let c0 = h.code().to_string();
+    let c1 = h.rotate_code().unwrap();
+    let c2 = h.rotate_code().unwrap();
+    assert!(c0 != c1 && c1 != c2 && c0 != c2);
+    assert_eq!(wait_ready(&h), c2, "Ready reports the newest code");
+    assert_eq!(h.code(), c2);
+    settle();
+    refused(APP_A, at, code_token(APP_A, &c0));
+    refused(APP_A, at, code_token(APP_A, &c1));
+    assert!(raw_hello(APP_A, at, code_token(APP_A, &c2)).0);
+    let join = |code: &str| {
+        join_with_relay(
+            &app(APP_A),
+            &Identity::ephemeral(),
+            code,
+            Box::new(hub.client()),
+        )
+    };
+    no_answer(&join(&c0));
+    no_answer(&join(&c1));
+    let ok = join(&c2);
+    connected(&ok);
+    assert_eq!(joined(&h).2, Admission::Code);
+    l.shutdown();
+}
+
+/// Review coverage: an invite handshake parked just before its seat is
+/// refused when the target moves away, or the invite is revoked, meanwhile.
+#[test]
+fn an_invite_handshake_parked_before_its_seat_is_refused_when_the_target_moves() {
+    let hub = FakeRelayHub::new();
+    let l = listener();
+    let host_id = Identity::ephemeral();
+    let key = host_id.pubkey().to_bytes();
+    let (a1, _) = open(&l, &hub, APP_A, &host_id);
+    let (a2, _) = open(&l, &hub, APP_A, &host_id);
+    let s = secret(9);
+    let invite = l.add_invite(APP_A, s).unwrap();
+    a1.set_invite_target(true).unwrap();
+    settle();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let join = || {
+        join_invite_with_relay(
+            &app(APP_A),
+            &Identity::ephemeral(),
+            &s,
+            key,
+            Box::new(hub.client()),
+        )
+    };
+
+    // Moved away while parked in a1.
+    a1.pause_before_seating(Some(Arc::clone(&barrier)));
+    let cl = join();
+    crate::runtime().block_on(barrier.wait());
+    a2.set_invite_target(true).unwrap();
+    crate::runtime().block_on(barrier.wait());
+    assert_eq!(fail_reason(&cl), FailReason::NotAdmitted);
+    assert_eq!((a1.peer_count(), a2.peer_count()), (0, 0));
+    a1.pause_before_seating(None);
+
+    // Revoked while parked in a2.
+    settle();
+    a2.pause_before_seating(Some(Arc::clone(&barrier)));
+    let cl = join();
+    crate::runtime().block_on(barrier.wait());
+    assert!(l.remove_invite(APP_A, invite));
+    crate::runtime().block_on(barrier.wait());
+    assert_eq!(fail_reason(&cl), FailReason::NotAdmitted);
+    assert_eq!((a1.peer_count(), a2.peer_count()), (0, 0));
+    a2.pause_before_seating(None);
+
+    // Control: live again, the next one lands in the new target.
+    l.add_invite(APP_A, s).unwrap();
+    settle();
+    let id = Identity::ephemeral();
+    let cl = join_invite_with_relay(&app(APP_A), &id, &s, key, Box::new(hub.client()));
+    connected(&cl);
+    let (_, pubkey, by) = joined(&a2);
+    assert_eq!((pubkey, by), (id.pubkey(), Admission::Invite(invite)));
+    l.shutdown();
+}
+
+/// Review coverage: the UTC midnight roll on a room of a listener rolls its
+/// code tags and the listener invites it carries, and only that room's.
+#[test]
+fn the_midnight_roll_on_a_listener_room_rolls_that_rooms_tags_only() {
+    let hub = FakeRelayHub::new();
+    let l = listener();
+    let at = addr(&l);
+    let host_id = Identity::ephemeral();
+    let (a1, c1) = open(&l, &hub, APP_A, &host_id);
+    let (_a2, c2) = open(&l, &hub, APP_A, &host_id);
+    let s = secret(3);
+    let invite = l.add_invite(APP_A, s).unwrap();
+    a1.set_invite_target(true).unwrap();
+    settle();
+    let today = utc_today();
+    let by_code = |code: &str, day: u64| derive(APP_A, code, day).unwrap().admit;
+    let by_invite = |day: u64| derive_invite(APP_A, &s, day).unwrap().admit;
+    let takes = |token| raw_hello(APP_A, at, token).0;
+
+    // Before: today and yesterday, not tomorrow.
+    assert!(takes(by_code(&c1, today)) && takes(by_code(&c1, today - 1)));
+    assert!(!takes(by_code(&c1, today + 1)));
+    assert!(takes(by_invite(today)) && !takes(by_invite(today + 1)));
+
+    // Midnight passes on a1 only; the roll derives the code again first.
+    a1.set_test_day(today + 1);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !(takes(by_code(&c1, today + 1)) && takes(by_invite(today + 1))) {
+        assert!(Instant::now() < deadline, "the room never rolled");
+    }
+    assert!(takes(by_code(&c1, today)), "yesterday's still works");
+    assert!(!takes(by_code(&c1, today - 1)), "the day before is dropped");
+    assert!(takes(by_invite(today)), "yesterday's invite still works");
+    assert!(
+        !takes(by_invite(today - 1)),
+        "the day before's invite is dropped"
+    );
+
+    // a2 did not roll.
+    assert!(takes(by_code(&c2, today)) && takes(by_code(&c2, today - 1)));
+    assert!(!takes(by_code(&c2, today + 1)));
+
+    // A joiner on the real clock still finds the rolled room by code and by invite.
+    let id = Identity::ephemeral();
+    let cl = join_with_relay(&app(APP_A), &id, &c1, Box::new(hub.client()));
+    connected(&cl);
+    let (_, pubkey, by) = joined(&a1);
+    assert_eq!((pubkey, by), (id.pubkey(), Admission::Code));
+    let id = Identity::ephemeral();
+    let cl = join_invite_with_relay(
+        &app(APP_A),
+        &id,
+        &s,
+        host_id.pubkey().to_bytes(),
+        Box::new(hub.client()),
+    );
+    connected(&cl);
+    let (_, pubkey, by) = joined(&a1);
+    assert_eq!((pubkey, by), (id.pubkey(), Admission::Invite(invite)));
+
+    // A rotation after the roll installs the new code for the new day.
+    let mut a1 = a1;
+    let new = a1.rotate_code().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !takes(by_code(&new, today + 1)) {
+        assert!(Instant::now() < deadline, "the rotated code never came in");
+    }
+    assert!(!takes(by_code(&c1, today + 1)));
+    l.shutdown();
+}
