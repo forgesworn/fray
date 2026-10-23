@@ -448,7 +448,8 @@ impl Listener {
         self.shared.cfg.apply_to(&mut cfg);
         let relays_total = cfg.relays.len();
         let mut st = self.shared.lock();
-        let refused = if st.closed {
+        let closed = st.closed;
+        let refused = if closed {
             Some("the listener is shut down".to_string())
         } else {
             self.shared.ensure_app(&mut st, &cfg.app_tag).err()
@@ -467,7 +468,12 @@ impl Listener {
                 None,
                 move |_code, _room, shared, _cmd_rx| async move {
                     shared.retire();
-                    shared.emit(HostEvent::Failed { reason });
+                    if closed {
+                        // The listener's shutdown, told as every room is.
+                        shared.tell_listener_closed();
+                    } else {
+                        shared.emit(HostEvent::Failed { reason });
+                    }
                 },
             );
         }
@@ -595,6 +601,13 @@ impl Listener {
         self.shared.online.or(self.shared.local)
     }
 
+    /// Whether the listener has been shut down (by [`Listener::shutdown`] or
+    /// a drop in progress): it takes no new rooms and its rooms are closing
+    /// or closed.
+    pub fn is_closed(&self) -> bool {
+        self.shut.load(Ordering::Relaxed) || self.shared.lock().closed
+    }
+
     /// How many rooms are open on the listener now.
     pub fn room_count(&self) -> usize {
         self.shared.lock().apps.iter().map(|a| a.rooms.len()).sum()
@@ -613,7 +626,7 @@ impl Listener {
         self.shutdown_inner(Duration::from_millis(1000));
     }
 
-    fn shutdown_inner(&self, wait: Duration) {
+    pub(crate) fn shutdown_inner(&self, wait: Duration) {
         if self.shut.swap(true, Ordering::Relaxed) {
             return;
         }

@@ -990,3 +990,80 @@ fn the_midnight_roll_on_a_listener_room_rolls_that_rooms_tags_only() {
     assert!(!takes(by_code(&c1, today + 1)));
     l.shutdown();
 }
+
+// ─── Follow-ups (K2-1): asking the listener and the room why ───
+
+/// `Listener::is_closed` and `HostHandle::closed_by_listener` tell a listener's
+/// close from a room's own, without matching text.
+#[test]
+fn a_room_can_tell_a_listener_close_from_its_own() {
+    let l = listener();
+    assert!(!l.is_closed());
+    let own = open_lan(&l, APP_A);
+    let told = open_lan(&l, APP_A);
+    own.shutdown();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!l.is_closed(), "a room closing does not close the listener");
+    assert!(!told.closed_by_listener() && !told.is_closed());
+    l.shutdown_inner(Duration::from_millis(1000));
+    assert!(l.is_closed());
+    let ev = wait_host(&told, 5, |e| matches!(e, HostEvent::Failed { .. }));
+    assert!(
+        matches!(&ev, HostEvent::Failed { reason } if reason == crate::LISTENER_SHUTDOWN_REASON),
+        "{ev:?}"
+    );
+    assert!(told.closed_by_listener() && told.is_closed());
+    // A room opened on the closed listener is told the same way.
+    let late = l.host(&app(APP_A), &Identity::ephemeral(), room(8));
+    let ev = wait_host(&late, 5, |e| matches!(e, HostEvent::Failed { .. }));
+    assert!(
+        matches!(&ev, HostEvent::Failed { reason } if reason == crate::LISTENER_SHUTDOWN_REASON),
+        "{ev:?}"
+    );
+    assert!(late.closed_by_listener() && late.is_closed());
+    // A room of its own is never closed by a listener.
+    let alone = host(&cfg(), &Identity::ephemeral(), room(8));
+    wait_ready(&alone);
+    assert!(!alone.closed_by_listener() && !alone.is_closed());
+    alone.shutdown();
+}
+
+/// Review R1: a room opened just before its listener goes (still deriving its
+/// code, so its task is late) is told once, and says nothing after: no `Ready`
+/// and no second `Failed` follow the listener's `Failed`.
+#[test]
+fn a_room_opened_just_before_the_listener_drops_says_nothing_after_its_failed() {
+    for _ in 0..2 {
+        let hub = FakeRelayHub::new();
+        let l = listener();
+        let rooms: Vec<HostHandle> = (0..24)
+            .map(|_| {
+                l.host_with_relay(
+                    &app(APP_A),
+                    &Identity::ephemeral(),
+                    room(8),
+                    Some(Box::new(hub.client())),
+                )
+            })
+            .collect();
+        drop(l);
+        // Longer than the derivation, so a late `Ready` would show.
+        std::thread::sleep(Duration::from_millis(3000));
+        for h in &rooms {
+            let mut failed = 0;
+            while let Some(ev) = h.poll() {
+                match ev {
+                    HostEvent::Failed { reason } => {
+                        assert_eq!(reason, crate::LISTENER_SHUTDOWN_REASON);
+                        failed += 1;
+                    }
+                    HostEvent::Ready { .. } => assert_eq!(failed, 0, "Ready after Failed"),
+                    HostEvent::PeerLeft { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert_eq!(failed, 1, "told exactly once");
+            assert!(h.closed_by_listener() && h.is_closed());
+        }
+    }
+}

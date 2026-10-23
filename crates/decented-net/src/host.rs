@@ -371,9 +371,41 @@ impl Shared {
     pub(crate) fn tell_listener_closed(&self) {
         if !self.listener_closed.swap(true, Ordering::AcqRel) {
             self.emit(HostEvent::Failed {
-                reason: "the listener shut down".into(),
+                reason: LISTENER_SHUTDOWN_REASON.into(),
             });
         }
+    }
+
+    /// A start-up event (`Ready`, or a failure before the room is up). A room
+    /// on a listener that has been retired since (its listener shut down, or
+    /// its handle did) says nothing more: the handle has already heard
+    /// `Failed`, or asked for the close. Checked under the peer lock, as
+    /// [`Shared::retire`] sets the flag, so nothing slips between the two.
+    /// A room of its own always emits, as before.
+    fn emit_start(&self, ev: HostEvent) {
+        if self.seat.is_some() {
+            let _held = self.peers.lock();
+            if self.is_retired() {
+                return;
+            }
+            self.emit(ev);
+        } else {
+            self.emit(ev);
+        }
+    }
+
+    /// A room failed to start. On a listener that is already gone this is the
+    /// listener's shutdown, told once like any other; otherwise `reason`.
+    fn fail_start(&self, reason: String) {
+        if let Some(seat) = &self.seat {
+            if seat.listener().is_none() {
+                self.retire();
+                self.tell_listener_closed();
+                return;
+            }
+        }
+        self.emit_start(HostEvent::Failed { reason });
+        self.retire();
     }
 
     /// The current room code.
@@ -437,6 +469,10 @@ pub struct HostHandle {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
     shut: AtomicBool,
 }
+
+/// The reason in the [`HostEvent::Failed`] a room's handle gets when its
+/// listener shuts down (see [`HostHandle::closed_by_listener`]).
+pub const LISTENER_SHUTDOWN_REASON: &str = "the listener shut down";
 
 /// Start hosting. Watch [`HostHandle::poll`] for `Ready` or `Failed`.
 pub fn host(cfg: &NetConfig, id: &Identity, room: RoomInfo) -> HostHandle {
@@ -726,6 +762,15 @@ impl HostHandle {
     /// task failed. Nobody is seated in a closed room and it never recovers.
     pub fn is_closed(&self) -> bool {
         self.shared.is_retired()
+    }
+
+    /// Whether the room's listener closed it (the listener was shut down or
+    /// dropped), as opposed to the room's own handle or a failure. `true`
+    /// from the moment the handle is told (the [`HostEvent::Failed`] with
+    /// [`LISTENER_SHUTDOWN_REASON`]); a room of its own is never closed by a
+    /// listener. Implies [`HostHandle::is_closed`] once the room is retired.
+    pub fn closed_by_listener(&self) -> bool {
+        self.shared.listener_closed.load(Ordering::Acquire)
     }
 
     /// This endpoint's runtime identity. This does not attest a persona.
@@ -1418,16 +1463,14 @@ impl HostTask {
         mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     ) {
         if let Err(e) = self.cfg.checked().and_then(|_| self.cfg.advertised()) {
-            self.shared.emit(HostEvent::Failed { reason: e });
-            self.shared.retire();
+            self.shared.fail_start(e);
             return;
         }
         let only = self.cfg.advertise_only;
         let net = match self.net(relay.is_some()).await {
             Ok(n) => n,
             Err(e) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                self.shared.retire();
+                self.shared.fail_start(e);
                 return;
             }
         };
@@ -1473,8 +1516,7 @@ impl HostTask {
                 Ok((code, s)) if self.install_code(&code, &s) => s,
                 Ok(_) => Vec::new(),
                 Err(e) => {
-                    self.shared.emit(HostEvent::Failed { reason: e });
-                    self.shared.retire();
+                    self.shared.fail_start(e);
                     return;
                 }
             };
@@ -1500,7 +1542,12 @@ impl HostTask {
         }
         let mut last_upnp_check = Instant::now();
         self.code = self.shared.current_code();
-        self.shared.emit(HostEvent::Ready {
+        if self.shared.seat.is_some() && self.shared.is_retired() {
+            // Closed while starting (the listener went, or the handle did):
+            // no `Ready`, and the loop below would only close what is closed.
+            return;
+        }
+        self.shared.emit_start(HostEvent::Ready {
             code: self.code.clone(),
         });
 
