@@ -38,7 +38,7 @@ pub const MAX_QUEUED_RELIABLE: usize = 256;
 pub const MAX_QUEUED_LOSSY: usize = 64;
 /// How long a kicked peer's connection stays open so a last message flushes.
 const KICK_FLUSH: Duration = Duration::from_millis(250);
-const UPNP_RENEW_CHECK: Duration = Duration::from_secs(60);
+pub(crate) const UPNP_RENEW_CHECK: Duration = Duration::from_secs(60);
 /// Most invites a host holds at once ([`HostHandle::add_invite`]). Each costs
 /// two relay tags in the host's one standing subscription.
 pub const MAX_INVITES: usize = 256;
@@ -100,6 +100,9 @@ struct Tokens {
     /// From each live invite, for today and yesterday (online hosts only).
     /// Installed by the host task; `remove_invite` strips a row at once.
     invites: Vec<(InviteId, [u8; 32])>,
+    /// From each listener-level invite while this room is its app's invite
+    /// target ([`crate::Listener::add_invite`]); empty otherwise.
+    keep_invites: Vec<(InviteId, [u8; 32])>,
 }
 
 fn random_token() -> [u8; 32] {
@@ -139,7 +142,19 @@ pub(crate) struct Shared {
     invites: Mutex<HashMap<InviteId, [u8; 32]>>,
     open: AtomicBool,
     max_peers: usize,
-    next_peer: AtomicU32,
+    /// Shared by every room on one listener, so peer ids are unique on the
+    /// endpoint.
+    next_peer: Arc<AtomicU32>,
+    /// The room has shut down (or its task ended): nobody is seated in it any
+    /// more. Set under the peer lock.
+    retired: AtomicBool,
+    /// The current room code ([`HostHandle::rotate_code`] changes it). Lock
+    /// this before `tokens` when holding both.
+    code: Mutex<String>,
+    /// What the room announces in its answers ([`HostHandle::announced`]).
+    announced: Mutex<Vec<Candidate>>,
+    /// The listener this room shares, if any, and the room's id on it.
+    pub(crate) seat: Option<crate::listener::Seat>,
     ev_tx: Mutex<mpsc::Sender<Queued<HostEvent>>>,
     relays_up: AtomicUsize,
     relays_total: AtomicUsize,
@@ -294,7 +309,7 @@ impl Shared {
     /// Every token a hello may prove, in precedence order: the LAN token, the
     /// code's, then each invite's. A hello that proves several is credited to
     /// the first.
-    fn admission_tokens(&self) -> Vec<(Admission, [u8; 32])> {
+    pub(crate) fn admission_tokens(&self) -> Vec<(Admission, [u8; 32])> {
         self.tokens
             .lock()
             .map(|t| {
@@ -303,6 +318,7 @@ impl Shared {
                     .chain(
                         t.invites
                             .iter()
+                            .chain(t.keep_invites.iter())
                             .map(|(id, token)| (Admission::Invite(*id), *token)),
                     )
                     .collect()
@@ -329,6 +345,40 @@ impl Shared {
         peers.remove(&peer);
         Some(link)
     }
+    /// The room is going: nobody is seated from now on (a handshake still
+    /// running is refused at its seat), and it leaves its listener.
+    pub(crate) fn retire(&self) {
+        {
+            // Under the peer lock, as every seat is taken: a handshake seated
+            // before this is closed with the rest; one after sees the flag.
+            let _held = self.peers.lock();
+            self.retired.store(true, Ordering::Release);
+        }
+        if let Some(seat) = &self.seat {
+            seat.leave();
+        }
+    }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// The current room code.
+    pub(crate) fn current_code(&self) -> String {
+        self.code.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Strip listener-level invite tokens (all of them, or `only` that one):
+    /// a hello proving them is refused from now on, here and at the seat.
+    pub(crate) fn strip_keep_invites(&self, only: Option<InviteId>) {
+        if let Ok(mut t) = self.tokens.lock() {
+            match only {
+                Some(id) => t.keep_invites.retain(|(i, _)| *i != id),
+                None => t.keep_invites.clear(),
+            }
+        }
+    }
+
     /// Close every connection (host gone).
     pub(crate) fn close_all(&self, code: u32, why: &'static [u8]) {
         let links: Vec<Link> = self
@@ -357,6 +407,9 @@ pub(crate) enum Cmd {
     SetOpen(bool),
     /// The set of live invites changed: derive, subscribe, install.
     InvitesChanged,
+    /// The room code changed ([`HostHandle::rotate_code`]): derive, subscribe,
+    /// install the new one.
+    CodeChanged,
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -523,10 +576,52 @@ where
     F: FnOnce(String, RoomInfo, Arc<Shared>, tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let code = pinned
-        .as_ref()
-        .map(|(code, _)| code.clone())
-        .unwrap_or_else(crate::room::generate_code);
+    start_host_with(
+        id,
+        room,
+        host_has_player,
+        relays_total,
+        path_override,
+        app_tag,
+        app_binding_label,
+        limits,
+        pinned,
+        None,
+        task,
+    )
+}
+
+/// [`start_host`], for a room on a shared listener when `placement` is set
+/// (its code, its seat on the listener and the listener's peer numbering).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_host_with<F, Fut>(
+    id: &Identity,
+    room: RoomInfo,
+    host_has_player: bool,
+    relays_total: usize,
+    path_override: Option<PathKind>,
+    app_tag: String,
+    app_binding_label: Option<String>,
+    limits: crate::ReliableLimits,
+    pinned: Option<(String, crate::migration::EndpointPolicy)>,
+    placement: Option<crate::listener::Placement>,
+    task: F,
+) -> HostHandle
+where
+    F: FnOnce(String, RoomInfo, Arc<Shared>, tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (code, seat, next_peer) = match placement {
+        Some(p) => (p.code, Some(p.seat), p.next_peer),
+        None => (
+            pinned
+                .as_ref()
+                .map(|(code, _)| code.clone())
+                .unwrap_or_else(crate::room::generate_code),
+            None,
+            Arc::new(AtomicU32::new(1)),
+        ),
+    };
     let (ev_tx, ev_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let max_players = room.max_players.clamp(2, MAX_PLAYERS);
@@ -549,11 +644,16 @@ where
             lan: random_token(),
             code: Vec::new(),
             invites: Vec::new(),
+            keep_invites: Vec::new(),
         }),
         invites: Mutex::new(HashMap::new()),
         open: AtomicBool::new(pinned.is_none()),
         max_peers: max_players as usize - usize::from(host_has_player),
-        next_peer: AtomicU32::new(1),
+        next_peer,
+        retired: AtomicBool::new(false),
+        code: Mutex::new(code.clone()),
+        announced: Mutex::new(Vec::new()),
+        seat,
         ev_tx: Mutex::new(ev_tx),
         relays_up: AtomicUsize::new(0),
         relays_total: AtomicUsize::new(relays_total),
@@ -588,6 +688,7 @@ where
         {
             log::error!("[host] host task panicked; closing the room");
             s.open.store(false, Ordering::Relaxed);
+            s.retire();
             s.close_all(close::HOST_SHUTDOWN, b"host failed");
             s.emit(HostEvent::Failed {
                 reason: "internal error".into(),
@@ -894,9 +995,98 @@ impl HostHandle {
         removed
     }
 
-    /// The room code (also delivered in `Ready`).
+    /// The room code (also delivered in `Ready`, and changed by
+    /// [`rotate_code`](Self::rotate_code)).
     pub fn code(&self) -> &str {
         &self.code
+    }
+
+    /// Give the room a new code, for new joiners only: nobody already in the
+    /// room is dropped. Returns the new code (also from [`code`](Self::code)).
+    ///
+    /// From the moment this returns, a hello proving the old code is
+    /// refused, and so is one already mid-handshake (checked again at the
+    /// seat), and the LAN admission token is rotated too, so a beacon heard
+    /// before does not admit anyone later. The room answers the new code on
+    /// the relays a moment later, on the host's task (the code is stretched,
+    /// as at the UTC midnight roll, which this reuses). A room on a
+    /// [`Listener`](crate::Listener) never gets a code another room of its app
+    /// holds there.
+    ///
+    /// Refused while a migration session is pinned: its descriptor names the
+    /// code.
+    pub fn rotate_code(&mut self) -> Result<String, String> {
+        if self.shut.load(Ordering::Relaxed) || self.shared.is_retired() {
+            return Err("the room is shut down".into());
+        }
+        if self
+            .shared
+            .session_policy
+            .lock()
+            .map(|p| p.is_some())
+            .unwrap_or(true)
+        {
+            return Err("a pinned session keeps its room code".into());
+        }
+        let old = self.code.clone();
+        let install = |new: &str| {
+            if let Ok(mut code) = self.shared.code.lock() {
+                *code = new.to_string();
+                if let Ok(mut t) = self.shared.tokens.lock() {
+                    t.code.clear();
+                    t.lan = random_token();
+                }
+            }
+        };
+        let new = match &self.shared.seat {
+            Some(seat) => seat.fresh_code(&self.shared.app_tag, &old, install)?,
+            None => {
+                let mut new = crate::room::generate_code();
+                while new == old {
+                    new = crate::room::generate_code();
+                }
+                install(&new);
+                new
+            }
+        };
+        self.code = new.clone();
+        let _ = self.cmd_tx.send(Cmd::CodeChanged);
+        Ok(new)
+    }
+
+    /// Make this room its app's target for listener-level invites
+    /// ([`Listener::add_invite`](crate::Listener::add_invite)), or stop it
+    /// being one. At most one room per app is the target: setting one clears
+    /// the previous. An invite join then lands here, reported as
+    /// [`Admission::Invite`]; with no target, invite joins are refused as for
+    /// an invite that is not live. The previous target stops admitting those
+    /// invites at once (a handshake it had mid-way is refused at the seat);
+    /// this room answers them a moment later, on its task. Only for a room on
+    /// a listener.
+    pub fn set_invite_target(&self, target: bool) -> Result<(), String> {
+        match &self.shared.seat {
+            Some(seat) => seat.set_target(&self.shared, target),
+            None => Err("only a room on a listener takes listener invites".into()),
+        }
+    }
+
+    /// Whether this room is its app's target for listener-level invites.
+    pub fn is_invite_target(&self) -> bool {
+        self.shared.seat.as_ref().is_some_and(|s| s.is_target())
+    }
+
+    /// The candidates this room announces in its answers, as gathered when it
+    /// started listening (the same list the `[host] listening on` log line
+    /// prints): the discovered ones, then the configured
+    /// [`advertise`](crate::NetConfig::advertise) addresses. Empty until
+    /// `Ready`. A room on a [`Listener`](crate::Listener) announces the
+    /// listener's.
+    pub fn announced(&self) -> Vec<Candidate> {
+        self.shared
+            .announced
+            .lock()
+            .map(|a| a.clone())
+            .unwrap_or_default()
     }
 
     pub fn poll(&self) -> Option<HostEvent> {
@@ -1072,6 +1262,14 @@ impl HostHandle {
     fn link(&self, peer: PeerId) -> Option<Link> {
         self.shared.peers.lock().ok()?.get(&peer).cloned()
     }
+
+    pub(crate) fn shared_arc(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
+    }
+
+    pub(crate) fn cmd_sender(&self) -> tokio::sync::mpsc::UnboundedSender<Cmd> {
+        self.cmd_tx.clone()
+    }
 }
 
 impl Drop for HostHandle {
@@ -1080,13 +1278,13 @@ impl Drop for HostHandle {
     }
 }
 
-struct HostTask {
-    cfg: NetConfig,
-    room: RoomInfo,
-    code: String,
-    shared: Arc<Shared>,
+pub(crate) struct HostTask {
+    pub(crate) cfg: NetConfig,
+    pub(crate) room: RoomInfo,
+    pub(crate) code: String,
+    pub(crate) shared: Arc<Shared>,
     /// Tests pin the UTC day; otherwise it follows the clock.
-    fixed_day: Option<u64>,
+    pub(crate) fixed_day: Option<u64>,
 }
 
 /// Answered offers, keyed by `(session, offer signer)`.
@@ -1105,29 +1303,42 @@ struct Answered {
     targets: Vec<SocketAddr>,
 }
 
+/// What a room answers and punches with: its own endpoint's, or its
+/// listener's.
+struct Net {
+    /// The endpoints this room accepts on itself (none on a listener).
+    endpoint: Option<quinn::Endpoint>,
+    online_ep: Option<quinn::Endpoint>,
+    candidates: Vec<Candidate>,
+    announced: Vec<Candidate>,
+    punchers: Punchers,
+    local: Option<SocketAddr>,
+    online: Option<SocketAddr>,
+    mapping: Arc<Mutex<Option<crate::nat::upnp::PortMapping>>>,
+}
+
 impl HostTask {
-    async fn run(
-        self,
-        relay: Option<Box<dyn RendezvousRelay>>,
-        mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
-    ) {
-        let live = match self.cfg.checked() {
-            Ok(l) => l,
-            Err(e) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                return;
-            }
-        };
-        let advertised = match self.cfg.advertised() {
-            Ok(a) => a,
-            Err(e) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                return;
-            }
-        };
+    /// Bind and gather (a room of its own), or take the listener's.
+    async fn net(&self, relay_present: bool) -> Result<Net, String> {
+        // A room on a shared listener takes the listener's; any other binds
+        // and owns its own endpoint.
+        if let Some(l) = self.shared.seat.as_ref().map(|s| s.listener()) {
+            return Ok(Net {
+                endpoint: None,
+                online_ep: None,
+                candidates: l.candidates.clone(),
+                announced: l.announced.clone(),
+                punchers: l.punchers.clone(),
+                local: l.local,
+                online: l.online,
+                mapping: Arc::new(Mutex::new(None)),
+            });
+        }
+        let live = self.cfg.checked()?;
+        let advertised = self.cfg.advertised()?;
         let only = self.cfg.advertise_only;
-        let online = upnp_wanted(relay.is_some(), self.cfg.vpn_active) && !only;
-        let prep = match prepare_advertising(
+        let online = upnp_wanted(relay_present, self.cfg.vpn_active) && !only;
+        let prep = prepare_advertising(
             self.cfg.quic_port,
             online,
             self.cfg.stun.clone(),
@@ -1137,14 +1348,7 @@ impl HostTask {
                 only,
             },
         )
-        .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                return;
-            }
-        };
+        .await?;
         let announced = prep.announced();
         // With a LAN hook there are two endpoints: the LAN one (hooked; its
         // port goes in the LAN candidates and the beacon) and the online one
@@ -1153,32 +1357,70 @@ impl HostTask {
             Some(lan) => (lan, Some(prep.socket)),
             None => (prep.socket, None),
         };
-        let endpoint = match quic::server_endpoint(lan_socket, &self.cfg.app_tag, live) {
-            Ok(ep) => ep,
-            Err(e) => {
-                self.shared.emit(HostEvent::Failed { reason: e });
-                return;
-            }
-        };
+        let endpoint = quic::server_endpoint(lan_socket, &self.cfg.app_tag, live)?;
         let online_ep =
             match online_socket.map(|s| quic::server_endpoint(s, &self.cfg.app_tag, live)) {
                 Some(Ok(ep)) => Some(ep),
-                Some(Err(e)) => {
-                    self.shared.emit(HostEvent::Failed { reason: e });
-                    return;
-                }
+                Some(Err(e)) => return Err(e),
                 None => None,
             };
-        let local = endpoint.local_addr().ok();
+        Ok(Net {
+            local: endpoint.local_addr().ok(),
+            online: online_ep.as_ref().and_then(|e| e.local_addr().ok()),
+            endpoint: Some(endpoint),
+            online_ep,
+            candidates: prep.candidates,
+            announced,
+            punchers: Punchers {
+                online: Arc::new(prep.punch_socket),
+                lan: prep.lan_punch_socket.map(Arc::new),
+            },
+            mapping: Arc::new(Mutex::new(prep.mapping)),
+        })
+    }
+
+    pub(crate) async fn run(
+        mut self,
+        relay: Option<Box<dyn RendezvousRelay>>,
+        mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
+    ) {
+        if let Err(e) = self.cfg.checked().and_then(|_| self.cfg.advertised()) {
+            self.shared.emit(HostEvent::Failed { reason: e });
+            self.shared.retire();
+            return;
+        }
+        let only = self.cfg.advertise_only;
+        let net = match self.net(relay.is_some()).await {
+            Ok(n) => n,
+            Err(e) => {
+                self.shared.emit(HostEvent::Failed { reason: e });
+                self.shared.retire();
+                return;
+            }
+        };
+        let Net {
+            endpoint,
+            online_ep,
+            candidates,
+            announced,
+            punchers,
+            local,
+            online,
+            mapping,
+        } = net;
         if let Ok(mut a) = self.shared.local_addr.lock() {
             *a = local;
         }
         if let Ok(mut a) = self.shared.online_addr.lock() {
-            *a = online_ep.as_ref().and_then(|e| e.local_addr().ok());
+            *a = online;
         }
+        if let Ok(mut a) = self.shared.announced.lock() {
+            *a = announced.clone();
+        }
+        self.code = self.shared.current_code();
         log::info!(
             "[host] listening on {local:?} (online {:?}), code {}, candidates {:?}",
-            online_ep.as_ref().and_then(|e| e.local_addr().ok()),
+            online,
             self.code,
             announced
         );
@@ -1192,15 +1434,21 @@ impl HostTask {
         let mut code_secrets: Vec<RoomSecrets> = Vec::new();
         let mut invite_rooms: HashMap<InviteId, Vec<RoomSecrets>> = HashMap::new();
         if relay.is_some() {
-            code_secrets = match derive_days(&self.cfg.app_tag, &self.code, day).await {
-                Ok(s) => s,
+            // A rotation while this ran is caught by its `CodeChanged`.
+            code_secrets = match self.derive_code(day).await {
+                Ok((code, s)) => {
+                    self.install_code(&code, &s);
+                    s
+                }
                 Err(e) => {
                     self.shared.emit(HostEvent::Failed { reason: e });
+                    self.shared.retire();
                     return;
                 }
             };
+        } else {
+            self.set_code_tokens(&code_secrets);
         }
-        self.set_code_tokens(&code_secrets);
         if relay.is_some() {
             self.sync_invites(&mut invite_rooms, day);
         }
@@ -1218,16 +1466,11 @@ impl HostTask {
             })));
             let _ = r.subscribe(filter.clone());
         }
-        let mapping = Arc::new(Mutex::new(prep.mapping));
         let mut last_upnp_check = Instant::now();
         self.shared.emit(HostEvent::Ready {
             code: self.code.clone(),
         });
 
-        let punchers = Punchers {
-            online: Arc::new(prep.punch_socket),
-            lan: prep.lan_punch_socket.map(Arc::new),
-        };
         let mut beacon = BeaconSender::new(self.cfg.lan_port, self.cfg.lan_socket_hook.as_ref());
         let mut last_beacon = Instant::now() - BEACON_EVERY;
         let mut tick = tokio::time::interval(Duration::from_millis(25));
@@ -1238,7 +1481,12 @@ impl HostTask {
 
         loop {
             tokio::select! {
-                incoming = endpoint.accept() => {
+                incoming = async {
+                    match &endpoint {
+                        Some(ep) => ep.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let Some(incoming) = incoming else { break };
                     // The hooked LAN endpoint answers around the VPN, so it
                     // serves local sources only; the online endpoint takes
@@ -1273,6 +1521,32 @@ impl HostTask {
                             }
                         }
                     }
+                    Some(Cmd::CodeChanged) => {
+                        // The handle already stripped the old code's tokens.
+                        if let Some(r) = &relay {
+                            match self.derive_code(day).await {
+                                Ok((code, s)) => {
+                                    // A later rotation sent its own
+                                    // `CodeChanged`: only the current code
+                                    // is installed.
+                                    if self.install_code(&code, &s) {
+                                        code_secrets = s;
+                                        secrets = all_rooms(&code_secrets, &invite_rooms);
+                                        if let Ok(mut k) = accept_keys.lock() {
+                                            *k = secrets.clone();
+                                        }
+                                        filter = offer_filter(&secrets);
+                                        if self.is_open() {
+                                            let _ = r.subscribe(filter.clone());
+                                        }
+                                        log::info!("[host] room code changed");
+                                    }
+                                }
+                                Err(e) => log::warn!("[host] new code: {e}"),
+                            }
+                        }
+                        self.code = self.shared.current_code();
+                    }
                     Some(Cmd::SetOpen(open)) => {
                         if let Some(r) = &relay {
                             let _ = if open { r.subscribe(filter.clone()) } else { r.unsubscribe() };
@@ -1290,11 +1564,17 @@ impl HostTask {
                         let now_day = self.today();
                         if now_day > day {
                             // Midnight UTC: roll to the new today + yesterday.
-                            match derive_days(&self.cfg.app_tag, &self.code, now_day).await {
-                                Ok(s) => {
+                            match self.derive_code(now_day).await {
+                                Ok((code, s)) => {
                                     day = now_day;
-                                    code_secrets = s;
-                                    self.set_code_tokens(&code_secrets);
+                                    // A rotation meanwhile leaves the old
+                                    // code's tokens out; its own
+                                    // `CodeChanged` derives the new one.
+                                    if self.install_code(&code, &s) {
+                                        code_secrets = s;
+                                    } else {
+                                        code_secrets.clear();
+                                    }
                                     // The invites roll with the code.
                                     invite_rooms.clear();
                                     self.sync_invites(&mut invite_rooms, day);
@@ -1317,7 +1597,7 @@ impl HostTask {
                         while let Some(ev) = r.try_recv() {
                             if seen.len() > 4096 { seen.clear(); }
                             if !seen.insert(ev.id) { continue; }
-                            self.on_offer(&ev, &secrets, r.as_ref(), &prep.candidates, &mut offers, &punchers, open);
+                            self.on_offer(&ev, &secrets, r.as_ref(), &candidates, &mut offers, &punchers, open);
                         }
                     }
                     // An advertise-only host announces nothing it discovered: no beacon.
@@ -1364,8 +1644,13 @@ impl HostTask {
         }
 
         // Shutdown: tell every peer the host left, then let the closes flush.
+        // A room on a listener leaves it first, so no handshake still running
+        // is seated after the close.
+        self.shared.retire();
         self.shared.close_all(close::HOST_SHUTDOWN, b"host left");
-        endpoint.close(close::HOST_SHUTDOWN.into(), b"host left");
+        if let Some(ep) = &endpoint {
+            ep.close(close::HOST_SHUTDOWN.into(), b"host left");
+        }
         if let Some(ep) = &online_ep {
             ep.close(close::HOST_SHUTDOWN.into(), b"host left");
         }
@@ -1377,11 +1662,18 @@ impl HostTask {
             .and_then(|mut g| g.take())
             .map(|m| tokio::task::spawn_blocking(move || m.remove()));
         let idle = async {
-            tokio::join!(endpoint.wait_idle(), async {
-                if let Some(ep) = &online_ep {
-                    ep.wait_idle().await;
+            tokio::join!(
+                async {
+                    if let Some(ep) = &endpoint {
+                        ep.wait_idle().await;
+                    }
+                },
+                async {
+                    if let Some(ep) = &online_ep {
+                        ep.wait_idle().await;
+                    }
                 }
-            });
+            );
         };
         let _ = tokio::time::timeout(Duration::from_millis(500), idle).await;
         if let Some(r) = &relay {
@@ -1437,11 +1729,29 @@ impl HostTask {
     /// it when the day rolls. Done under the invite lock, so an invite
     /// removed meanwhile is not resurrected.
     fn sync_invites(&self, rooms: &mut HashMap<InviteId, Vec<RoomSecrets>>, day: u64) {
+        match &self.shared.seat {
+            // The listener's invites, while this room is its app's target;
+            // the listener's lock is held throughout (taken before the room's).
+            Some(seat) => seat.with_target_invites(&self.cfg.app_tag, |keep| {
+                self.sync_invites_with(rooms, day, keep)
+            }),
+            None => self.sync_invites_with(rooms, day, &HashMap::new()),
+        }
+    }
+
+    /// [`Self::sync_invites`], with `keep` the listener-level invites this
+    /// room answers (empty unless it is its app's invite target).
+    fn sync_invites_with(
+        &self,
+        rooms: &mut HashMap<InviteId, Vec<RoomSecrets>>,
+        day: u64,
+        keep: &HashMap<InviteId, [u8; 32]>,
+    ) {
         let Ok(live) = self.shared.invites.lock() else {
             return;
         };
-        rooms.retain(|id, _| live.contains_key(id));
-        for (id, secret) in live.iter() {
+        rooms.retain(|id, _| live.contains_key(id) || keep.contains_key(id));
+        for (id, secret) in live.iter().chain(keep.iter()) {
             if rooms.contains_key(id) {
                 continue;
             }
@@ -1453,11 +1763,37 @@ impl HostTask {
             }
         }
         if let Ok(mut t) = self.shared.tokens.lock() {
-            t.invites = rooms
-                .iter()
-                .flat_map(|(id, rs)| rs.iter().map(move |r| (*id, r.admit)))
-                .collect();
+            let tokens = |of: &dyn Fn(&InviteId) -> bool| -> Vec<(InviteId, [u8; 32])> {
+                rooms
+                    .iter()
+                    .filter(|(id, _)| of(id))
+                    .flat_map(|(id, rs)| rs.iter().map(move |r| (*id, r.admit)))
+                    .collect()
+            };
+            t.invites = tokens(&|id| live.contains_key(id));
+            t.keep_invites = tokens(&|id| keep.contains_key(id));
         }
+    }
+
+    /// The current code's secrets for `day` and the day before, with the
+    /// code they were derived for.
+    async fn derive_code(&self, day: u64) -> Result<(String, Vec<RoomSecrets>), String> {
+        let code = self.shared.current_code();
+        let secrets = derive_days(&self.cfg.app_tag, &code, day).await?;
+        Ok((code, secrets))
+    }
+
+    /// Install `secrets`' admission tokens if `code` is still the room's
+    /// code (a rotation meanwhile wins). Whether they were installed.
+    fn install_code(&self, code: &str, secrets: &[RoomSecrets]) -> bool {
+        let Ok(current) = self.shared.code.lock() else {
+            return false;
+        };
+        if *current != code {
+            return false;
+        }
+        self.set_code_tokens(secrets);
+        true
     }
 
     fn set_code_tokens(&self, secrets: &[RoomSecrets]) {
@@ -1666,6 +2002,7 @@ pub(crate) fn current_candidates(
 /// Clones of the QUIC sockets that send punches. Targets on the local network
 /// go out of the LAN endpoint's socket (hooked, so a VPN doesn't swallow them);
 /// everything else goes out of the online one, over the phone's normal route.
+#[derive(Clone)]
 pub(crate) struct Punchers {
     pub(crate) online: Arc<UdpSocket>,
     /// Present only with a LAN socket hook (two endpoints).
@@ -1965,7 +2302,9 @@ fn seat_refusal(shared: &Shared, peers: &HashMap<PeerId, Link>) -> Option<u32> {
     } else {
         shared.max_peers
     };
-    if session.is_none() && !shared.open.load(Ordering::Relaxed) {
+    if shared.retired.load(Ordering::Acquire) {
+        Some(close::HOST_SHUTDOWN)
+    } else if session.is_none() && !shared.open.load(Ordering::Relaxed) {
         Some(close::CLOSED)
     } else if peers.len() >= capacity {
         Some(close::FULL)
@@ -1983,6 +2322,45 @@ fn seat_refusal(shared: &Shared, peers: &HashMap<PeerId, Link>) -> Option<u32> {
 /// says who it is only after verifying that welcome, and is checked against
 /// the kick deny-list and seated only then.
 pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) {
+    accept_arriving(Arriving::Incoming(incoming), shared).await
+}
+
+/// A connection on its way to a room's seat.
+#[allow(clippy::large_enum_variant)] // short-lived, one per connection
+pub(crate) enum Arriving {
+    /// Straight off the room's own endpoint: not yet accepted.
+    Incoming(quinn::Incoming),
+    /// Accepted by a shared listener, which read the hello to find the room
+    /// whose tokens it proves. The room checks it again, as its own.
+    Demuxed {
+        conn: quinn::Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        hello: Box<quic::Hello>,
+        /// When the listener accepted it: the handshake deadline runs from here.
+        started: tokio::time::Instant,
+    },
+}
+
+impl Arriving {
+    fn remote(&self) -> SocketAddr {
+        match self {
+            Arriving::Incoming(i) => i.remote_address(),
+            Arriving::Demuxed { conn, .. } => conn.remote_address(),
+        }
+    }
+
+    /// Turn it away before any handshake work for this room.
+    fn refuse(self, code: u32) {
+        match self {
+            Arriving::Incoming(i) => i.refuse(),
+            Arriving::Demuxed { conn, .. } => conn.close(code.into(), b"refused"),
+        }
+    }
+}
+
+/// [`accept_peer`] for a connection from either source.
+pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
     struct PendingSlot(Arc<Shared>);
     impl Drop for PendingSlot {
         fn drop(&mut self) {
@@ -1994,20 +2372,20 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
     // it closes them (`preempted` below).
     let (policy, generation, slot, mut generation_rx) = {
         let Ok(_peers) = shared.peers.lock() else {
-            incoming.refuse();
+            arriving.refuse(close::CLOSED);
             return;
         };
         let policy = match shared.session_policy.lock() {
             Ok(p) => p.clone(),
             Err(_) => {
-                incoming.refuse();
+                arriving.refuse(close::CLOSED);
                 return;
             }
         };
         let count = shared.pending_handshakes.fetch_add(1, Ordering::AcqRel);
         if policy.is_some() && count >= 2 {
             shared.pending_handshakes.fetch_sub(1, Ordering::AcqRel);
-            incoming.refuse();
+            arriving.refuse(close::FULL);
             return;
         }
         (
@@ -2021,23 +2399,43 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
     // handshake with a code (dropping it would close it without one).
     let accepted: Mutex<Option<quinn::Connection>> = Mutex::new(None);
     // Shown as IPv4 when the joiner is IPv4 (it arrives v4-mapped).
-    let remote = crate::nat::addr::canonical(incoming.remote_address());
+    let remote = crate::nat::addr::canonical(arriving.remote());
+    let started = match &arriving {
+        Arriving::Demuxed { started, .. } => *started,
+        Arriving::Incoming(_) => tokio::time::Instant::now(),
+    };
     let setup = async {
-        let conn = incoming
-            .accept()
-            .map_err(|e| e.to_string())?
-            .await
-            .map_err(|e| e.to_string())?;
-        if let Ok(mut accepted) = accepted.lock() {
-            *accepted = Some(conn.clone());
-        }
         let refuse = |conn: &quinn::Connection, code: u32, why: String| {
             conn.close(code.into(), why.as_bytes());
             Err(why)
         };
-        let (mut send, mut recv, hello) = match quic::server_read_hello(&conn).await {
-            Ok(x) => x,
-            Err((code, why)) => return refuse(&conn, code, why),
+        let (conn, mut send, mut recv, hello) = match arriving {
+            Arriving::Incoming(incoming) => {
+                let conn = incoming
+                    .accept()
+                    .map_err(|e| e.to_string())?
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Ok(mut accepted) = accepted.lock() {
+                    *accepted = Some(conn.clone());
+                }
+                match quic::server_read_hello(&conn).await {
+                    Ok((send, recv, hello)) => (conn, send, recv, hello),
+                    Err((code, why)) => return refuse(&conn, code, why),
+                }
+            }
+            Arriving::Demuxed {
+                conn,
+                send,
+                recv,
+                hello,
+                ..
+            } => {
+                if let Ok(mut accepted) = accepted.lock() {
+                    *accepted = Some(conn.clone());
+                }
+                (conn, send, recv, *hello)
+            }
         };
         // Admission: the hello must prove the room code, an invite or the LAN
         // token before anything about this host is sent.
@@ -2167,12 +2565,13 @@ pub(crate) async fn accept_peer(incoming: quinn::Incoming, shared: Arc<Shared>) 
             std::future::pending::<()>().await;
         }
     };
-    let timed = tokio::time::timeout(
-        if policy.is_some() {
-            quic::SESSION_HANDSHAKE_DEADLINE
-        } else {
-            quic::HANDSHAKE_TIMEOUT
-        },
+    let timed = tokio::time::timeout_at(
+        started
+            + if policy.is_some() {
+                quic::SESSION_HANDSHAKE_DEADLINE
+            } else {
+                quic::HANDSHAKE_TIMEOUT
+            },
         setup,
     );
     let outcome = tokio::select! {

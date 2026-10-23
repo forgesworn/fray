@@ -26,6 +26,7 @@ mod host;
 mod identity;
 pub mod ifaces;
 mod lan;
+mod listener;
 pub mod migration;
 pub mod nat;
 pub mod netbind;
@@ -42,6 +43,7 @@ pub use client::{
 pub use host::{HostHandle, MAX_INVITES};
 pub use identity::{npub_of, Identity};
 pub use lan::{lan_browse, LanBrowser};
+pub use listener::{Listener, ListenerConfig};
 pub use netbind::{check_lan_binding, lan_blocked, LanBindError, LanSocketHook, VPN_BLOCKS_LAN};
 pub use room::{generate_invite_secret, InviteId};
 pub use virt::{
@@ -359,30 +361,12 @@ impl NetConfig {
     /// starts (a joiner's config is not held to it): see the field for the
     /// rules.
     pub(crate) fn advertised(&self) -> Result<Vec<rendezvous::Candidate>, String> {
-        if self.advertise_only && self.advertise.is_empty() {
-            return Err("advertise_only is set but advertise is empty".into());
-        }
-        let list = nat::candidates::advertised_candidates(&self.advertise)?;
-        if self.lan_socket_hook.is_some() {
-            // The hooked endpoint serves `is_lan_ip` sources only, which
-            // leaves out carrier-NAT (100.64/10) as well as public ones.
-            let local = |c: &rendezvous::Candidate| {
-                c.addr
-                    .parse::<SocketAddr>()
-                    .is_ok_and(|a| nat::candidates::is_lan_ip(a.ip()))
-            };
-            if let Some(c) = list.iter().find(|c| !local(c)) {
-                return Err(format!(
-                    "advertise {}: with a lan_socket_hook the host's QUIC port is bound for \
-                     local peers only, so only private and unique-local addresses can be announced",
-                    c.addr
-                ));
-            }
-        }
-        if !list.is_empty() && self.quic_port == 0 {
-            return Err("advertise is set but quic_port is 0: a forward needs a fixed port".into());
-        }
-        Ok(list)
+        checked_advertise(
+            &self.advertise,
+            self.advertise_only,
+            self.lan_socket_hook.is_some(),
+            self.quic_port,
+        )
     }
 
     /// No relays and no STUN: a host or joiner that never touches the internet.
@@ -392,6 +376,40 @@ impl NetConfig {
         self.stun.clear();
         self
     }
+}
+
+/// The candidates for an `advertise` list, checked as
+/// [`NetConfig::advertise`] describes (a host's or a [`Listener`]'s).
+pub(crate) fn checked_advertise(
+    advertise: &[SocketAddr],
+    advertise_only: bool,
+    hooked: bool,
+    quic_port: u16,
+) -> Result<Vec<rendezvous::Candidate>, String> {
+    if advertise_only && advertise.is_empty() {
+        return Err("advertise_only is set but advertise is empty".into());
+    }
+    let list = nat::candidates::advertised_candidates(advertise)?;
+    if hooked {
+        // The hooked endpoint serves `is_lan_ip` sources only, which
+        // leaves out carrier-NAT (100.64/10) as well as public ones.
+        let local = |c: &rendezvous::Candidate| {
+            c.addr
+                .parse::<SocketAddr>()
+                .is_ok_and(|a| nat::candidates::is_lan_ip(a.ip()))
+        };
+        if let Some(c) = list.iter().find(|c| !local(c)) {
+            return Err(format!(
+                "advertise {}: with a lan_socket_hook the host's QUIC port is bound for \
+                 local peers only, so only private and unique-local addresses can be announced",
+                c.addr
+            ));
+        }
+    }
+    if !list.is_empty() && quic_port == 0 {
+        return Err("advertise is set but quic_port is 0: a forward needs a fixed port".into());
+    }
+    Ok(list)
 }
 
 /// Start hosting. Watch [`HostHandle::poll`] for `Ready` or `Failed`.

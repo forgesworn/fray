@@ -133,26 +133,62 @@ fn transport_config(live: Liveness) -> Arc<quinn::TransportConfig> {
     Arc::new(base_transport(live))
 }
 
+/// The self-signed certificate a server endpoint presents. It carries no
+/// identity (joiners verify the host in the signed welcome), so one is made
+/// per endpoint and kept when the endpoint's protocols change.
+pub(crate) struct ServerCert {
+    cert: rustls::pki_types::CertificateDer<'static>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl ServerCert {
+    pub(crate) fn generate() -> Result<ServerCert, String> {
+        let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
+            .map_err(|e| format!("certificate: {e}"))?;
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+            .map_err(|e| format!("key: {e}"))?;
+        Ok(ServerCert {
+            cert: cert_der,
+            key,
+        })
+    }
+}
+
 pub(crate) fn server_config(app_tag: &str, live: Liveness) -> Result<quinn::ServerConfig, String> {
-    let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
-        .map_err(|e| format!("certificate: {e}"))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
-        .map_err(|e| format!("key: {e}"))?;
+    server_config_for(&ServerCert::generate()?, vec![alpn(app_tag)], live)
+}
+
+/// A server config offering `alpns` (a shared endpoint offers every app it
+/// hosts; the client offers its one, and TLS refuses a client whose protocol
+/// is not in the list).
+pub(crate) fn server_config_for(
+    cert: &ServerCert,
+    alpns: Vec<Vec<u8>>,
+    live: Liveness,
+) -> Result<quinn::ServerConfig, String> {
     let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(|e| format!("tls: {e}"))?
     .with_no_client_auth()
-    .with_single_cert(vec![cert_der], key)
+    .with_single_cert(vec![cert.cert.clone()], cert.key.clone_key())
     .map_err(|e| format!("tls: {e}"))?;
-    crypto.alpn_protocols = vec![alpn(app_tag)];
+    crypto.alpn_protocols = alpns;
     let qc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|e| format!("quic tls: {e}"))?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(qc));
     cfg.transport_config(transport_config(live));
     Ok(cfg)
+}
+
+/// The application protocol a finished handshake settled on, if any.
+pub(crate) fn negotiated_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .protocol
 }
 
 pub(crate) fn client_config(app_tag: &str, live: Liveness) -> Result<quinn::ClientConfig, String> {
@@ -179,10 +215,18 @@ pub(crate) fn server_endpoint(
     app_tag: &str,
     live: Liveness,
 ) -> Result<quinn::Endpoint, String> {
+    server_endpoint_with(socket, server_config(app_tag, live)?)
+}
+
+/// [`server_endpoint`] with a config already made.
+pub(crate) fn server_endpoint_with(
+    socket: std::net::UdpSocket,
+    config: quinn::ServerConfig,
+) -> Result<quinn::Endpoint, String> {
     let runtime = quinn::default_runtime().ok_or("no async runtime")?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
-        Some(server_config(app_tag, live)?),
+        Some(config),
         socket,
         runtime,
     )

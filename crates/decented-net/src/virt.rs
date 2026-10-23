@@ -232,7 +232,7 @@ async fn run_host(
             cmd = cmd_rx.recv() => match cmd {
                 // The handle already applied the open state, and the token
                 // (rotated or kept); each new link reads the current one.
-                Some(Cmd::SetOpen(_) | Cmd::InvitesChanged) => {}
+                Some(Cmd::SetOpen(_) | Cmd::InvitesChanged | Cmd::CodeChanged) => {}
                 Some(Cmd::Shutdown(tx)) => { done = Some(tx); break; }
                 None => break,
             },
