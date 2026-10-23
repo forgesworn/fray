@@ -1436,10 +1436,9 @@ impl HostTask {
         if relay.is_some() {
             // A rotation while this ran is caught by its `CodeChanged`.
             code_secrets = match self.derive_code(day).await {
-                Ok((code, s)) => {
-                    self.install_code(&code, &s);
-                    s
-                }
+                // Only the room's current code is answered.
+                Ok((code, s)) if self.install_code(&code, &s) => s,
+                Ok(_) => Vec::new(),
                 Err(e) => {
                     self.shared.emit(HostEvent::Failed { reason: e });
                     self.shared.retire();
@@ -1467,6 +1466,7 @@ impl HostTask {
             let _ = r.subscribe(filter.clone());
         }
         let mut last_upnp_check = Instant::now();
+        self.code = self.shared.current_code();
         self.shared.emit(HostEvent::Ready {
             code: self.code.clone(),
         });
