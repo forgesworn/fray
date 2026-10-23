@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::host::{
@@ -233,9 +233,10 @@ impl ListenerShared {
     }
 }
 
-/// A room's place on its listener.
+/// A room's place on its listener. It holds the listener weakly: a room's
+/// handle can outlive the listener, and must not keep its socket bound.
 pub(crate) struct Seat {
-    listener: Arc<ListenerShared>,
+    listener: Weak<ListenerShared>,
     room: u64,
     app: String,
 }
@@ -248,13 +249,17 @@ pub(crate) struct Placement {
 }
 
 impl Seat {
-    pub(crate) fn listener(&self) -> &ListenerShared {
-        &self.listener
+    /// The listener, while it is alive.
+    pub(crate) fn listener(&self) -> Option<Arc<ListenerShared>> {
+        self.listener.upgrade()
     }
 
     /// Leave the listener: no longer demuxed to, no longer an invite target.
     pub(crate) fn leave(&self) {
-        let mut st = self.listener.lock();
+        let Some(listener) = self.listener() else {
+            return;
+        };
+        let mut st = listener.lock();
         if let Some(app) = st.app_mut(&self.app) {
             app.rooms.retain(|r| r.id != self.room);
             if app.target == Some(self.room) {
@@ -271,7 +276,10 @@ impl Seat {
         old: &str,
         install: impl FnOnce(&str),
     ) -> Result<String, String> {
-        let st = self.listener.lock();
+        let listener = self
+            .listener()
+            .ok_or_else(|| "the listener is shut down".to_string())?;
+        let st = listener.lock();
         let taken: Vec<String> = st
             .app(app_tag)
             .map(|a| {
@@ -288,14 +296,18 @@ impl Seat {
     }
 
     pub(crate) fn is_target(&self) -> bool {
-        self.listener
-            .lock()
-            .app(&self.app)
-            .is_some_and(|a| a.target == Some(self.room))
+        self.listener().is_some_and(|l| {
+            l.lock()
+                .app(&self.app)
+                .is_some_and(|a| a.target == Some(self.room))
+        })
     }
 
     pub(crate) fn set_target(&self, room: &Shared, on: bool) -> Result<(), String> {
-        let mut st = self.listener.lock();
+        let listener = self
+            .listener()
+            .ok_or_else(|| "the listener is shut down".to_string())?;
+        let mut st = listener.lock();
         if st.closed || room.is_retired() {
             return Err("the room is shut down".into());
         }
@@ -332,7 +344,10 @@ impl Seat {
         app_tag: &str,
         f: impl FnOnce(&HashMap<InviteId, [u8; 32]>) -> R,
     ) -> R {
-        let st = self.listener.lock();
+        let Some(listener) = self.listener() else {
+            return f(&HashMap::new());
+        };
+        let st = listener.lock();
         match st
             .app(app_tag)
             .filter(|a| a.target == Some(self.room) && a.room(self.room).is_some())
@@ -402,6 +417,11 @@ impl Listener {
     /// among this listener's rooms of `cfg.app_tag`; its `app_tag`'s protocol
     /// is registered on the endpoint if new. Several rooms may use the same
     /// [`Identity`]. Watch [`HostHandle::poll`] for `Ready` or `Failed`.
+    ///
+    /// The room is reachable as soon as this returns (its LAN token exists
+    /// and the listener's address is known), so a direct join can be seated,
+    /// and `PeerJoined` queued, before the room's `Ready`. A room of its own
+    /// ([`crate::host`]) has no endpoint before `Ready`, so there it cannot.
     pub fn host(&self, cfg: &NetConfig, id: &Identity, room: RoomInfo) -> HostHandle {
         let relay: Option<Box<dyn RendezvousRelay>> = if cfg.relays.is_empty() {
             None
@@ -459,7 +479,7 @@ impl Listener {
             .unwrap_or_default();
         let placement = Placement {
             seat: Seat {
-                listener: Arc::clone(&self.shared),
+                listener: Arc::downgrade(&self.shared),
                 room: room_id,
                 app: cfg.app_tag.clone(),
             },
@@ -513,7 +533,11 @@ impl Listener {
     /// must present the key the invite names). Returns the invite's id; the
     /// same secret again returns the same id. At most [`MAX_INVITES`] per
     /// app: beyond that this returns an error. These share the target room's
-    /// relay subscription with its own invites.
+    /// relay subscription with its own invites; the target room's one
+    /// subscription then carries its own invites' tags and these, up to
+    /// twice [`MAX_INVITES`] in all, so a Keep should hold a handful. Give
+    /// each room and the listener different secrets: if two rooms of an app
+    /// hold the same one, a join with it is credited to the room opened first.
     pub fn add_invite(&self, app_tag: &str, secret: [u8; 32]) -> Result<InviteId, String> {
         let id = InviteId::of(&secret);
         let mut st = self.shared.lock();
@@ -578,6 +602,13 @@ impl Listener {
 
     /// Close every room (each peer hears the host left), then the endpoint,
     /// and release the router mapping. Blocks for at most ~1 s.
+    ///
+    /// Each room's handle is told: its [`poll`](HostHandle::poll) yields
+    /// [`HostEvent::Failed`] with the reason "the listener shut down" (once;
+    /// the `PeerLeft` of its peers may come before or after it), and
+    /// [`HostHandle::is_closed`] is `true`. A room closed by its own handle's
+    /// `shutdown` or drop is not told, as it asked. The UDP port is freed
+    /// shortly after this returns, even while room handles are still held.
     pub fn shutdown(self) {
         self.shutdown_inner(Duration::from_millis(1000));
     }
@@ -599,7 +630,7 @@ impl Listener {
             .iter()
             .filter_map(|tx| {
                 let (ack, done) = mpsc::channel();
-                tx.send(Cmd::Shutdown(ack)).ok().map(|_| done)
+                tx.send(Cmd::ListenerShutdown(ack)).ok().map(|_| done)
             })
             .collect();
         for done in acks {
@@ -758,6 +789,8 @@ async fn run_listener(
     for room in rooms {
         room.retire();
         room.close_all(close::HOST_SHUTDOWN, b"host left");
+        // Once: a room whose task already said so does not say it twice.
+        room.tell_listener_closed();
     }
     endpoint.close(close::HOST_SHUTDOWN.into(), b"host left");
     if let Some(ep) = &online_ep {

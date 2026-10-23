@@ -233,7 +233,7 @@ async fn run_host(
                 // The handle already applied the open state, and the token
                 // (rotated or kept); each new link reads the current one.
                 Some(Cmd::SetOpen(_) | Cmd::InvitesChanged | Cmd::CodeChanged) => {}
-                Some(Cmd::Shutdown(tx)) => { done = Some(tx); break; }
+                Some(Cmd::Shutdown(tx) | Cmd::ListenerShutdown(tx)) => { done = Some(tx); break; }
                 None => break,
             },
         }

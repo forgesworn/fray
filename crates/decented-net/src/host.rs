@@ -148,6 +148,9 @@ pub(crate) struct Shared {
     /// The room has shut down (or its task ended): nobody is seated in it any
     /// more. Set under the peer lock.
     retired: AtomicBool,
+    /// The room's listener has told its handle that it closed the room
+    /// (once; see [`Shared::tell_listener_closed`]).
+    listener_closed: AtomicBool,
     /// The current room code ([`HostHandle::rotate_code`] changes it). Lock
     /// this before `tokens` when holding both.
     code: Mutex<String>,
@@ -363,6 +366,16 @@ impl Shared {
         self.retired.load(Ordering::Acquire)
     }
 
+    /// The room's listener closed it, not its own handle: say so once, so a
+    /// game or status page polling the handle learns the room is gone ([`HostEvent::Failed`]).
+    pub(crate) fn tell_listener_closed(&self) {
+        if !self.listener_closed.swap(true, Ordering::AcqRel) {
+            self.emit(HostEvent::Failed {
+                reason: "the listener shut down".into(),
+            });
+        }
+    }
+
     /// The current room code.
     pub(crate) fn current_code(&self) -> String {
         self.code.lock().map(|c| c.clone()).unwrap_or_default()
@@ -411,6 +424,9 @@ pub(crate) enum Cmd {
     /// install the new one.
     CodeChanged,
     Shutdown(mpsc::Sender<()>),
+    /// The room's listener is closing it: as `Shutdown`, then the handle is
+    /// told ([`Shared::tell_listener_closed`]) before the ack.
+    ListenerShutdown(mpsc::Sender<()>),
 }
 
 /// A hosted room. All methods return immediately.
@@ -651,6 +667,7 @@ where
         max_peers: max_players as usize - usize::from(host_has_player),
         next_peer,
         retired: AtomicBool::new(false),
+        listener_closed: AtomicBool::new(false),
         code: Mutex::new(code.clone()),
         announced: Mutex::new(Vec::new()),
         seat,
@@ -705,6 +722,12 @@ where
 }
 
 impl HostHandle {
+    /// Whether the room has ended: shut down, closed by its listener, or its
+    /// task failed. Nobody is seated in a closed room and it never recovers.
+    pub fn is_closed(&self) -> bool {
+        self.shared.is_retired()
+    }
+
     /// This endpoint's runtime identity. This does not attest a persona.
     pub fn runtime_key(&self) -> PublicKey {
         self.shared.host_keys.public_key()
@@ -731,6 +754,13 @@ impl HostHandle {
     /// ordinary joins anyway. Otherwise any LAN host could hold the pin off
     /// by opening a bare QUIC connection every few seconds.
     pub fn pin_session(&self, descriptor: crate::migration::Descriptor) -> Result<(), String> {
+        if self.shared.seat.is_some() {
+            // Admission of a pinned room (pending-handshake cap, refusals
+            // before the hello) is built on the room owning its endpoint; a
+            // listener reads the hello first. Until that is designed and
+            // tested, a room on a listener does not migrate.
+            return Err("a room on a listener cannot migrate".into());
+        }
         if self.shared.path_override == Some(PathKind::Virtual) {
             return Err("virtual migration is unsupported".into());
         }
@@ -1322,7 +1352,10 @@ impl HostTask {
     async fn net(&self, relay_present: bool) -> Result<Net, String> {
         // A room on a shared listener takes the listener's; any other binds
         // and owns its own endpoint.
-        if let Some(l) = self.shared.seat.as_ref().map(|s| s.listener()) {
+        if let Some(seat) = &self.shared.seat {
+            let l = seat
+                .listener()
+                .ok_or_else(|| "the listener is shut down".to_string())?;
             return Ok(Net {
                 endpoint: None,
                 online_ep: None,
@@ -1478,6 +1511,7 @@ impl HostTask {
         let mut seen: HashSet<nostr::EventId> = HashSet::new();
         let mut offers = Offers::default();
         let mut done: Option<mpsc::Sender<()>> = None;
+        let mut by_listener = false;
 
         loop {
             tokio::select! {
@@ -1556,6 +1590,7 @@ impl HostTask {
                         }
                     }
                     Some(Cmd::Shutdown(tx)) => { done = Some(tx); break; }
+                    Some(Cmd::ListenerShutdown(tx)) => { done = Some(tx); by_listener = true; break; }
                     None => break,
                 },
                 _ = tick.tick() => {
@@ -1648,6 +1683,9 @@ impl HostTask {
         // is seated after the close.
         self.shared.retire();
         self.shared.close_all(close::HOST_SHUTDOWN, b"host left");
+        if by_listener {
+            self.shared.tell_listener_closed();
+        }
         if let Some(ep) = &endpoint {
             ep.close(close::HOST_SHUTDOWN.into(), b"host left");
         }

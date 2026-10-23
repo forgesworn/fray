@@ -650,7 +650,9 @@ pub enum HostEvent {
     Ready {
         code: String,
     },
-    /// Hosting could not start at all.
+    /// Hosting could not start at all, or the room ended without its owner
+    /// asking (its task failed, or the [`Listener`] it was on shut down).
+    /// Nobody joins the room after it; [`HostHandle::is_closed`] is then `true`.
     Failed {
         reason: String,
     },
