@@ -94,6 +94,56 @@ pub fn req_frame(sub_id: &str, f: &TagFilter, since: u64) -> String {
     json!(["REQ", sub_id, filter]).to_string()
 }
 
+/// Most tag values one relay `REQ` carries. A longer standing subscription
+/// (a room holding many invites) goes out as several `REQ`s of at most this
+/// many, on every relay; one with this many or fewer is a single `REQ`, as
+/// ever.
+pub const MAX_TAGS_PER_REQ: usize = 16;
+
+/// The subscription id of the `i`th `REQ` of the standing subscription: the
+/// first is [`SUB_ID`] itself, so a small subscription is unchanged.
+fn chunk_sub_id(i: usize) -> String {
+    if i == 0 {
+        SUB_ID.to_string()
+    } else {
+        format!("{SUB_ID}{i}")
+    }
+}
+
+/// Whether `id` names one of the standing subscription's `REQ`s.
+fn is_standing_sub_id(id: &str) -> bool {
+    id.strip_prefix(SUB_ID)
+        .is_some_and(|rest| rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// How many `REQ`s a filter with `values` tag values takes (never fewer than one).
+fn req_count(values: usize) -> usize {
+    values.div_ceil(MAX_TAGS_PER_REQ).max(1)
+}
+
+/// The `(sub id, REQ frame)` pairs for a standing filter: its values split
+/// into chunks of at most [`MAX_TAGS_PER_REQ`].
+fn req_frames(f: &TagFilter, since: u64) -> Vec<(String, String)> {
+    (0..req_count(f.values.len()))
+        .map(|i| {
+            let part = TagFilter {
+                kind: f.kind,
+                letter: f.letter,
+                values: f
+                    .values
+                    .iter()
+                    .skip(i * MAX_TAGS_PER_REQ)
+                    .take(MAX_TAGS_PER_REQ)
+                    .cloned()
+                    .collect(),
+            };
+            let id = chunk_sub_id(i);
+            let frame = req_frame(&id, &part, since);
+            (id, frame)
+        })
+        .collect()
+}
+
 pub fn close_frame(sub_id: &str) -> String {
     json!(["CLOSE", sub_id]).to_string()
 }
@@ -103,19 +153,23 @@ pub fn event_frame(ev: &Event) -> String {
 }
 
 pub fn parse_frame(text: &str, sub_id: &str) -> Frame {
+    parse_frame_where(text, |id| id == sub_id)
+}
+
+fn parse_frame_where(text: &str, ours: impl Fn(&str) -> bool) -> Frame {
     let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(text) else {
         return Frame::Other;
     };
     let s = |i: usize| arr.get(i).and_then(|x| x.as_str());
     match arr.first().and_then(|x| x.as_str()) {
-        Some("EVENT") if s(1) == Some(sub_id) => match arr.get(2) {
+        Some("EVENT") if s(1).is_some_and(&ours) => match arr.get(2) {
             Some(v) => match serde_json::from_value::<Event>(v.clone()) {
                 Ok(ev) => Frame::Event(Box::new(ev)),
                 Err(_) => Frame::Other,
             },
             None => Frame::Other,
         },
-        Some("EOSE") if s(1) == Some(sub_id) => Frame::Eose,
+        Some("EOSE") if s(1).is_some_and(&ours) => Frame::Eose,
         Some("OK") => Frame::Ok {
             id: s(1).unwrap_or_default().to_string(),
             accepted: arr.get(2).and_then(|x| x.as_bool()).unwrap_or(false),
@@ -525,7 +579,9 @@ async fn relay_worker(
                     log::info!("[relays] connected {} in {} ms", urls[i], took.as_millis());
                     pool.record_success(&urls[i], Some(took));
                     if let Some(f) = standing.as_ref() {
-                        let _ = send_text(&mut ws, req_frame(SUB_ID, f, sub_since())).await;
+                        for (_, frame) in req_frames(f, sub_since()) {
+                            let _ = send_text(&mut ws, frame).await;
+                        }
                     }
                     sockets[i] = Some(ws);
                 }
@@ -550,17 +606,32 @@ async fn relay_worker(
             };
             match cmd {
                 Cmd::Subscribe(f) => {
-                    let frame = req_frame(SUB_ID, &f, sub_since());
+                    let frames = req_frames(&f, sub_since());
+                    // REQs this one replaces by id; ids past the new count
+                    // are closed.
+                    let old_n = standing
+                        .as_ref()
+                        .map_or(0, |old| req_count(old.values.len()));
+                    let stale: Vec<String> = (frames.len()..old_n).map(chunk_sub_id).collect();
                     for ws in sockets.iter_mut().flatten() {
-                        let _ = send_text(ws, frame.clone()).await;
+                        for (_, frame) in &frames {
+                            let _ = send_text(ws, frame.clone()).await;
+                        }
+                        for id in &stale {
+                            let _ = send_text(ws, close_frame(id)).await;
+                        }
                     }
                     standing = Some(f);
                 }
                 Cmd::Unsubscribe => {
-                    if standing.take().is_some() {
-                        let frame = close_frame(SUB_ID);
+                    if let Some(old) = standing.take() {
+                        let ids: Vec<String> = (0..req_count(old.values.len()))
+                            .map(chunk_sub_id)
+                            .collect();
                         for ws in sockets.iter_mut().flatten() {
-                            let _ = send_text(ws, frame.clone()).await;
+                            for id in &ids {
+                                let _ = send_text(ws, close_frame(id)).await;
+                            }
                         }
                     }
                 }
@@ -614,7 +685,7 @@ async fn relay_worker(
                 match tokio::time::timeout(READ_POLL, ws.next()).await {
                     Ok(Some(Ok(Message::Text(t)))) => {
                         read_any = true;
-                        match parse_frame(&t, SUB_ID) {
+                        match parse_frame_where(&t, is_standing_sub_id) {
                             Frame::Event(ev) => {
                                 // Only what we asked for; a relay may send anything.
                                 let wanted = standing.as_ref().is_some_and(|f| tag_matches(&ev, f));
@@ -872,6 +943,87 @@ mod tests {
             ids, want,
             "the event both relays carried arrives once, the other too"
         );
+    }
+
+    fn tagged_with(value: &str) -> Event {
+        EventBuilder::new(Kind::Custom(20911), "x")
+            .tags([Tag::parse(["p", value]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    fn many(n: usize) -> TagFilter {
+        TagFilter {
+            kind: 20911,
+            letter: 'p',
+            values: (0..n).map(|i| format!("tag-{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn a_small_subscription_is_one_unchanged_req() {
+        // 0 and up to MAX_TAGS_PER_REQ values: one frame, identical to the
+        // single-REQ frame.
+        for n in [0, 1, MAX_TAGS_PER_REQ] {
+            let f = many(n);
+            let frames = req_frames(&f, 7);
+            assert_eq!(frames.len(), 1, "{n} tags");
+            assert_eq!(frames[0].0, SUB_ID);
+            assert_eq!(frames[0].1, req_frame(SUB_ID, &f, 7), "{n} tags");
+        }
+        assert_eq!(req_frames(&many(MAX_TAGS_PER_REQ + 1), 7).len(), 2);
+        assert!(is_standing_sub_id("rz") && is_standing_sub_id("rz4"));
+        assert!(!is_standing_sub_id("rzx") && !is_standing_sub_id("other"));
+    }
+
+    #[test]
+    fn seventy_tags_go_out_as_five_reqs_per_relay_and_every_tag_is_answered() {
+        let (a, b) = (FakeWsRelay::start(), FakeWsRelay::start());
+        let m = MultiRelay::start_in(fast_pool(vec![]), vec![a.url.clone(), b.url.clone()], false);
+        m.subscribe(many(70)).unwrap();
+        eventually("five REQs on each relay", || {
+            (a.reqs() == 5 && b.reqs() == 5).then_some(())
+        });
+        std::thread::sleep(ms(200));
+        assert_eq!((a.reqs(), b.reqs()), (5, 5), "no more than five");
+        // One event per tag, each from its own key; relay a carries the even
+        // ones, relay b the odd ones.
+        let mut want = Vec::new();
+        for i in 0..70 {
+            let e = tagged_with(&format!("tag-{i}"));
+            want.push(e.id);
+            if i % 2 == 0 { &a } else { &b }.inject(&e);
+        }
+        let got = drain(&m, ms(1500));
+        let mut ids: Vec<_> = got.iter().map(|e| e.id).collect();
+        ids.sort();
+        want.sort();
+        assert_eq!(ids, want, "every tag, across the chunks, is answered");
+        // An event for a tag nobody asked for is not queued.
+        a.inject(&tagged_with("not-asked"));
+        assert!(drain(&m, ms(300)).is_empty());
+    }
+
+    #[test]
+    fn a_long_subscription_is_resent_whole_on_reconnect_and_shrinking_closes_the_extras() {
+        let a = FakeWsRelay::start();
+        let pool = fast_pool(vec![]);
+        let m = MultiRelay::start_in(pool, vec![a.url.clone()], false);
+        m.subscribe(many(70)).unwrap();
+        eventually("five REQs", || (a.reqs() == 5).then_some(()));
+        a.kill();
+        eventually("the drop", || (m.connected().0 == 0).then_some(()));
+        a.revive();
+        eventually("all five again after the reconnect", || {
+            (m.connected().0 == 1 && a.reqs() == 10).then_some(())
+        });
+        // Shrinking to two chunks replaces rz and rz1 and closes rz2..rz4.
+        m.subscribe(many(20)).unwrap();
+        eventually("the three extras closed", || {
+            (a.reqs() == 12 && a.closes() == 3).then_some(())
+        });
+        m.unsubscribe().unwrap();
+        eventually("the rest closed", || (a.closes() == 5).then_some(()));
     }
 
     #[test]

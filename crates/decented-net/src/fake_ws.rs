@@ -19,6 +19,7 @@ struct State {
     kill: tokio::sync::watch::Sender<u64>,
     bus: tokio::sync::broadcast::Sender<Event>,
     reqs: AtomicUsize,
+    closes: AtomicUsize,
     conns: AtomicUsize,
     tries: AtomicUsize,
     received: Mutex<Vec<Event>>,
@@ -67,6 +68,7 @@ impl FakeWsRelay {
             kill,
             bus,
             reqs: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
             conns: AtomicUsize::new(0),
             tries: AtomicUsize::new(0),
             received: Mutex::new(Vec::new()),
@@ -112,6 +114,7 @@ impl FakeWsRelay {
                                         let _ = sink.send(Message::Text(json!(["EOSE", sid]).to_string().into())).await;
                                     }
                                     Some("CLOSE") => {
+                                        st.closes.fetch_add(1, Ordering::Relaxed);
                                         let sid = a.get(1).and_then(|v| v.as_str()).unwrap_or("");
                                         subs.retain(|(s, _)| s != sid);
                                     }
@@ -153,6 +156,11 @@ impl FakeWsRelay {
     /// `REQ`s received so far (a resubscription after a reconnect adds one).
     pub fn reqs(&self) -> usize {
         self.state.reqs.load(Ordering::Relaxed)
+    }
+
+    /// `CLOSE`s received so far.
+    pub fn closes(&self) -> usize {
+        self.state.closes.load(Ordering::Relaxed)
     }
 
     /// TCP connection attempts so far, refused ones included.
