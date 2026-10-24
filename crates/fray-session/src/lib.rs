@@ -1,7 +1,9 @@
 //! Fray's game-session state machines: the room-code format and host
-//! migration. Nothing here does I/O: no sockets, no async runtime, no clock
-//! of its own. The transport (`fray-net`) drives these types and re-exports
-//! them, so a game can keep importing them from there.
+//! migration. Nothing here does I/O: no sockets and no async runtime. The
+//! session time is passed in by the caller; the only clock read is
+//! `std::time::Instant` timing two elapsed-work budgets in `migration`. The
+//! transport (`fray-net`) drives these types and re-exports them, so a game can
+//! keep importing them from there.
 
 pub mod code;
 pub mod migration;
