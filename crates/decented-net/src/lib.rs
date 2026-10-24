@@ -27,7 +27,7 @@ mod identity;
 pub mod ifaces;
 mod lan;
 mod listener;
-pub mod migration;
+pub use fray_session::migration;
 pub mod nat;
 pub mod netbind;
 mod quic;
@@ -84,8 +84,9 @@ pub const DEFAULT_LAN_PORT: u16 = 7715;
 pub const NET_PROTOCOL_VERSION: u32 = 7;
 /// Default for [`NetConfig::max_reliable_len`]: the largest reliable message
 /// `send_reliable` will carry (and accept: a bigger frame from a peer ends the
-/// connection). Host migration always uses this size.
-pub const MAX_RELIABLE_LEN: usize = 1024;
+/// connection). Host migration always uses this size. Defined in
+/// `fray_session`, which owns the bound; re-exported here.
+pub use fray_session::MAX_RELIABLE_LEN;
 /// The largest [`NetConfig::max_reliable_len`] an app can ask for.
 pub(crate) const MAX_RELIABLE_LEN_CEILING: usize = 1024 * 1024;
 /// Largest lossy message `send_lossy` will carry (always fits a QUIC datagram

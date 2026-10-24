@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/decented-net", "crates/decented-relays"]
+members = ["crates/decented-net", "crates/decented-relays", "crates/fray-session"]
 
 [workspace.package]
 version = "0.1.0"

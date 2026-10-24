@@ -3024,7 +3024,7 @@ pub fn fresh_session() -> Result<SessionId> {
     Ok(session)
 }
 pub fn room_code_hash(code: &str) -> Result<Hash> {
-    let code = crate::room::normalize_code(code).ok_or(Error::Invalid("room code"))?;
+    let code = crate::code::normalize_code(code).ok_or(Error::Invalid("room code"))?;
     Ok(hash(b"fray/migration/code/v1\0", code.as_bytes()))
 }
 impl Root {
@@ -3946,7 +3946,8 @@ impl ConnectionBinding {
         }
         Ok(())
     }
-    pub(crate) fn canonical(&self) -> Result<Vec<u8>> {
+    /// The canonical bytes of this binding; `fray-net`'s QUIC hello hashes them.
+    pub fn canonical(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let mut bytes = vec![VERSION];
         bytes.extend(self.session);

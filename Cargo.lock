@@ -359,6 +359,7 @@ dependencies = [
  "argon2",
  "bytes",
  "fray-relays",
+ "fray-session",
  "futures-util",
  "getrandom 0.3.4",
  "hex",
@@ -382,6 +383,16 @@ name = "fray-relays"
 version = "0.1.0"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "fray-session"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "nostr",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

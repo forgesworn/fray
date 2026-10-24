@@ -1,0 +1,12 @@
+[package]
+name = "fray-session"
+description = "Fray's game-session state machines (host migration, room-code format). No I/O: no sockets, no async runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+getrandom = "0.3"
+nostr = "=0.44.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
