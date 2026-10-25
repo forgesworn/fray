@@ -366,6 +366,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "bytes",
+ "fray-keep",
  "fray-relays",
  "fray-session",
  "futures-util",

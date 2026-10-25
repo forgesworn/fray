@@ -1215,28 +1215,48 @@ impl HostHandle {
     /// for the rest of this room's life. Anything already sent to it (a
     /// rejection message, say) gets a moment to flush before the close.
     pub fn kick(&self, peer: PeerId) {
-        self.remove_peer(peer, true, close::KICKED);
+        self.remove_peer(peer, true, close::KICKED, b"kicked");
     }
 
     /// Disconnect a peer without banning it (e.g. it was refused because the
     /// room was full or a match was running): it may dial back in. Emits
     /// `PeerLeft{Kicked}`.
     pub fn disconnect(&self, peer: PeerId) {
-        self.remove_peer(peer, false, close::KICKED);
+        self.remove_peer(peer, false, close::KICKED, b"kicked");
+    }
+
+    /// As [`disconnect`](Self::disconnect) (no ban, the same close code and
+    /// flush), but the peer is told why: `reason` is a short plain sentence
+    /// meant for the player, cut to at most [`MAX_DISCONNECT_REASON`](crate::MAX_DISCONNECT_REASON) bytes on
+    /// a character boundary. Its client sees
+    /// `Disconnected(KickedWith(reason))` once the text has been cleaned (see
+    /// [`DisconnectReason::KickedWith`](crate::DisconnectReason::KickedWith)); an empty reason, or one that is
+    /// nothing but invisible characters, shows as plain `Kicked`. Emits
+    /// `PeerLeft{Kicked}`.
+    ///
+    /// The reason `"kicked"` is what plain `disconnect` sends, so it reads as
+    /// plain `Kicked` too.
+    ///
+    /// An older client receiving this close reads it as `Kicked`, so nothing
+    /// breaks; a client of this version talking to an older host sees `Kicked`.
+    pub fn disconnect_with_reason(&self, peer: PeerId, reason: &str) {
+        let cut = crate::cut_reason(reason);
+        self.remove_peer(peer, false, close::KICKED, cut.as_bytes());
     }
 
     /// As [`disconnect`](Self::disconnect), for a joiner that did not confirm
     /// in time: its client sees `Disconnected(ConfirmTimeout)`, not `Kicked`.
     pub fn confirm_timeout(&self, peer: PeerId) {
-        self.remove_peer(peer, false, close::CONFIRM_TIMEOUT);
+        self.remove_peer(peer, false, close::CONFIRM_TIMEOUT, b"kicked");
     }
 
-    fn remove_peer(&self, peer: PeerId, ban: bool, code: u32) {
+    fn remove_peer(&self, peer: PeerId, ban: bool, code: u32, reason: &[u8]) {
         if let Some(l) = self.shared.detach_peer(peer, ban) {
             let generation = l.generation;
+            let reason = Bytes::copy_from_slice(reason);
             crate::runtime().spawn(async move {
                 tokio::time::sleep(KICK_FLUSH).await;
-                l.conn.close(code.into(), b"kicked");
+                l.conn.close(code.into(), &reason);
             });
             self.shared.emit_at(
                 HostEvent::PeerLeft {
@@ -2813,8 +2833,8 @@ pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
     let removed = shared.detach_peer(peer, false).is_some();
     if removed {
         let reason = match ended {
-            Ended::Remote(close::KICKED) => LeaveReason::Kicked,
-            Ended::Remote(_) => LeaveReason::Left,
+            Ended::Remote(close::KICKED, _) => LeaveReason::Kicked,
+            Ended::Remote(..) => LeaveReason::Left,
             Ended::TimedOut => LeaveReason::TimedOut,
             Ended::Local => LeaveReason::Error("closed locally".into()),
             Ended::Error(e) => LeaveReason::Error(e),

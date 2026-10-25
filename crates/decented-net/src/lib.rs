@@ -540,13 +540,66 @@ pub enum LeaveReason {
     Error(String),
 }
 
+/// The longest reason, in bytes, a host sends with `disconnect_with_reason`
+/// and a client passes on in `DisconnectReason::KickedWith`.
+pub const MAX_DISCONNECT_REASON: usize = 200;
+
+/// The text cut to at most [`MAX_DISCONNECT_REASON`] bytes, on a character
+/// boundary.
+pub(crate) fn cut_reason(s: &str) -> &str {
+    if s.len() <= MAX_DISCONNECT_REASON {
+        return s;
+    }
+    let mut end = MAX_DISCONNECT_REASON;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// What a client tells the game about a `KICKED` close's reason bytes: `None`
+/// (plain `Kicked`) unless they are valid UTF-8, not exactly `kicked`, and
+/// something is left after turning line breaks and tabs into single spaces,
+/// removing control, bidi and invisible characters and trimming; the rest is cut to [`MAX_DISCONNECT_REASON`] bytes.
+pub(crate) fn kick_reason_text(bytes: &[u8]) -> Option<String> {
+    if bytes == b"kicked" {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    // Whitespace (line breaks, tabs, U+0085, U+2028/9 included) reads as a space (a run of them as one); every other
+    // control, bidi and invisible character is dropped.
+    let mut clean = String::new();
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !clean.ends_with(' ') {
+                clean.push(' ');
+            }
+        } else if !c.is_control() && !fray_keep::is_invisible(c) {
+            clean.push(c);
+        }
+    }
+    let cut = cut_reason(clean.trim()).trim();
+    (!cut.is_empty()).then(|| cut.to_string())
+}
+
 /// Why the connection to the host ended (client side).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisconnectReason {
     /// The host shut down or closed the connection.
     HostLeft,
-    /// The host kicked us.
+    /// The host kicked us (or disconnected us) and gave no reason of its own.
     Kicked,
+    /// The host disconnected us with a reason (`HostHandle::disconnect_with_reason`):
+    /// a short plain sentence for the player, such as "The world restarted;
+    /// join again with the same code." It is the host's text, cleaned: control,
+    /// bidi and invisible characters removed, trimmed, at most
+    /// [`MAX_DISCONNECT_REASON`] bytes, never empty. Show it as a message,
+    /// never as markup or a command.
+    ///
+    /// Arrives only from a host that sends reasons. A client built before this
+    /// variant existed reads the same close as `Kicked`, and this client
+    /// talking to an older host sees `Kicked`, so nothing breaks either way.
+    KickedWith(String),
     /// We stayed on the confirm screen too long and the host dropped us (not
     /// a ban: we may join again).
     ConfirmTimeout,

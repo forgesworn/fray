@@ -777,9 +777,12 @@ async fn run(
         return; // We left; nothing to report.
     }
     let reason = match ended {
-        Ended::Remote(close::KICKED) => DisconnectReason::Kicked,
-        Ended::Remote(close::CONFIRM_TIMEOUT) => DisconnectReason::ConfirmTimeout,
-        Ended::Remote(_) => DisconnectReason::HostLeft,
+        Ended::Remote(close::KICKED, why) => match crate::kick_reason_text(&why) {
+            Some(text) => DisconnectReason::KickedWith(text),
+            None => DisconnectReason::Kicked,
+        },
+        Ended::Remote(close::CONFIRM_TIMEOUT, _) => DisconnectReason::ConfirmTimeout,
+        Ended::Remote(..) => DisconnectReason::HostLeft,
         Ended::TimedOut => DisconnectReason::TimedOut,
         Ended::Local => DisconnectReason::Error("closed locally".into()),
         Ended::Error(e) => DisconnectReason::Error(e),
@@ -842,10 +845,10 @@ fn host_matches(proof: &quic::HostProof, named: &str, signer: &PublicKey) -> Res
 /// The host's refusal, if it closed the connection with one.
 fn refusal(ended: Option<&Ended>) -> Option<FailReason> {
     match ended? {
-        Ended::Remote(close::FULL) => Some(FailReason::RoomFull),
-        Ended::Remote(close::CLOSED) => Some(FailReason::RoomClosed),
-        Ended::Remote(close::VERSION) => Some(FailReason::VersionMismatch),
-        Ended::Remote(close::NOT_ADMITTED | close::KICKED) => Some(FailReason::NotAdmitted),
+        Ended::Remote(close::FULL, _) => Some(FailReason::RoomFull),
+        Ended::Remote(close::CLOSED, _) => Some(FailReason::RoomClosed),
+        Ended::Remote(close::VERSION, _) => Some(FailReason::VersionMismatch),
+        Ended::Remote(close::NOT_ADMITTED | close::KICKED, _) => Some(FailReason::NotAdmitted),
         _ => None,
     }
 }

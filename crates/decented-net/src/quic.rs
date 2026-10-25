@@ -1167,8 +1167,9 @@ impl Link {
 /// How a connection ended, as seen by the pump.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ended {
-    /// Closed by the other side with an application code.
-    Remote(u32),
+    /// Closed by the other side with an application code and the reason
+    /// bytes it sent with it (untrusted: any bytes, up to a packet's worth).
+    Remote(u32, Bytes),
     TimedOut,
     /// Closed by us (kick, shutdown, too slow).
     Local,
@@ -1177,9 +1178,10 @@ pub(crate) enum Ended {
 
 pub(crate) fn ended_of(err: &quinn::ConnectionError) -> Ended {
     match err {
-        quinn::ConnectionError::ApplicationClosed(ac) => {
-            Ended::Remote(u32::try_from(ac.error_code.into_inner()).unwrap_or(u32::MAX))
-        }
+        quinn::ConnectionError::ApplicationClosed(ac) => Ended::Remote(
+            u32::try_from(ac.error_code.into_inner()).unwrap_or(u32::MAX),
+            ac.reason.clone(),
+        ),
         quinn::ConnectionError::TimedOut => Ended::TimedOut,
         quinn::ConnectionError::LocallyClosed => Ended::Local,
         other => Ended::Error(other.to_string()),
@@ -1261,7 +1263,7 @@ pub(crate) async fn pump(
                 Ok(e) => e,
                 Err(_) => {
                     conn.close(close::LEAVE.into(), b"stream ended");
-                    return Ended::Remote(close::LEAVE);
+                    return Ended::Remote(close::LEAVE, Bytes::new());
                 }
             }
         }

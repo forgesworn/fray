@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 decented-relays = { package = "fray-relays", path = "../decented-relays" }
 fray-session = { path = "../fray-session" }
+fray-keep = { path = "../fray-keep" }
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
