@@ -1,0 +1,13 @@
+[package]
+name = "fray-keep"
+description = "What a game needs to join a Keep by invite link: the link, finding it in pasted text, the saved-Keeps list and the return-pass rule. No I/O beyond one file; no sockets, no async runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fray_keep"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -353,6 +353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fray-keep"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fray-net"
 version = "0.1.0"
 dependencies = [
