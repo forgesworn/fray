@@ -111,6 +111,12 @@ that TLS session. A fake host learns nothing it can replay.
   messages; the net layer's `FLOOD` close does not ban): a joiner refused because the room was full, the match had
   started or its version differed, or one that sat on the confirm screen too
   long (`CONFIRM_TIMEOUT`), is only disconnected and may come back.
+- **A disconnect may carry a reason.** `disconnect_with_reason` sends a short
+  text in the close frame; the client shows it to the player as
+  `DisconnectReason::KickedWith`. The text comes from the host, so the client
+  treats it as untrusted: it must be valid UTF-8, has control, bidi and
+  invisible characters removed, and is cut to 200 bytes. An older client reads
+  the same close as plain `Kicked`.
 
 ## Invites (code-room hosts)
 
