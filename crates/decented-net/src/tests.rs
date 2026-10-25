@@ -1175,6 +1175,145 @@ fn a_disconnected_but_not_kicked_identity_may_dial_back_in() {
     h.shutdown();
 }
 
+fn disconnected(ev: ClientEvent) -> DisconnectReason {
+    match ev {
+        ClientEvent::Disconnected { reason } => reason,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// What a client is told when its host disconnects it with `reason`.
+fn reason_seen_after_disconnect_with(reason: &str) -> DisconnectReason {
+    let (h, cl, peer, _) = connected_pair(4);
+    h.disconnect_with_reason(peer, reason);
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    h.shutdown();
+    match ev {
+        ClientEvent::Disconnected { reason } => reason,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn disconnect_with_reason_delivers_the_text_and_does_not_ban() {
+    let (h, cl, peer, id) = connected_pair(4);
+    h.disconnect_with_reason(peer, "The world restarted; join again with the same code.");
+    let ev = wait_host(&h, 5, |e| matches!(e, HostEvent::PeerLeft { .. }));
+    assert!(matches!(
+        ev,
+        HostEvent::PeerLeft {
+            reason: LeaveReason::Kicked,
+            ..
+        }
+    ));
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    assert_eq!(
+        disconnected(ev),
+        DisconnectReason::KickedWith("The world restarted; join again with the same code.".into())
+    );
+    // Not a ban: the same identity may dial straight back in.
+    let addr = local_addr_again(&h);
+    let again = join_addr(&cfg(), &id, addr, &h.lan_token());
+    let ev = wait_client(&again, 10, |e| {
+        matches!(
+            e,
+            ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+        )
+    });
+    assert!(matches!(ev, ClientEvent::Connected { .. }), "{ev:?}");
+    h.shutdown();
+}
+
+#[test]
+fn disconnect_without_a_reason_still_gives_plain_kicked() {
+    let (h, cl, peer, _) = connected_pair(4);
+    h.disconnect(peer);
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    assert_eq!(disconnected(ev), DisconnectReason::Kicked);
+    h.shutdown();
+}
+
+#[test]
+fn a_long_reason_is_cut_on_a_character_boundary() {
+    // 100 euro signs are 300 bytes; 200 bytes would fall inside the 67th.
+    let long = "\u{20ac}".repeat(100);
+    let seen = reason_seen_after_disconnect_with(&long);
+    assert_eq!(
+        seen,
+        DisconnectReason::KickedWith("\u{20ac}".repeat(66)),
+        "66 whole characters, 198 bytes"
+    );
+}
+
+#[test]
+fn control_and_bidi_characters_are_removed_from_a_reason() {
+    let seen = reason_seen_after_disconnect_with(
+        "  The\u{202e} world\u{0} restarted\u{7}\n; join\u{200b} again.\u{feff}  ",
+    );
+    assert_eq!(
+        seen,
+        DisconnectReason::KickedWith("The world restarted; join again.".into())
+    );
+}
+
+#[test]
+fn an_empty_or_all_invisible_reason_gives_plain_kicked() {
+    assert_eq!(
+        reason_seen_after_disconnect_with(""),
+        DisconnectReason::Kicked
+    );
+    assert_eq!(
+        reason_seen_after_disconnect_with(" \u{202e}\u{200b}\u{0}\n\u{feff} "),
+        DisconnectReason::Kicked
+    );
+}
+
+#[test]
+fn a_ban_kick_still_bans_and_reads_as_plain_kicked() {
+    let (h, cl, peer, id) = connected_pair(4);
+    h.kick(peer);
+    let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
+    assert_eq!(disconnected(ev), DisconnectReason::Kicked);
+    let addr = local_addr_again(&h);
+    let again = join_addr(&cfg(), &id, addr, &h.lan_token());
+    let ev = wait_client(&again, 10, |e| {
+        matches!(
+            e,
+            ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+        )
+    });
+    assert!(
+        matches!(
+            ev,
+            ClientEvent::Failed {
+                reason: FailReason::NotAdmitted,
+                ..
+            }
+        ),
+        "{ev:?}"
+    );
+    h.shutdown();
+}
+
+#[test]
+fn the_client_reads_close_reason_bytes_defensively() {
+    use crate::kick_reason_text as t;
+    assert_eq!(t(b"kicked"), None, "what older hosts send");
+    assert_eq!(t(b""), None);
+    assert_eq!(t(&[0xff, 0xfe, b'a']), None, "not UTF-8");
+    assert_eq!(
+        t(b"Kicked"),
+        Some("Kicked".into()),
+        "only the exact word is the default"
+    );
+    assert_eq!(t(b"  hi \x1b[31m there "), Some("hi [31m there".into()));
+    // A hostile host sends a packet's worth: cut after cleaning, whole characters.
+    let big = "\u{20ac}".repeat(400);
+    assert_eq!(t(big.as_bytes()), Some("\u{20ac}".repeat(66)));
+    let padded = format!("{}{}", "\u{200b}".repeat(300), "a".repeat(300));
+    assert_eq!(t(padded.as_bytes()), Some("a".repeat(200)));
+}
+
 /// Records every event a relay client publishes or receives.
 struct Spy {
     inner: crate::relay::FakeRelay,
@@ -1825,7 +1964,14 @@ mod review_v2 {
             !out.0 && !welcomed.load(Ordering::Relaxed),
             "a welcome was sent"
         );
-        assert_eq!(out.1, Some(quic::Ended::Remote(quic::close::NOT_ADMITTED)));
+        assert!(
+            matches!(
+                out.1,
+                Some(quic::Ended::Remote(quic::close::NOT_ADMITTED, _))
+            ),
+            "{:?}",
+            out.1
+        );
         assert_eq!(h.peer_count(), 0);
         h.shutdown();
     }
@@ -3395,7 +3541,13 @@ mod invites {
         for proof in [proof_today, proof_yesterday] {
             let (welcomed, ended) = raw_hello(addr, proof);
             assert!(!welcomed, "a welcome was sent to a revoked invite");
-            assert_eq!(ended, Some(quic::Ended::Remote(quic::close::NOT_ADMITTED)));
+            assert!(
+                matches!(
+                    ended,
+                    Some(quic::Ended::Remote(quic::close::NOT_ADMITTED, _))
+                ),
+                "{ended:?}"
+            );
         }
 
         // And the host no longer answers offers on its tags.

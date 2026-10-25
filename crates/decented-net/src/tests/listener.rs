@@ -126,9 +126,11 @@ fn raw_hello(tag: &str, addr: SocketAddr, token: [u8; 32]) -> (bool, Option<Ende
 }
 
 fn refused(tag: &str, addr: SocketAddr, token: [u8; 32]) {
-    assert_eq!(
-        raw_hello(tag, addr, token),
-        (false, Some(Ended::Remote(close::NOT_ADMITTED)))
+    let (welcomed, ended) = raw_hello(tag, addr, token);
+    assert!(!welcomed);
+    assert!(
+        matches!(ended, Some(Ended::Remote(close::NOT_ADMITTED, _))),
+        "{ended:?}"
     );
 }
 
@@ -409,14 +411,14 @@ fn rotate_code_on_a_plain_host_keeps_peers_and_rotates_the_lan_token() {
         let (w, e) = raw_hello(TAG, at, token);
         (w, e)
     };
-    assert_eq!(
-        raw(old_lan),
-        (false, Some(Ended::Remote(close::NOT_ADMITTED)))
-    );
-    assert_eq!(
-        raw(code_token(TAG, &old)),
-        (false, Some(Ended::Remote(close::NOT_ADMITTED)))
-    );
+    for refused in [raw(old_lan), raw(code_token(TAG, &old))] {
+        assert!(!refused.0);
+        assert!(
+            matches!(refused.1, Some(Ended::Remote(close::NOT_ADMITTED, _))),
+            "{:?}",
+            refused.1
+        );
+    }
     still_talking(&h, peer, &first, b"kept");
     settle();
     let second = join_with_relay(&cfg(), &Identity::ephemeral(), &new, Box::new(hub.client()));
