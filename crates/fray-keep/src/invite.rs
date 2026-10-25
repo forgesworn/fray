@@ -74,7 +74,7 @@ pub fn format_invite_link(prefix: &str, host_key: &[u8; 32], secret: &[u8; 32]) 
 
 /// `text` starts with `prefix`, ignoring ASCII case.
 fn starts_with_ci(text: &str, prefix: &str) -> bool {
-    text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    !prefix.is_empty() && text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Read a link pasted by a person. Leading and trailing whitespace is ignored,
@@ -98,12 +98,12 @@ const MAX_TEXT: usize = 4096;
 /// Is `word` a Keep link token: it starts with `prefix` (either case), or is
 /// the prefix without its trailing slash (a link cut short, which the caller
 /// should report as a bad link)?
-fn is_link_word(prefix: &str, word: &str) -> bool {
+pub fn is_link_word(prefix: &str, word: &str) -> bool {
     if starts_with_ci(word, prefix) {
         return true;
     }
     let bare = prefix.strip_suffix('/').unwrap_or(prefix);
-    bare.len() < prefix.len() && word.eq_ignore_ascii_case(bare)
+    !bare.is_empty() && bare.len() < prefix.len() && word.eq_ignore_ascii_case(bare)
 }
 
 /// The first word of pasted text that starts with `prefix` (either case), so a
@@ -241,6 +241,27 @@ mod tests {
         let l = format_invite_link(p, &HOST, &SECRET);
         assert_eq!(invite_in_text(p, &format!("see {l}")), Some(l.as_str()));
         assert_eq!(parse_invite_link(p, &l), invite());
+    }
+
+    #[test]
+    fn an_empty_prefix_matches_nothing() {
+        let bare = format!("{}/{}", "ab".repeat(32), "01".repeat(32));
+        assert_eq!(parse_invite_link("", &bare), None);
+        assert_eq!(invite_in_text("", " hi there"), None);
+        assert_eq!(invite_in_text("", ""), None);
+        assert!(!is_link_word("", ""));
+        assert!(!is_link_word("", "hi"));
+        assert!(!is_link_word("/", ""));
+    }
+
+    #[test]
+    fn is_link_word_says_whether_a_word_is_a_keep_link_at_all() {
+        assert!(is_link_word(PREFIX, &link()));
+        assert!(is_link_word(PREFIX, "STAMPEDE://KEEP/x"));
+        assert!(is_link_word(PREFIX, "stampede://keep"));
+        assert!(!is_link_word(PREFIX, "stampede://keeper/x"));
+        assert!(!is_link_word(PREFIX, "foo stampede://keep/x"));
+        assert!(!is_link_word(PREFIX, "stampede://join#ABC"));
     }
 
     #[test]

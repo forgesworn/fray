@@ -4,15 +4,24 @@
 //! The list lives in one file the caller names (a game uses `keeps.json` in its
 //! data directory). The secrets in it are the way in, so the file is private to
 //! the app (mode 0600 where the platform has modes) and is replaced atomically:
-//! written to `<file>.tmp`, synced, then renamed over. A file that cannot be
-//! read as a list is kept as `<file>.bad` and reads as empty, never lost.
+//! written to a fresh `<file>.tmp`, synced, then renamed over.
 //!
 //! The file is a JSON array of
 //! `{ "host_key": "<64 hex>", "secret": "<64 hex>", "name": "<string>", "last_joined": <unix secs> }`.
-//! One [`Keeps`] should own a file at a time: it holds the list in memory and
-//! does not re-read the file.
+//! Reading it: an entry that is not a whole Keep with hex keys is dropped, hex
+//! is lower-cased, names are cleaned, there is one entry per host key (the
+//! newest kept), newest first, at most [`MAX_KEEPS`]. A file that is not a JSON
+//! array at all is moved to `<file>.bad` and reads as empty. A file that cannot
+//! be read for any reason but being absent is an error, and nothing is ever
+//! saved over it.
+//!
+//! [`Keeps`] changes the list by reading the file again, changing what is
+//! there and saving, so a `Keeps` that has gone stale (a second one saved a
+//! Keep meanwhile) never erases an entry another one saved. [`Keeps::list`] is
+//! a snapshot from the last load or change. The free functions on a
+//! `Vec<Keep>` are the same rules without the file.
 
-use crate::invite::{describe, hex_encode, parse_hex32};
+use crate::invite::{hex_encode, parse_hex32};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::io::Write;
@@ -58,23 +67,50 @@ impl Keep {
     }
 }
 
-/// Format characters that draw nothing or reorder text (bidi overrides,
-/// zero-width joiners, the byte-order mark): a host's name may not carry them.
-fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+/// Format characters that draw nothing, reorder text or break a line (bidi
+/// overrides, zero-width joiners, the byte-order mark, line and paragraph
+/// separators, the Hangul fillers): a host's name may not carry them.
+pub fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{61c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+    )
 }
 
-/// The name to show for a Keep: the host's own, with control and invisible or
-/// bidi characters stripped, trimmed and cut to 40 characters; else `Keep `
-/// and the first six hex characters of the key (`Keep ab12cd`).
-pub fn display_name(host_name: Option<&str>, host_key: &[u8; 32]) -> String {
+/// The first six hex characters of a host key (as hex text), upper-cased: the
+/// Keep ID a player can read out.
+pub fn keep_id_hex(host_hex: &str) -> String {
+    host_hex.get(..6).unwrap_or(host_hex).to_ascii_uppercase()
+}
+
+/// The name to show for a Keep whose key is hex text: the host's own, with
+/// control and invisible or bidi characters stripped, trimmed and cut to 40
+/// characters; else `Keep ` and the first six hex characters of the key
+/// (`Keep ab12cd`).
+pub fn display_name_hex(host_name: Option<&str>, host_hex: &str) -> String {
     let clean: String = host_name.unwrap_or("").chars().filter(|c| !c.is_control() && !is_invisible(*c)).collect();
     let clean = clean.trim();
     if clean.is_empty() {
-        format!("Keep {}", describe(host_key))
+        format!("Keep {}", host_hex.get(..6).unwrap_or(host_hex))
     } else {
-        clean.chars().take(MAX_NAME).collect()
+        // Trim again: the cut can land just after a space.
+        clean.chars().take(MAX_NAME).collect::<String>().trim_end().to_string()
     }
+}
+
+/// [`display_name_hex`] for a key as bytes.
+pub fn display_name(host_name: Option<&str>, host_key: &[u8; 32]) -> String {
+    display_name_hex(host_name, &hex_encode(host_key))
 }
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", "4 d ago", "3 mo ago".
@@ -92,6 +128,29 @@ pub fn ago(then: u64, now: u64) -> String {
     }
 }
 
+/// Put `keep` in the list: a Keep already there under the same host key is
+/// replaced (a new secret supersedes the old), the newest play comes first and
+/// only [`MAX_KEEPS`] stay, the oldest dropped.
+pub fn remember(list: &mut Vec<Keep>, keep: Keep) {
+    list.retain(|k| !k.host_key.eq_ignore_ascii_case(&keep.host_key));
+    list.push(keep);
+    // Stable: equal times keep their order, the new one last of its time, so it is dropped first.
+    list.sort_by_key(|k| std::cmp::Reverse(k.last_joined));
+    list.truncate(MAX_KEEPS);
+}
+
+/// Take the Keep with `host_key` (hex) out of the list. True if it was there.
+pub fn forget(list: &mut Vec<Keep>, host_key: &str) -> bool {
+    let before = list.len();
+    list.retain(|k| !k.host_key.eq_ignore_ascii_case(host_key));
+    list.len() != before
+}
+
+/// `host_key` (hex) is in the list.
+pub fn contains(list: &[Keep], host_key: &str) -> bool {
+    list.iter().any(|k| k.host_key.eq_ignore_ascii_case(host_key))
+}
+
 /// `<file>` with `suffix` added to its name, in the same directory.
 fn sibling(file: &Path, suffix: &str) -> PathBuf {
     let mut name: OsString = file.file_name().map(OsString::from).unwrap_or_default();
@@ -99,7 +158,65 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
     file.with_file_name(name)
 }
 
-/// The saved Keeps, newest play first, kept in memory and in one file.
+/// Read the file as the module docs say. Only a missing file is an empty list
+/// without being an error.
+fn read_list(path: &Path) -> std::io::Result<Vec<Keep>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        let _ = std::fs::rename(path, sibling(path, ".bad"));
+        return Ok(Vec::new());
+    };
+    let mut list: Vec<Keep> = items.into_iter().filter_map(|v| serde_json::from_value::<Keep>(v).ok()).collect();
+    list.retain(|k| k.keys().is_some());
+    for k in &mut list {
+        k.host_key = k.host_key.to_ascii_lowercase();
+        k.secret = k.secret.to_ascii_lowercase();
+        k.name = display_name_hex(Some(&k.name), &k.host_key);
+    }
+    list.sort_by_key(|k| std::cmp::Reverse(k.last_joined));
+    // One entry per host key: the newest, which sorted first.
+    let mut seen = std::collections::HashSet::new();
+    list.retain(|k| seen.insert(k.host_key.clone()));
+    list.truncate(MAX_KEEPS);
+    Ok(list)
+}
+
+/// Write `list` to a fresh `<file>.tmp` (mode 0600 from creation on unix), sync
+/// it and rename it over the file. A temp file left behind, whatever its mode or
+/// kind of link, is removed first, so the file written is always private.
+fn write_list(path: &Path, list: &[Keep]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_vec_pretty(list).map_err(std::io::Error::other)?;
+    let tmp = sibling(path, ".tmp");
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    let written = f.write_all(&json).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// The saved Keeps, newest play first, kept in one file.
 #[derive(Clone, Debug)]
 pub struct Keeps {
     path: PathBuf,
@@ -107,36 +224,19 @@ pub struct Keeps {
 }
 
 impl Keeps {
-    /// Read the saved Keeps from `path`. A missing or unreadable file is an
-    /// empty list. A file that is not a list is renamed to `<file>.bad` (never
-    /// lost) and reads as empty. Entries whose keys are not hex are dropped,
-    /// hex is lower-cased, names are cleaned as [`display_name`] does, and the
-    /// list is newest first and at most [`MAX_KEEPS`] long.
-    pub fn load(path: impl Into<PathBuf>) -> Keeps {
+    /// Read the saved Keeps from `path`; see the module docs for what is
+    /// dropped and what is moved to `<file>.bad`. A missing file is an empty
+    /// list. Any other failure to read it is an error: the file is left alone.
+    pub fn load(path: impl Into<PathBuf>) -> std::io::Result<Keeps> {
         let path = path.into();
-        let list = match std::fs::read(&path) {
-            Err(_) => Vec::new(),
-            Ok(bytes) => match serde_json::from_slice::<Vec<Keep>>(&bytes) {
-                Ok(mut list) => {
-                    list.retain(|k| k.keys().is_some());
-                    for k in &mut list {
-                        k.host_key = k.host_key.to_ascii_lowercase();
-                        k.secret = k.secret.to_ascii_lowercase();
-                        if let Some((host_key, _)) = k.keys() {
-                            k.name = display_name(Some(&k.name), &host_key);
-                        }
-                    }
-                    list.sort_by_key(|k| std::cmp::Reverse(k.last_joined));
-                    list.truncate(MAX_KEEPS);
-                    list
-                }
-                Err(_) => {
-                    let _ = std::fs::rename(&path, sibling(&path, ".bad"));
-                    Vec::new()
-                }
-            },
-        };
-        Keeps { path, list }
+        let list = read_list(&path)?;
+        Ok(Keeps { path, list })
+    }
+
+    /// Read the file again into [`list`](Keeps::list).
+    pub fn reload(&mut self) -> std::io::Result<()> {
+        self.list = read_list(&self.path)?;
+        Ok(())
     }
 
     /// The file this list is saved in.
@@ -144,77 +244,62 @@ impl Keeps {
         &self.path
     }
 
-    /// The saved Keeps, newest play first.
+    /// The saved Keeps, newest play first, as of the last load or change.
     pub fn list(&self) -> &[Keep] {
         &self.list
     }
 
-    /// `host_key` is in the list.
+    /// `host_key` is in the list ([`list`](Keeps::list)).
     pub fn contains(&self, host_key: &[u8; 32]) -> bool {
-        let hex = hex_encode(host_key);
-        self.list.iter().any(|k| k.host_key == hex)
+        contains(&self.list, &hex_encode(host_key))
     }
 
-    /// Write the list to `<file>.tmp` (mode 0600 on unix), sync it, and rename
-    /// it over the file.
+    /// Write the snapshot [`list`](Keeps::list) to the file, as it stands. The
+    /// changing calls below read the file first; this one does not, so use
+    /// them rather than this to change a list.
     pub fn save(&self) -> std::io::Result<()> {
-        if let Some(dir) = self.path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)?;
-        }
-        let json = serde_json::to_vec_pretty(&self.list).map_err(std::io::Error::other)?;
-        let tmp = sibling(&self.path, ".tmp");
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
-        f.write_all(&json)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, &self.path)
+        write_list(&self.path, &self.list)
     }
 
-    /// Put a Keep in the list (in memory; [`save`](Keeps::save) writes it): one
-    /// entry per host key, a new secret replacing the old, the newest play
-    /// first and only [`MAX_KEEPS`] kept, the oldest dropped. `host_name` is
-    /// cleaned by [`display_name`].
-    pub fn remember(&mut self, host_key: &[u8; 32], secret: &[u8; 32], host_name: Option<&str>, now_secs: u64) {
-        let keep = Keep::new(host_key, secret, host_name, now_secs);
-        self.list.retain(|k| k.host_key != keep.host_key);
-        self.list.push(keep);
-        // Stable: equal times keep their order, the new one last of its time, so it is dropped first.
-        self.list.sort_by_key(|k| std::cmp::Reverse(k.last_joined));
-        self.list.truncate(MAX_KEEPS);
+    /// Put a Keep in the file: read it, apply [`remember`]'s rule (one entry
+    /// per host key, a new secret replacing the old, newest first, at most
+    /// [`MAX_KEEPS`]), save. `host_name` is cleaned by [`display_name`]. The
+    /// snapshot is updated once the file is written.
+    pub fn remember(&mut self, host_key: &[u8; 32], secret: &[u8; 32], host_name: Option<&str>, now_secs: u64) -> std::io::Result<()> {
+        let mut list = read_list(&self.path)?;
+        remember(&mut list, Keep::new(host_key, secret, host_name, now_secs));
+        write_list(&self.path, &list)?;
+        self.list = list;
+        Ok(())
     }
 
-    /// Note a successful join: [`remember`](Keeps::remember), then save, unless
-    /// the list came out as it already was and the file exists. `Ok(true)` when
-    /// the file was written, `Ok(false)` when nothing needed writing. The error
-    /// is for the log: a Keep that could not be saved does not stop the game.
+    /// Note a successful join: like [`remember`](Keeps::remember), but the file
+    /// is not rewritten when the list comes out as it already was and the file
+    /// exists. `Ok(true)` when the file was written, `Ok(false)` when nothing
+    /// needed writing. The error is for the log: a Keep that could not be saved
+    /// does not stop the game.
     pub fn record_join(&mut self, host_key: &[u8; 32], secret: &[u8; 32], host_name: Option<&str>, now_secs: u64) -> std::io::Result<bool> {
-        let before = self.list.clone();
-        self.remember(host_key, secret, host_name, now_secs);
-        if self.list == before && self.path.exists() {
-            return Ok(false);
+        let before = read_list(&self.path)?;
+        let mut list = before.clone();
+        remember(&mut list, Keep::new(host_key, secret, host_name, now_secs));
+        let write = list != before || !self.path.exists();
+        if write {
+            write_list(&self.path, &list)?;
         }
-        self.save()?;
-        Ok(true)
+        self.list = list;
+        Ok(write)
     }
 
-    /// Take the Keep with `host_key` out of the list and save. `Ok(true)` if it
-    /// was there; an absent Keep changes nothing and writes nothing.
+    /// Take the Keep with `host_key` out of the file: read it, remove, save.
+    /// `Ok(true)` if it was there; an absent Keep writes nothing.
     pub fn forget(&mut self, host_key: &[u8; 32]) -> std::io::Result<bool> {
-        let hex = hex_encode(host_key);
-        let before = self.list.len();
-        self.list.retain(|k| k.host_key != hex);
-        if self.list.len() == before {
-            return Ok(false);
+        let mut list = read_list(&self.path)?;
+        let was_there = forget(&mut list, &hex_encode(host_key));
+        if was_there {
+            write_list(&self.path, &list)?;
         }
-        self.save()?;
-        Ok(true)
+        self.list = list;
+        Ok(was_there)
     }
 }
 
@@ -244,9 +329,14 @@ mod tests {
         format!("{n:02x}").repeat(32)
     }
 
-    /// Put `keeps` in a list as if loaded.
-    fn with(d: &Path, keeps: Vec<Keep>) -> Keeps {
-        Keeps { path: file(d), list: keeps }
+    fn load(d: &Path) -> Keeps {
+        Keeps::load(file(d)).unwrap()
+    }
+
+    /// Write `list` to the file straight, as a game's older code might have.
+    fn write(d: &Path, list: &[Keep]) {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(file(d), serde_json::to_vec_pretty(list).unwrap()).unwrap();
     }
 
     #[test]
@@ -269,15 +359,38 @@ mod tests {
         assert_eq!(display_name(None, &[0x0f; 32]), "Keep 0f0f0f");
         // Forty characters, not forty bytes.
         assert_eq!(display_name(Some(&"\u{e9}".repeat(60)), &HOST).chars().count(), 40);
+        // The hex forms, as the games' own tests call them.
+        assert_eq!(display_name_hex(Some("Co\u{202e}us\u{200b}in\u{feff}"), "abcdef0123"), "Cousin");
+        assert_eq!(display_name_hex(Some("\u{202e}\u{200b}"), "abcdef0123"), "Keep abcdef");
+        assert_eq!(keep_id_hex("abcdef0123"), "ABCDEF");
+        assert_eq!(keep_id_hex("abc"), "ABC");
+        assert!(is_invisible('\u{202e}') && is_invisible('\u{feff}') && !is_invisible('a') && !is_invisible('\u{e9}'));
+    }
+
+    #[test]
+    fn line_breaks_and_hangul_fillers_are_stripped_from_names() {
+        assert_eq!(display_name(Some("a\u{2028}b\u{2029}c"), &HOST), "abc");
+        assert_eq!(display_name(Some("\u{3164}\u{115f}\u{1160}\u{ffa0}"), &HOST), "Keep ababab", "an invisible name is no name");
+        assert_eq!(display_name(Some("Mo\u{3164}use"), &HOST), "Mouse");
+    }
+
+    #[test]
+    fn the_cut_to_forty_does_not_leave_a_trailing_space() {
+        let name = format!("{} b", "a".repeat(39));
+        assert_eq!(display_name(Some(&name), &HOST), "a".repeat(39));
+        assert_eq!(display_name_hex(Some(&name), "abcdef"), "a".repeat(39));
     }
 
     #[test]
     fn saved_keeps_load_back_and_a_missing_file_is_empty() {
         let d = dir("roundtrip");
-        assert!(Keeps::load(file(&d)).list().is_empty());
+        assert!(load(&d).list().is_empty());
         let list = vec![keep(2, 200), keep(1, 100)];
-        with(&d, list.clone()).save().unwrap();
-        assert_eq!(Keeps::load(file(&d)).list(), list.as_slice());
+        write(&d, &list);
+        let keeps = load(&d);
+        assert_eq!(keeps.list(), list.as_slice());
+        keeps.save().unwrap();
+        assert_eq!(load(&d).list(), list.as_slice());
         assert!(!d.join("keeps.json.tmp").exists(), "the temp file is renamed away");
         let _ = std::fs::remove_dir_all(d);
     }
@@ -287,23 +400,54 @@ mod tests {
     fn the_file_is_private_after_every_save() {
         use std::os::unix::fs::PermissionsExt;
         let d = dir("mode");
-        let mut keeps = Keeps::load(file(&d));
+        let mut keeps = load(&d);
         keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap();
         let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(file(&d)), 0o600, "the file holds secrets");
         keeps.record_join(&[3; 32], &[4; 32], Some("Two"), 20).unwrap();
         assert_eq!(mode(file(&d)), 0o600, "still private after a second save");
+        keeps.remember(&[5; 32], &[6; 32], None, 30).unwrap();
+        assert_eq!(mode(file(&d)), 0o600);
+        keeps.forget(&[5; 32]).unwrap();
+        assert_eq!(mode(file(&d)), 0o600);
         assert!(!d.join("keeps.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_wide_open_temp_file_does_not_widen_the_saved_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("staletmp");
+        std::fs::create_dir_all(&d).unwrap();
+        let tmp = d.join("keeps.json.tmp");
+        std::fs::write(&tmp, "left behind by a restore").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut keeps = load(&d);
+        assert!(keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap());
+        let mode = std::fs::metadata(file(&d)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "whatever was left behind");
+        assert!(!tmp.exists());
+        assert_eq!(load(&d).list().len(), 1);
+        // A symlink left at the temp name is replaced, never written through.
+        let target = d.join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        keeps.remember(&[3; 32], &[4; 32], None, 20).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert_eq!(std::fs::metadata(file(&d)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(load(&d).list().len(), 2);
         let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn a_file_in_a_missing_directory_is_made_and_a_bare_file_name_works() {
         let d = dir("nested");
-        let mut keeps = Keeps::load(d.join("a").join("b").join("keeps.json"));
+        let path = d.join("a").join("b").join("keeps.json");
+        let mut keeps = Keeps::load(&path).unwrap();
         assert!(keeps.record_join(&[1; 32], &[2; 32], None, 1).unwrap());
-        assert_eq!(Keeps::load(d.join("a").join("b").join("keeps.json")).list().len(), 1);
-        assert_eq!(keeps.path(), d.join("a").join("b").join("keeps.json"));
+        assert_eq!(Keeps::load(&path).unwrap().list().len(), 1);
+        assert_eq!(keeps.path(), path);
         assert_eq!(sibling(Path::new("keeps.json"), ".tmp"), PathBuf::from("keeps.json.tmp"));
         let _ = std::fs::remove_dir_all(d);
     }
@@ -322,7 +466,7 @@ mod tests {
         let d = dir("oldshape");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(file(&d), old_file_text()).unwrap();
-        let keeps = Keeps::load(file(&d));
+        let keeps = load(&d);
         assert_eq!(
             keeps.list(),
             [Keep::new(&HOST, &SECRET, Some("Cousin's Keep"), 1_790_000_200), Keep::new(&[2; 32], &[3; 32], None, 1_790_000_100)].as_slice()
@@ -332,8 +476,8 @@ mod tests {
         keeps.save().unwrap();
         assert_eq!(std::fs::read_to_string(file(&d)).unwrap(), old_file_text());
         // An old file with no change to make is not rewritten by a repeated join.
-        let mut keeps = Keeps::load(file(&d));
-        assert!(!(keeps.record_join(&HOST, &SECRET, Some("Cousin's Keep"), 1_790_000_200).unwrap()));
+        let mut keeps = load(&d);
+        assert!(!keeps.record_join(&HOST, &SECRET, Some("Cousin's Keep"), 1_790_000_200).unwrap());
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -347,7 +491,7 @@ mod tests {
             "0A".repeat(32)
         );
         std::fs::write(file(&d), text).unwrap();
-        let keeps = Keeps::load(file(&d));
+        let keeps = load(&d);
         assert_eq!(keeps.list().len(), 1);
         assert_eq!(keeps.list()[0].host_key, "ab".repeat(32), "hex is lower-cased");
         assert_eq!(keeps.list()[0].secret, "0a".repeat(32));
@@ -356,67 +500,134 @@ mod tests {
         // An empty name falls back to the key.
         let text = format!(r#"[{{"host_key":"{}","secret":"{}","name":"","last_joined":7}}]"#, "ab".repeat(32), "01".repeat(32));
         std::fs::write(file(&d), text).unwrap();
-        assert_eq!(Keeps::load(file(&d)).list()[0].name, "Keep ababab");
+        assert_eq!(load(&d).list()[0].name, "Keep ababab");
         // More than the cap, out of order: newest first, twenty kept.
         let many: Vec<Keep> = (0..30u8).map(|i| keep(i, 1000 + u64::from((i * 7) % 30))).collect();
         std::fs::write(file(&d), serde_json::to_vec(&many).unwrap()).unwrap();
-        let loaded = Keeps::load(file(&d));
+        let loaded = load(&d);
         assert_eq!(loaded.list().len(), MAX_KEEPS);
         assert!(loaded.list().windows(2).all(|w| w[0].last_joined >= w[1].last_joined));
         let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
-    fn the_same_keep_with_a_new_secret_replaces_the_old_entry() {
-        let d = dir("replace");
-        let mut keeps = with(&d, vec![keep(2, 200), keep(1, 100)]);
-        keeps.remember(&[1; 32], &[9; 32], Some("Renamed"), 300);
+    fn a_host_key_in_two_cases_is_one_entry_and_the_newest_stays() {
+        let d = dir("dedupe");
+        std::fs::create_dir_all(&d).unwrap();
+        let entry = |host: String, secret: &str, at: u64| {
+            format!("{{\"host_key\":\"{host}\",\"secret\":\"{}\",\"name\":\"N{at}\",\"last_joined\":{at}}}", secret.repeat(32))
+        };
+        let text = format!("[{},{},{}]", entry("AB".repeat(32), "01", 5), entry("ab".repeat(32), "02", 9), entry("cd".repeat(32), "03", 1));
+        std::fs::write(file(&d), text).unwrap();
+        let keeps = load(&d);
         assert_eq!(keeps.list().len(), 2);
-        assert_eq!(keeps.list()[0], Keep::new(&[1; 32], &[9; 32], Some("Renamed"), 300), "newest first");
-        assert_eq!(keeps.list()[1], keep(2, 200));
-        assert_eq!(keeps.list().iter().filter(|k| k.host_key == hex_of(1)).count(), 1);
+        assert_eq!(keeps.list()[0].host_key, "ab".repeat(32));
+        assert_eq!(keeps.list()[0].secret, "02".repeat(32), "the newest play of the Keep");
+        assert_eq!(keeps.list()[0].last_joined, 9);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_same_keep_with_a_new_secret_replaces_the_old_entry() {
+        let mut list = vec![keep(2, 200), keep(1, 100)];
+        let again = Keep::new(&[1; 32], &[9; 32], Some("Renamed"), 300);
+        remember(&mut list, again.clone());
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], again, "newest first");
+        assert_eq!(list[1], keep(2, 200));
+        assert_eq!(list.iter().filter(|k| k.host_key == hex_of(1)).count(), 1);
     }
 
     #[test]
     fn the_list_holds_twenty_and_drops_the_oldest() {
-        let d = dir("cap");
-        let mut keeps = with(&d, Vec::new());
+        let mut list = Vec::new();
         for i in 0..MAX_KEEPS as u8 {
-            keeps.remember(&[i; 32], &[i.wrapping_add(1); 32], Some(&format!("Keep number {i}")), 1000 + u64::from(i));
+            remember(&mut list, keep(i, 1000 + u64::from(i)));
+        }
+        assert_eq!(list.len(), MAX_KEEPS);
+        remember(&mut list, keep(100, 5000));
+        assert_eq!(list.len(), MAX_KEEPS);
+        assert_eq!(list[0], keep(100, 5000));
+        assert!(!contains(&list, &hex_of(0)), "the oldest, played at 1000, is gone");
+        assert!(contains(&list, &hex_of(1)));
+        // A new Keep older than all twenty does not push a newer one out.
+        remember(&mut list, keep(101, 1));
+        assert_eq!(list.len(), MAX_KEEPS);
+        assert!(!contains(&list, &hex_of(101)));
+        assert!(contains(&list, &hex_of(100)));
+    }
+
+    #[test]
+    fn the_list_helpers_ignore_hex_case() {
+        let mut list = vec![keep(0xab, 5)];
+        assert!(contains(&list, &hex_of(0xab).to_uppercase()));
+        assert!(forget(&mut list, &hex_of(0xab).to_uppercase()));
+        assert!(!forget(&mut list, &hex_of(0xab)));
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn the_file_holds_twenty_through_remember_too() {
+        let d = dir("filecap");
+        let mut keeps = load(&d);
+        for i in 0..(MAX_KEEPS as u8 + 3) {
+            keeps.remember(&[i; 32], &[i.wrapping_add(1); 32], None, 1000 + u64::from(i)).unwrap();
         }
         assert_eq!(keeps.list().len(), MAX_KEEPS);
-        keeps.remember(&[100; 32], &[101; 32], Some("Keep number 100"), 5000);
-        assert_eq!(keeps.list().len(), MAX_KEEPS);
-        assert_eq!(keeps.list()[0], keep(100, 5000));
-        assert!(!keeps.contains(&[0; 32]), "the oldest, played at 1000, is gone");
-        assert!(keeps.contains(&[1; 32]));
-        // A new Keep older than all twenty does not push a newer one out.
-        keeps.remember(&[101; 32], &[102; 32], None, 1);
-        assert_eq!(keeps.list().len(), MAX_KEEPS);
-        assert!(!keeps.contains(&[101; 32]));
-        assert!(keeps.contains(&[100; 32]));
+        assert_eq!(load(&d).list().len(), MAX_KEEPS);
+        assert!(!keeps.contains(&[0; 32]));
+        assert!(keeps.contains(&[22; 32]));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn forgetting_removes_one_keep_and_saves() {
         let d = dir("forget");
-        let mut keeps = Keeps::load(file(&d));
+        let mut keeps = load(&d);
         keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap();
         keeps.record_join(&[3; 32], &[4; 32], None, 20).unwrap();
-        assert_eq!(Keeps::load(file(&d)).list().len(), 2);
+        assert_eq!(load(&d).list().len(), 2);
         assert!(keeps.forget(&[1; 32]).unwrap());
-        let left = Keeps::load(file(&d));
+        let left = load(&d);
         assert_eq!(left.list().len(), 1);
         assert_eq!(left.list()[0].name, "Keep 030303");
-        assert!(!(keeps.forget(&[1; 32]).unwrap()), "forgetting an absent Keep changes nothing");
-        assert_eq!(Keeps::load(file(&d)).list(), left.list());
+        assert!(!keeps.forget(&[1; 32]).unwrap(), "forgetting an absent Keep changes nothing");
+        assert_eq!(load(&d).list(), left.list());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_stale_keeps_cannot_erase_what_another_saved() {
+        // The reviewer's probe: A loads, B joins Keep 9, then A forgets a different Keep.
+        let d = dir("stale");
+        let mut seed = load(&d);
+        seed.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap();
+        seed.record_join(&[3; 32], &[4; 32], Some("Three"), 20).unwrap();
+        let mut a = load(&d);
+        let mut b = load(&d);
+        b.record_join(&[9; 32], &[8; 32], Some("Nine"), 30).unwrap();
+        assert_eq!(a.list().len(), 2, "A's snapshot is stale");
+        assert!(a.forget(&[1; 32]).unwrap());
+        let on_disk = load(&d);
+        assert!(on_disk.contains(&[9; 32]), "B's Keep survived A's forget");
+        assert!(on_disk.contains(&[3; 32]));
+        assert!(!on_disk.contains(&[1; 32]));
+        assert_eq!(a.list(), on_disk.list(), "and A's snapshot caught up");
+        // The same through record_join and remember.
+        b.record_join(&[10; 32], &[11; 32], None, 40).unwrap();
+        a.record_join(&[12; 32], &[13; 32], None, 50).unwrap();
+        a.remember(&[14; 32], &[15; 32], None, 60).unwrap();
+        let on_disk = load(&d);
+        for n in [3u8, 9, 10, 12, 14] {
+            assert!(on_disk.contains(&[n; 32]), "{n}");
+        }
         let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
     fn a_join_that_changes_nothing_does_not_rewrite_the_file() {
         let d = dir("rewrite");
-        let mut keeps = Keeps::load(file(&d));
+        let mut keeps = load(&d);
         assert!(keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap());
         let first = std::fs::read(file(&d)).unwrap();
         // Replace the file with an identical copy so its modified time is known.
@@ -424,7 +635,7 @@ mod tests {
         std::fs::write(file(&d), &first).unwrap();
         let mtime = std::fs::metadata(file(&d)).unwrap().modified().unwrap();
         // Same Keep, same secret, same second: the list is as it was.
-        assert!(!(keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap()));
+        assert!(!keeps.record_join(&[1; 32], &[2; 32], Some("One"), 10).unwrap());
         assert_eq!(std::fs::metadata(file(&d)).unwrap().modified().unwrap(), mtime);
         assert_eq!(std::fs::read(file(&d)).unwrap(), first);
         // A later play, or a new secret, is a change.
@@ -438,29 +649,49 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_file_is_set_aside_and_bad_entries_are_dropped() {
+    fn a_file_that_is_not_a_list_is_set_aside() {
         let d = dir("broken");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(file(&d), "not json").unwrap();
-        assert!(Keeps::load(file(&d)).list().is_empty());
+        assert!(load(&d).list().is_empty());
         assert!(!file(&d).exists(), "the bad file is moved, not left in place");
         assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad")).unwrap(), "not json", "and never lost");
         // Not UTF-8 is also not a list.
         std::fs::write(file(&d), [0xff, 0xfe, 0x00]).unwrap();
-        assert!(Keeps::load(file(&d)).list().is_empty());
+        assert!(load(&d).list().is_empty());
         assert_eq!(std::fs::read(d.join("keeps.json.bad")).unwrap(), vec![0xff, 0xfe, 0x00]);
-        // A JSON value that is not an array of Keeps.
+        // A JSON value that is not an array.
         std::fs::write(file(&d), r#"{"host_key":"x"}"#).unwrap();
-        assert!(Keeps::load(file(&d)).list().is_empty());
+        assert!(load(&d).list().is_empty());
         assert!(!file(&d).exists());
-        // Bad entries are dropped, good ones stay.
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn one_bad_entry_is_dropped_and_the_rest_stay() {
+        let d = dir("badentry");
+        std::fs::create_dir_all(&d).unwrap();
         let good = keep(1, 5);
-        let mut bad = keep(2, 6);
-        bad.secret = "zz".into();
+        let mut bad_secret = keep(2, 6);
+        bad_secret.secret = "zz".into();
         let mut short = keep(3, 7);
         short.host_key = "ab".into();
-        std::fs::write(file(&d), serde_json::to_vec(&vec![bad, good.clone(), short]).unwrap()).unwrap();
-        assert_eq!(Keeps::load(file(&d)).list(), [good].as_slice());
+        let mut text = serde_json::to_string(&vec![bad_secret, good.clone(), short]).unwrap();
+        // An entry with no last_joined, one of the wrong type, and a stray number.
+        text.pop();
+        text.push_str(&format!(
+            ",{{\"host_key\":\"{}\",\"secret\":\"{}\",\"name\":\"x\"}},{{\"host_key\":5}},7]",
+            hex_of(4),
+            hex_of(5)
+        ));
+        std::fs::write(file(&d), text).unwrap();
+        assert_eq!(load(&d).list(), [good.clone()].as_slice());
+        assert!(!d.join("keeps.json.bad").exists(), "a few bad entries are not a bad file");
+        assert!(file(&d).exists());
+        // Saving after such a load keeps the good one.
+        let mut keeps = load(&d);
+        keeps.record_join(&[6; 32], &[7; 32], None, 99).unwrap();
+        assert_eq!(load(&d).list().len(), 2);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -469,10 +700,47 @@ mod tests {
         let d = dir("recover");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(file(&d), "{{{").unwrap();
-        let mut keeps = Keeps::load(file(&d));
+        let mut keeps = load(&d);
         assert!(keeps.record_join(&[1; 32], &[2; 32], None, 1).unwrap());
-        assert_eq!(Keeps::load(file(&d)).list().len(), 1);
+        assert_eq!(load(&d).list().len(), 1);
         assert!(d.join("keeps.json.bad").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_an_error_and_is_never_overwritten() {
+        // A directory where the file should be: reading it fails, and it is not "missing".
+        let d = dir("unreadable");
+        std::fs::create_dir_all(file(&d)).unwrap();
+        std::fs::write(file(&d).join("keep-me"), "x").unwrap();
+        assert!(Keeps::load(file(&d)).is_err());
+        let mut keeps = Keeps { path: file(&d), list: vec![keep(1, 1)] };
+        assert!(keeps.record_join(&[2; 32], &[3; 32], None, 5).is_err());
+        assert!(keeps.remember(&[2; 32], &[3; 32], None, 5).is_err());
+        assert!(keeps.forget(&[1; 32]).is_err());
+        assert!(keeps.reload().is_err());
+        assert!(file(&d).is_dir(), "nothing was saved over it");
+        assert!(file(&d).join("keep-me").exists());
+        assert_eq!(keeps.list().len(), 1, "the snapshot is left as it was");
+        assert!(!d.join("keeps.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_no_read_permission_is_an_error_and_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("noperm");
+        write(&d, &[keep(1, 5)]);
+        std::fs::set_permissions(file(&d), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything, so only check when the read really fails.
+        if std::fs::read(file(&d)).is_err() {
+            assert!(Keeps::load(file(&d)).is_err());
+            let mut keeps = Keeps { path: file(&d), list: Vec::new() };
+            assert!(keeps.record_join(&[2; 32], &[3; 32], None, 5).is_err());
+            std::fs::set_permissions(file(&d), std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(load(&d).list(), [keep(1, 5)].as_slice(), "the saved Keep is still there");
+        }
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -494,8 +762,7 @@ mod tests {
         let shown = format!("{k:?}");
         assert!(!shown.contains("0101"), "{shown}");
         assert!(shown.contains("Cousin"));
-        let d = dir("debug");
-        let keeps = with(&d, vec![k]);
+        let keeps = Keeps { path: PathBuf::from("keeps.json"), list: vec![k] };
         assert!(!format!("{keeps:?}").contains("0101"));
     }
 }

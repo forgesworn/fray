@@ -12,6 +12,6 @@ pub mod invite;
 pub mod keeps;
 pub mod pass;
 
-pub use invite::{describe, format_invite_link, hex_encode, invite_in_text, keep_id, parse_hex32, parse_invite_link, Invite};
-pub use keeps::{ago, display_name, Keep, Keeps, MAX_KEEPS};
+pub use invite::{describe, format_invite_link, hex_encode, invite_in_text, is_link_word, keep_id, parse_hex32, parse_invite_link, Invite};
+pub use keeps::{ago, display_name, display_name_hex, is_invisible, keep_id_hex, Keep, Keeps, MAX_KEEPS};
 pub use pass::accept_pass;
