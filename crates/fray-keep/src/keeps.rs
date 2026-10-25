@@ -78,9 +78,9 @@ pub fn display_name(host_name: Option<&str>, host_key: &[u8; 32]) -> String {
 }
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", "4 d ago", "3 mo ago".
-/// `now` and `then` are seconds since the Unix epoch; a `then` after `now` (a
+/// `then` and `now` are seconds since the Unix epoch; a `then` after `now` (a
 /// clock that went back) reads "just now".
-pub fn ago(now: u64, then: u64) -> String {
+pub fn ago(then: u64, now: u64) -> String {
     let s = now.saturating_sub(then);
     match s {
         0..=89 => "just now".into(),
@@ -480,12 +480,12 @@ mod tests {
     fn times_read_in_plain_words() {
         let now = 10_000_000;
         assert_eq!(ago(now, now), "just now");
-        assert_eq!(ago(now, now - 600), "10 min ago");
-        assert_eq!(ago(now, now - 3 * 3600), "3 h ago");
-        assert_eq!(ago(now, now - 86_400), "yesterday");
-        assert_eq!(ago(now, now - 4 * 86_400), "4 d ago");
-        assert_eq!(ago(now, now - 90 * 86_400), "3 mo ago");
-        assert_eq!(ago(now, now + 50), "just now", "a clock that went back");
+        assert_eq!(ago(now - 600, now), "10 min ago");
+        assert_eq!(ago(now - 3 * 3600, now), "3 h ago");
+        assert_eq!(ago(now - 86_400, now), "yesterday");
+        assert_eq!(ago(now - 4 * 86_400, now), "4 d ago");
+        assert_eq!(ago(now - 90 * 86_400, now), "3 mo ago");
+        assert_eq!(ago(now + 50, now), "just now", "a clock that went back");
     }
 
     #[test]
