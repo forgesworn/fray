@@ -1286,6 +1286,142 @@ fn the_reason_kicked_reads_as_plain_kicked() {
     );
 }
 
+/// Text with every kind of character a peer must not get onto a player's screen.
+const DIRTY_CLOSE_TEXT: &str = "\u{202e}Fake\u{0}\u{7} orders\u{200b}:\r\nreboot\u{feff}";
+
+/// No control, bidi or invisible character, and no line break.
+fn assert_clean(text: &str) {
+    for c in text.chars() {
+        assert!(
+            !c.is_control() && !fray_keep::is_invisible(c),
+            "{c:?} in {text:?}"
+        );
+    }
+}
+
+/// A bare QUIC host (no Fray host behind it) that takes a joiner's hello and
+/// then closes the connection with `code` and `reason`.
+fn closing_host(code: u32, reason: Vec<u8>) -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::runtime().spawn(async move {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let endpoint = quic::server_endpoint(socket, TAG, quic::Liveness::DEFAULT).unwrap();
+        tx.send(endpoint.local_addr().unwrap()).unwrap();
+        let conn = endpoint.accept().await.unwrap().accept().unwrap().await.unwrap();
+        let _ = quic::server_read_hello(&conn).await;
+        conn.close(code.into(), &reason);
+        // Keep the endpoint up until the close frame has been delivered.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    rx.recv().unwrap()
+}
+
+/// What a joiner is told when a host closes on it with `code` and `reason`.
+fn join_failure_text(code: u32, reason: Vec<u8>) -> String {
+    let addr = closing_host(code, reason);
+    let cl = join_addr(&cfg(), &Identity::ephemeral(), addr, &"0".repeat(64));
+    let ev = wait_client(&cl, 10, |e| {
+        matches!(
+            e,
+            ClientEvent::Failed { .. } | ClientEvent::Connected { .. }
+        )
+    });
+    match ev {
+        ClientEvent::Failed {
+            stage: JoinStage::Handshake,
+            reason: FailReason::Network(m),
+        } => m,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_host_close_with_an_unknown_code_reaches_a_joiner_as_cleaned_text() {
+    // A long dirty reason: the text is cleaned and cut, not passed raw.
+    let mut reason = DIRTY_CLOSE_TEXT.as_bytes().to_vec();
+    reason.extend(std::iter::repeat_n(b'x', 600));
+    let m = join_failure_text(99, reason);
+    assert_clean(&m);
+    assert!(
+        m.contains("closed by peer (code 99): Fake orders: reboot"),
+        "{m:?}"
+    );
+    assert!(m.len() < 300, "{} bytes: {m:?}", m.len());
+}
+
+#[test]
+fn a_host_close_with_no_text_gives_no_dangling_separator() {
+    let m = join_failure_text(99, Vec::new());
+    assert!(m.ends_with("closed by peer (code 99)"), "{m:?}");
+    // Text that cleans to nothing reads the same.
+    let m = join_failure_text(99, "\u{202e}\u{200b}\n\u{0}".as_bytes().to_vec());
+    assert!(m.ends_with("closed by peer (code 99)"), "{m:?}");
+}
+
+#[test]
+fn quinn_close_errors_are_described_from_kind_and_code_plus_cleaned_text() {
+    use crate::quic::{connection_error_text, ended_of, Ended};
+    let app = |code: u32, reason: &[u8]| {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: code.into(),
+            reason: Bytes::copy_from_slice(reason),
+        })
+    };
+    let transport = |reason: &[u8]| {
+        quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+            error_code: quinn::TransportErrorCode::PROTOCOL_VIOLATION,
+            frame_type: None,
+            reason: Bytes::copy_from_slice(reason),
+        })
+    };
+    assert_eq!(
+        connection_error_text(&app(99, DIRTY_CLOSE_TEXT.as_bytes())),
+        "closed by peer (code 99): Fake orders: reboot"
+    );
+    assert_eq!(connection_error_text(&app(7, b"")), "closed by peer (code 7)");
+    // The transport-level close a client sees as Disconnected(Error(..)): the
+    // one path no test can drive over a real connection, because quinn only
+    // sends application closes.
+    let long = format!("{DIRTY_CLOSE_TEXT}{}", "y".repeat(500));
+    let text = connection_error_text(&transport(long.as_bytes()));
+    assert_clean(&text);
+    assert!(
+        text.starts_with("aborted by peer (code 10: ") && text.contains("): Fake orders: reboot"),
+        "{text:?}"
+    );
+    assert!(text.len() <= 200 + 160, "{} bytes: {text:?}", text.len());
+    assert!(connection_error_text(&transport("\n\u{202e}".as_bytes())).ends_with(')'));
+    // Bytes that are not UTF-8 are cleaned too.
+    let text = connection_error_text(&app(99, b"\xff\xfe\x1b[2Jhi\x07"));
+    assert_clean(&text);
+    assert!(text.starts_with("closed by peer (code 99): "), "{text:?}");
+    assert!(text.ends_with("hi"), "{text:?}");
+    // The pump's Ended carries the same text; Fray's own errors are unchanged.
+    assert_eq!(
+        ended_of(&transport(DIRTY_CLOSE_TEXT.as_bytes())),
+        Ended::Error(connection_error_text(&transport(DIRTY_CLOSE_TEXT.as_bytes())))
+    );
+    assert_eq!(
+        connection_error_text(&quinn::ConnectionError::TimedOut),
+        "timed out"
+    );
+    assert_eq!(connection_error_text(&quinn::ConnectionError::Reset), "reset by peer");
+    // A lost connection inside a stream error spells out how the peer closed.
+    let lost = quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(app(
+        99,
+        DIRTY_CLOSE_TEXT.as_bytes(),
+    )));
+    assert_eq!(
+        crate::quic::read_exact_error_text(&lost),
+        "connection lost: closed by peer (code 99): Fake orders: reboot"
+    );
+    let lost = quinn::WriteError::ConnectionLost(app(99, DIRTY_CLOSE_TEXT.as_bytes()));
+    assert_eq!(
+        crate::quic::write_error_text(&lost),
+        "connection lost: closed by peer (code 99): Fake orders: reboot"
+    );
+}
+
 #[test]
 fn an_empty_or_all_invisible_reason_gives_plain_kicked() {
     assert_eq!(
