@@ -116,7 +116,9 @@ that TLS session. A fake host learns nothing it can replay.
   `DisconnectReason::KickedWith`. The text comes from the host, so the client
   treats it as untrusted: it must be valid UTF-8, has control, bidi and
   invisible characters removed, and is cut to 200 bytes. An older client reads
-  the same close as plain `Kicked`.
+  the same close as plain `Kicked`. Close text on every other path (the error
+  strings for a close with an unrecognised code or a transport-level close, on
+  clients and hosts alike) goes through the same cleaner before a game sees it.
 
 ## Invites (code-room hosts)
 

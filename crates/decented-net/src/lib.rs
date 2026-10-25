@@ -565,9 +565,15 @@ pub(crate) fn kick_reason_text(bytes: &[u8]) -> Option<String> {
     if bytes == b"kicked" {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    // Whitespace (line breaks, tabs, U+0085, U+2028/9 included) reads as a space (a run of them as one); every other
-    // control, bidi and invisible character is dropped.
+    clean_peer_text(std::str::from_utf8(bytes).ok()?)
+}
+
+/// The one cleaner for text a peer put in a close frame, whichever way it
+/// reaches a game: whitespace (line breaks, tabs, U+0085, U+2028/9 included)
+/// reads as a space (a run of them as one); every other control, bidi and
+/// invisible character is dropped; trimmed and cut to [`MAX_DISCONNECT_REASON`]
+/// bytes. `None` when nothing is left.
+pub(crate) fn clean_peer_text(text: &str) -> Option<String> {
     let mut clean = String::new();
     for c in text.chars() {
         if c.is_whitespace() {
@@ -580,6 +586,18 @@ pub(crate) fn kick_reason_text(bytes: &[u8]) -> Option<String> {
     }
     let cut = cut_reason(clean.trim()).trim();
     (!cut.is_empty()).then(|| cut.to_string())
+}
+
+/// `what` (the error kind and code, our own text) followed by `: ` and the
+/// peer's close reason bytes, cleaned by [`clean_peer_text`]; just `what` when
+/// there are no reason bytes or nothing is left of them. Bytes that are not
+/// UTF-8 are read as lossily as quinn's own `Display` does (invalid sequences
+/// become U+FFFD), then cleaned.
+pub(crate) fn with_peer_text(what: String, reason: &[u8]) -> String {
+    match clean_peer_text(&String::from_utf8_lossy(reason)) {
+        Some(text) => format!("{what}: {text}"),
+        None => what,
+    }
 }
 
 /// Why the connection to the host ended (client side).

@@ -313,7 +313,7 @@ pub(crate) async fn read_frame(
     match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
         Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
-        Err(e) => return Err(format!("frame header: {e}")),
+        Err(e) => return Err(format!("frame header: {}", read_exact_error_text(&e))),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > cap {
@@ -322,7 +322,7 @@ pub(crate) async fn read_frame(
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf)
         .await
-        .map_err(|e| format!("frame body: {e}"))?;
+        .map_err(|e| format!("frame body: {}", read_exact_error_text(&e)))?;
     Ok(Some(Bytes::from(buf)))
 }
 
@@ -330,7 +330,7 @@ async fn write_frame(send: &mut quinn::SendStream, payload: &[u8]) -> Result<(),
     let frame = encode_frame(payload).ok_or("frame too large")?;
     send.write_all(&frame)
         .await
-        .map_err(|e| format!("write: {e}"))
+        .map_err(|e| format!("write: {}", write_error_text(&e)))
 }
 
 async fn write_frame_capped(
@@ -341,7 +341,7 @@ async fn write_frame_capped(
     let frame = encode_frame_capped(payload, cap).ok_or("frame too large")?;
     send.write_all(&frame)
         .await
-        .map_err(|e| format!("write: {e}"))
+        .map_err(|e| format!("write: {}", write_error_text(&e)))
 }
 
 // ─── Handshake ──────────────────────────────────────────────────────────────
@@ -779,7 +779,7 @@ pub(crate) async fn client_open_bound(
     let (mut send, mut recv) = conn
         .open_bi()
         .await
-        .map_err(|e| format!("open stream: {e}"))?;
+        .map_err(|e| format!("open stream: {}", connection_error_text(&e)))?;
     let json = serde_json::to_vec(&hello).map_err(|e| e.to_string())?;
     write_frame(&mut send, &json).await?;
     let frame = read_frame(&mut recv, HANDSHAKE_FRAME_CAP)
@@ -895,7 +895,7 @@ pub(crate) async fn server_read_hello(
     let (send, mut recv) = conn
         .accept_bi()
         .await
-        .map_err(|e| (close::BAD_HELLO, format!("accept stream: {e}")))?;
+        .map_err(|e| (close::BAD_HELLO, format!("accept stream: {}", connection_error_text(&e))))?;
     let frame = read_frame(&mut recv, HELLO_FRAME_CAP)
         .await
         .map_err(|e| (close::BAD_HELLO, e))?
@@ -1184,7 +1184,51 @@ pub(crate) fn ended_of(err: &quinn::ConnectionError) -> Ended {
         ),
         quinn::ConnectionError::TimedOut => Ended::TimedOut,
         quinn::ConnectionError::LocallyClosed => Ended::Local,
-        other => Ended::Error(other.to_string()),
+        other => Ended::Error(connection_error_text(other)),
+    }
+}
+
+/// The text for a connection error. The peer chooses the reason bytes in a
+/// close frame, and quinn's own `Display` prints them raw, so this builds the
+/// text from the error kind and code and runs the reason through the same
+/// cleaner as `DisconnectReason::KickedWith` (and nothing else may format a
+/// quinn error that can hold a peer's close into a string a game sees). The
+/// other kinds carry only our own or quinn's fixed text.
+pub(crate) fn connection_error_text(err: &quinn::ConnectionError) -> String {
+    match err {
+        quinn::ConnectionError::ApplicationClosed(ac) => crate::with_peer_text(
+            format!("closed by peer (code {})", ac.error_code),
+            &ac.reason,
+        ),
+        quinn::ConnectionError::ConnectionClosed(cc) => crate::with_peer_text(
+            format!(
+                "aborted by peer (code {}: {})",
+                u64::from(cc.error_code),
+                cc.error_code
+            ),
+            &cc.reason,
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// A stream read error's text; a lost connection says how the peer closed it.
+pub(crate) fn read_exact_error_text(err: &quinn::ReadExactError) -> String {
+    match err {
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(e)) => {
+            format!("connection lost: {}", connection_error_text(e))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A stream write error's text; a lost connection says how the peer closed it.
+pub(crate) fn write_error_text(err: &quinn::WriteError) -> String {
+    match err {
+        quinn::WriteError::ConnectionLost(e) => {
+            format!("connection lost: {}", connection_error_text(e))
+        }
+        other => other.to_string(),
     }
 }
 
