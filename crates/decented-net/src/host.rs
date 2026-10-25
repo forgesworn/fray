@@ -1237,6 +1237,9 @@ impl HostHandle {
     /// The reason `"kicked"` is what plain `disconnect` sends, so it reads as
     /// plain `Kicked` too.
     ///
+    /// Meant for connected players: a close that arrives during the join
+    /// handshake shows as `Failed(NotAdmitted)` with no text.
+    ///
     /// An older client receiving this close reads it as `Kicked`, so nothing
     /// breaks; a client of this version talking to an older host sees `Kicked`.
     pub fn disconnect_with_reason(&self, peer: PeerId, reason: &str) {
