@@ -69,15 +69,19 @@ impl Keep {
 
 /// Format characters that draw nothing, reorder text or break a line (bidi
 /// overrides, zero-width joiners, the byte-order mark, line and paragraph
-/// separators, the Hangul fillers, tag characters and variation selectors): a
+/// separators, the Hangul fillers, the combining grapheme joiner, the Mongolian
+/// vowel separator, interlinear annotation marks, musical formatting controls,
+/// tag characters and variation selectors): a
 /// host's name may not carry them. Runs of combining marks are not limited.
 pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{ad}'
+            | '\u{34f}'
             | '\u{61c}'
             | '\u{115f}'
             | '\u{1160}'
+            | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}'
@@ -86,6 +90,8 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0000}'..='\u{e007f}'
             | '\u{e0100}'..='\u{e01ef}'
     )
@@ -373,8 +379,13 @@ mod tests {
         for c in ['\u{e0000}', '\u{e0041}', '\u{e007f}', '\u{fe00}', '\u{fe0f}', '\u{e0100}', '\u{e01ef}'] {
             assert!(is_invisible(c), "{c:?}");
         }
+        // Other characters that draw nothing: the combining grapheme joiner, the Mongolian vowel separator, interlinear
+        // annotation anchors and musical formatting controls.
+        for c in ['\u{34f}', '\u{180e}', '\u{fff9}', '\u{fffa}', '\u{fffb}', '\u{1d173}', '\u{1d17a}'] {
+            assert!(is_invisible(c), "{c:?}");
+        }
         // Their neighbours are ordinary characters.
-        for c in ['\u{dfff0}', '\u{e0080}', '\u{fdff}', '\u{fe10}', '\u{e00ff}', '\u{e01f0}', '\u{301}'] {
+        for c in ['\u{dfff0}', '\u{e0080}', '\u{fdff}', '\u{fe10}', '\u{e00ff}', '\u{e01f0}', '\u{301}', '\u{34e}', '\u{350}', '\u{180d}', '\u{180f}', '\u{fff8}', '\u{fffc}', '\u{1d172}', '\u{1d17b}'] {
             assert!(!is_invisible(c), "{c:?}");
         }
     }
