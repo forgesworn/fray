@@ -1188,10 +1188,7 @@ fn reason_seen_after_disconnect_with(reason: &str) -> DisconnectReason {
     h.disconnect_with_reason(peer, reason);
     let ev = wait_client(&cl, 5, |e| matches!(e, ClientEvent::Disconnected { .. }));
     h.shutdown();
-    match ev {
-        ClientEvent::Disconnected { reason } => reason,
-        other => panic!("{other:?}"),
-    }
+    disconnected(ev)
 }
 
 #[test]
@@ -1248,11 +1245,44 @@ fn a_long_reason_is_cut_on_a_character_boundary() {
 #[test]
 fn control_and_bidi_characters_are_removed_from_a_reason() {
     let seen = reason_seen_after_disconnect_with(
-        "  The\u{202e} world\u{0} restarted\u{7}\n; join\u{200b} again.\u{feff}  ",
+        "  The\u{202e} world\u{0} restarted\u{7}; join\u{200b} again.\u{feff}  ",
     );
     assert_eq!(
         seen,
         DisconnectReason::KickedWith("The world restarted; join again.".into())
+    );
+}
+
+#[test]
+fn line_breaks_and_tabs_in_a_reason_become_single_spaces() {
+    assert_eq!(
+        reason_seen_after_disconnect_with(
+            "World restarted.\r\n\nJoin\t again.\u{2028}Now. \u{200b}\n x"
+        ),
+        DisconnectReason::KickedWith("World restarted. Join again. Now. x".into())
+    );
+}
+
+#[test]
+fn the_host_cuts_the_reason_before_it_is_sent() {
+    // 66 zero-width spaces are 198 bytes, so the host's 200-byte cut keeps
+    // only "He" of the visible text. If the host did not cut, the client
+    // would clean the invisible run first and show all of "Hello".
+    let reason = format!("{}Hello", "\u{200b}".repeat(66));
+    assert_eq!(
+        reason_seen_after_disconnect_with(&reason),
+        DisconnectReason::KickedWith("He".into())
+    );
+    assert_eq!(crate::cut_reason(&"\u{20ac}".repeat(100)).len(), 198);
+    assert_eq!(crate::cut_reason(&"a".repeat(200)).len(), 200);
+    assert_eq!(crate::cut_reason(&"a".repeat(201)).len(), 200);
+}
+
+#[test]
+fn the_reason_kicked_reads_as_plain_kicked() {
+    assert_eq!(
+        reason_seen_after_disconnect_with("kicked"),
+        DisconnectReason::Kicked
     );
 }
 

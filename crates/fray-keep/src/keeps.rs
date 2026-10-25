@@ -69,7 +69,8 @@ impl Keep {
 
 /// Format characters that draw nothing, reorder text or break a line (bidi
 /// overrides, zero-width joiners, the byte-order mark, line and paragraph
-/// separators, the Hangul fillers): a host's name may not carry them.
+/// separators, the Hangul fillers, tag characters and variation selectors): a
+/// host's name may not carry them. Runs of combining marks are not limited.
 pub fn is_invisible(c: char) -> bool {
     matches!(
         c,
@@ -82,8 +83,11 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
             | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
             | '\u{ffa0}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
     )
 }
 
@@ -365,6 +369,14 @@ mod tests {
         assert_eq!(keep_id_hex("abcdef0123"), "ABCDEF");
         assert_eq!(keep_id_hex("abc"), "ABC");
         assert!(is_invisible('\u{202e}') && is_invisible('\u{feff}') && !is_invisible('a') && !is_invisible('\u{e9}'));
+        // Tag characters and variation selectors draw nothing and can smuggle text or marks.
+        for c in ['\u{e0000}', '\u{e0041}', '\u{e007f}', '\u{fe00}', '\u{fe0f}', '\u{e0100}', '\u{e01ef}'] {
+            assert!(is_invisible(c), "{c:?}");
+        }
+        // Their neighbours are ordinary characters.
+        for c in ['\u{dfff0}', '\u{e0080}', '\u{fdff}', '\u{fe10}', '\u{e00ff}', '\u{e01f0}', '\u{301}'] {
+            assert!(!is_invisible(c), "{c:?}");
+        }
     }
 
     #[test]

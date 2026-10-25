@@ -1234,6 +1234,9 @@ impl HostHandle {
     /// nothing but invisible characters, shows as plain `Kicked`. Emits
     /// `PeerLeft{Kicked}`.
     ///
+    /// The reason `"kicked"` is what plain `disconnect` sends, so it reads as
+    /// plain `Kicked` too.
+    ///
     /// An older client receiving this close reads it as `Kicked`, so nothing
     /// breaks; a client of this version talking to an older host sees `Kicked`.
     pub fn disconnect_with_reason(&self, peer: PeerId, reason: &str) {

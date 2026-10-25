@@ -559,17 +559,25 @@ pub(crate) fn cut_reason(s: &str) -> &str {
 
 /// What a client tells the game about a `KICKED` close's reason bytes: `None`
 /// (plain `Kicked`) unless they are valid UTF-8, not exactly `kicked`, and
-/// something is left after removing control, bidi and invisible characters
-/// and trimming; the rest is cut to [`MAX_DISCONNECT_REASON`] bytes.
+/// something is left after turning line breaks and tabs into single spaces,
+/// removing control, bidi and invisible characters and trimming; the rest is cut to [`MAX_DISCONNECT_REASON`] bytes.
 pub(crate) fn kick_reason_text(bytes: &[u8]) -> Option<String> {
     if bytes == b"kicked" {
         return None;
     }
     let text = std::str::from_utf8(bytes).ok()?;
-    let clean: String = text
-        .chars()
-        .filter(|c| !c.is_control() && !fray_keep::is_invisible(*c))
-        .collect();
+    // Whitespace (line breaks, tabs, U+0085, U+2028/9 included) reads as a space (a run of them as one); every other
+    // control, bidi and invisible character is dropped.
+    let mut clean = String::new();
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !clean.ends_with(' ') {
+                clean.push(' ');
+            }
+        } else if !c.is_control() && !fray_keep::is_invisible(c) {
+            clean.push(c);
+        }
+    }
     let cut = cut_reason(clean.trim()).trim();
     (!cut.is_empty()).then(|| cut.to_string())
 }
