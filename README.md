@@ -13,6 +13,7 @@ Fray is a poll-driven Rust transport for small realtime multiplayer games. Games
 | `fray-net` | `crates/decented-net` | QUIC reliable messages and datagrams, Nostr rendezvous, LAN discovery, NAT candidates and virtual links |
 | `fray-relays` | `crates/decented-relays` | Relay ordering, health, retry schedules, fallback and a shared process-wide pool |
 | `fray-session` | `crates/fray-session` | Game-session state machines with no I/O: host migration, recovery, membership and the room-code format. `fray-net` re-exports them |
+| `fray-keep` | `crates/fray-keep` | What a game needs to join a Keep by invite link: the link and finding it in pasted text, the saved-Keeps list (`keeps.json`) and the return-pass rule. Each game keeps its own wire format and words |
 
 The legacy directory names preserve the existing source-layout tests. New applications import `fray_net` and `fray_relays`; the session types can also come straight from `fray_session`. Existing consumers can keep their source imports using Cargo dependency aliases.
 
