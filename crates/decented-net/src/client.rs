@@ -985,7 +985,11 @@ async fn find_host(
                         Some("full") => FailReason::RoomFull,
                         Some("closed") => FailReason::RoomClosed,
                         Some("version") => FailReason::VersionMismatch,
-                        other => FailReason::Network(format!("refused: {other:?}")),
+                        // The host's own word, cleaned like any text a peer chose.
+                        other => FailReason::Network(match other.and_then(crate::clean_peer_text) {
+                            Some(text) => format!("refused: {text}"),
+                            None => "refused".to_string(),
+                        }),
                     })
                 }
                 Err(e) => log::debug!("[join] ignoring an answer: {e:?}"),
