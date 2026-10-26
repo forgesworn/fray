@@ -495,7 +495,10 @@ async fn run(
                 {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
-                        log::info!("[join] LAN connect to {addr}: {e}");
+                        log::info!(
+                            "[join] LAN connect to {addr}: {}",
+                            quic::connection_error_text(&e)
+                        );
                         return fail(JoinStage::Connecting, FailReason::PunchFailed);
                     }
                     Err(_) => return fail(JoinStage::Connecting, FailReason::PunchFailed),
@@ -667,7 +670,7 @@ async fn run(
                     (opened, Some(session), path, None)
                 }
                 Err(f) => {
-                    log::info!("[join] connect race: {f:?}");
+                    log::info!("[join] connect race: {}", quic::race_failure_text(&f));
                     let (stage, reason) = race_failure(&f);
                     return fail(stage, reason);
                 }

@@ -1191,7 +1191,7 @@ impl Link {
             return;
         }
         if let Err(e) = self.conn.send_datagram(bytes) {
-            log::debug!("[net] datagram dropped: {e}");
+            log::debug!("[net] datagram dropped: {}", send_datagram_error_text(&e));
         }
     }
 
@@ -1268,6 +1268,47 @@ pub(crate) fn write_error_text(err: &quinn::WriteError) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// A datagram send error's text; a lost connection says how the peer closed it.
+pub(crate) fn send_datagram_error_text(err: &quinn::SendDatagramError) -> String {
+    match err {
+        quinn::SendDatagramError::ConnectionLost(e) => {
+            format!("connection lost: {}", connection_error_text(e))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// How a connection ended, for a log line: the peer's close reason, when it
+/// gave one, is cleaned (the derived `Debug` would print its raw bytes).
+pub(crate) fn ended_text(ended: &Ended) -> String {
+    match ended {
+        Ended::Remote(code, reason) => {
+            crate::with_peer_text(format!("closed by peer (code {code})"), reason)
+        }
+        Ended::TimedOut => "timed out".to_string(),
+        Ended::Local => "closed locally".to_string(),
+        Ended::Error(text) => text.clone(),
+    }
+}
+
+/// One race attempt's failure, for a log line (never the derived `Debug`: it
+/// carries the peer's close reason raw).
+pub(crate) fn attempt_error_text(err: &AttemptError) -> String {
+    match err {
+        AttemptError::Connect => "no connection".to_string(),
+        AttemptError::Open(e, None) => format!("no verified welcome: {e}"),
+        AttemptError::Open(e, Some(ended)) => {
+            format!("no verified welcome: {e}; {}", ended_text(ended))
+        }
+    }
+}
+
+/// A failed race, for a log line: each attempt's [`attempt_error_text`].
+pub(crate) fn race_failure_text(f: &RaceFailure) -> String {
+    let attempts: Vec<String> = f.errors.iter().map(attempt_error_text).collect();
+    format!("connected: {}; [{}]", f.connected, attempts.join(", "))
 }
 
 /// Move bytes until the connection ends. Reliable frames go to `on_reliable`,
@@ -1426,7 +1467,10 @@ pub(crate) async fn race_open(
                             match tokio::time::timeout(ATTEMPT_CONNECT_TIMEOUT, connecting).await {
                                 Ok(Ok(c)) => c,
                                 Ok(Err(e)) => {
-                                    log::debug!("[net] candidate {addr}: {e}");
+                                    log::debug!(
+                                        "[net] candidate {addr}: {}",
+                                        connection_error_text(&e)
+                                    );
                                     return (idx, Err(AttemptError::Connect));
                                 }
                                 Err(_) => {
@@ -1481,7 +1525,11 @@ pub(crate) async fn race_open(
                                 }
                             }
                             Err(e) => {
-                                log::info!("[net] candidate {}: {e:?}", candidates[idx]);
+                                log::info!(
+                                    "[net] candidate {}: {}",
+                                    candidates[idx],
+                                    attempt_error_text(&e)
+                                );
                                 errors.push(e);
                                 race.on_failed(idx);
                             }
