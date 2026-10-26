@@ -565,9 +565,7 @@ async fn relay_worker(
                 let r = tokio::time::timeout(DIAL_TIMEOUT, dial)
                     .await
                     .map_err(|_| "timed out".to_string())
-                    .and_then(|r| {
-                        r.map_err(|e| e.to_string().chars().take(120).collect::<String>())
-                    })
+                    .and_then(|r| r.map_err(|e| dial_error_text(&e.to_string())))
                     .map(|(ws, _)| ws);
                 let _ = tx.send((i, r, started.elapsed()));
             });
@@ -738,10 +736,35 @@ async fn relay_worker(
     log::info!("[relay] worker stopped");
 }
 
+/// A dial error's text for the relay health (public, in `decented-relays`):
+/// cleaned like any text another party chose (a certificate-name error can
+/// carry the server's own name), then cut to 120 characters. A fixed phrase
+/// when nothing is left.
+fn dial_error_text(raw: &str) -> String {
+    match crate::clean_peer_text(raw) {
+        Some(text) => text.chars().take(120).collect(),
+        None => "dial failed".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn a_dial_error_is_cleaned_then_capped_for_the_public_health_text() {
+        assert_eq!(
+            dial_error_text("HTTP error: 503 Service Unavailable"),
+            "HTTP error: 503 Service Unavailable"
+        );
+        let dirty = format!("cert \u{202e}name\u{0}\u{1b}[2J\r\nis\u{200b} bad {}", "z".repeat(400));
+        let text = dial_error_text(&dirty);
+        assert!(text.starts_with("cert name[2J is bad zzz"), "{text:?}");
+        assert_eq!(text.chars().count(), 120);
+        assert!(text.chars().all(|c| !c.is_control() && !fray_keep::is_invisible(c)));
+        assert_eq!(dial_error_text("\u{202e}\u{0}\n"), "dial failed");
+    }
 
     fn ev(kind: u16, letter: &str, value: &str) -> Event {
         EventBuilder::new(Kind::Custom(kind), "x")
