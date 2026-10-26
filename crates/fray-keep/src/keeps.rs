@@ -20,6 +20,10 @@
 //! Keep meanwhile) never erases an entry another one saved. [`Keeps::list`] is
 //! a snapshot from the last load or change. The free functions on a
 //! `Vec<Keep>` are the same rules without the file.
+//!
+//! One writer at a time: two threads or processes saving the same file at once
+//! can lose an update, or leave a half-written file that the next read sets
+//! aside as `<file>.bad`. A game saves from its one frame loop.
 
 use crate::invite::{hex_encode, parse_hex32};
 use serde::{Deserialize, Serialize};
@@ -227,6 +231,14 @@ fn write_list(path: &Path, list: &[Keep]) -> std::io::Result<()> {
 }
 
 /// The saved Keeps, newest play first, kept in one file.
+/// Write `list` to the file at `path` as it stands, privately and atomically
+/// like every save here. It does not read the file first, so a caller keeping
+/// its own copy of the list saves that copy; the [`Keeps`] calls that change
+/// the list are the ones that keep another writer's entries.
+pub fn save_list(path: &Path, list: &[Keep]) -> std::io::Result<()> {
+    write_list(path, list)
+}
+
 #[derive(Clone, Debug)]
 pub struct Keeps {
     path: PathBuf,
@@ -347,6 +359,22 @@ mod tests {
     fn write(d: &Path, list: &[Keep]) {
         std::fs::create_dir_all(d).unwrap();
         std::fs::write(file(d), serde_json::to_vec_pretty(list).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_list_saved_as_it_stands_loads_back_the_same_and_private() {
+        let d = dir("save-list");
+        let list = vec![keep(3, 30), keep(2, 20)];
+        save_list(&file(&d), &list).unwrap();
+        assert_eq!(load(&d).list(), &list[..]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(file(&d)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        save_list(&file(&d), &[]).unwrap();
+        assert!(load(&d).list().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
