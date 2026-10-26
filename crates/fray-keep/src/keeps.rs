@@ -11,9 +11,10 @@
 //! Reading it: an entry that is not a whole Keep with hex keys is dropped, hex
 //! is lower-cased, names are cleaned, there is one entry per host key (the
 //! newest kept), newest first, at most [`MAX_KEEPS`]. A file that is not a JSON
-//! array at all is moved to `<file>.bad` and reads as empty. A file that cannot
-//! be read for any reason but being absent is an error, and nothing is ever
-//! saved over it.
+//! array at all is moved to `<file>.bad` and reads as empty; if it cannot be
+//! moved (`<file>.bad` is a directory, the folder is read-only) that is an
+//! error and it stays where it is. A file that cannot be read for any reason
+//! but being absent is an error, and nothing is ever saved over it.
 //!
 //! [`Keeps`] changes the list by reading the file again, changing what is
 //! there and saving, so a `Keeps` that has gone stale (a second one saved a
@@ -181,7 +182,10 @@ fn read_list(path: &Path) -> std::io::Result<Vec<Keep>> {
         Err(e) => return Err(e),
     };
     let Ok(serde_json::Value::Array(items)) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        let _ = std::fs::rename(path, sibling(path, ".bad"));
+        // The corrupt file is moved aside so a save cannot overwrite it. If it
+        // cannot be moved it is still in place, so this is a read error: the
+        // caller must not save over it.
+        std::fs::rename(path, sibling(path, ".bad"))?;
         return Ok(Vec::new());
     };
     let mut list: Vec<Keep> = items.into_iter().filter_map(|v| serde_json::from_value::<Keep>(v).ok()).collect();
@@ -248,7 +252,8 @@ pub struct Keeps {
 impl Keeps {
     /// Read the saved Keeps from `path`; see the module docs for what is
     /// dropped and what is moved to `<file>.bad`. A missing file is an empty
-    /// list. Any other failure to read it is an error: the file is left alone.
+    /// list. Any other failure to read it, or to move a corrupt file aside, is
+    /// an error: the file is left alone.
     pub fn load(path: impl Into<PathBuf>) -> std::io::Result<Keeps> {
         let path = path.into();
         let list = read_list(&path)?;
@@ -773,6 +778,23 @@ mod tests {
         assert!(file(&d).is_dir(), "nothing was saved over it");
         assert!(file(&d).join("keep-me").exists());
         assert_eq!(keeps.list().len(), 1, "the snapshot is left as it was");
+        assert!(!d.join("keeps.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_corrupt_file_that_cannot_be_set_aside_is_an_error_and_is_kept() {
+        // A directory at `.bad` makes the rename fail, so the corrupt file stays put.
+        let d = dir("badrename");
+        std::fs::create_dir_all(d.join("keeps.json.bad")).unwrap();
+        std::fs::write(file(&d), "{{{").unwrap();
+        assert!(Keeps::load(file(&d)).is_err());
+        let mut keeps = Keeps { path: file(&d), list: Vec::new() };
+        assert!(keeps.record_join(&[2; 32], &[3; 32], None, 5).is_err());
+        assert!(keeps.forget(&[1; 32]).is_err());
+        assert!(keeps.reload().is_err());
+        assert_eq!(std::fs::read_to_string(file(&d)).unwrap(), "{{{", "the corrupt bytes are still there");
+        assert!(d.join("keeps.json.bad").is_dir());
         assert!(!d.join("keeps.json.tmp").exists());
         let _ = std::fs::remove_dir_all(d);
     }
