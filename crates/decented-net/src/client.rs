@@ -988,11 +988,7 @@ async fn find_host(
                         Some("full") => FailReason::RoomFull,
                         Some("closed") => FailReason::RoomClosed,
                         Some("version") => FailReason::VersionMismatch,
-                        // The host's own word, cleaned like any text a peer chose.
-                        other => FailReason::Network(match other.and_then(crate::clean_peer_text) {
-                            Some(text) => format!("refused: {text}"),
-                            None => "refused".to_string(),
-                        }),
+                        other => FailReason::Network(refusal_text(other)),
                     })
                 }
                 Err(e) => log::debug!("[join] ignoring an answer: {e:?}"),
@@ -1002,6 +998,15 @@ async fn find_host(
             return Err(FailReason::NoAnswer);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The failure text for a host's refusal word that is not one of the known
+/// ones: the host's own word, cleaned like any text a peer chose.
+fn refusal_text(word: Option<&str>) -> String {
+    match word.and_then(crate::clean_peer_text) {
+        Some(text) => format!("refused: {text}"),
+        None => "refused".to_string(),
     }
 }
 
@@ -1026,6 +1031,22 @@ fn other_answerer(relay: &dyn RendezvousRelay, host: &PublicKey) -> Option<Publi
 mod tests {
     use super::*;
     use crate::quic::{sign_welcome, verify_welcome};
+
+    #[test]
+    fn a_hosts_refusal_word_is_cleaned_like_any_peer_text() {
+        assert_eq!(refusal_text(Some("banned")), "refused: banned");
+        assert_eq!(refusal_text(None), "refused");
+        assert_eq!(refusal_text(Some("\u{202e}\u{7}\u{200b}\n")), "refused");
+        let dirty = format!("\u{202e}no\u{0}\u{7}\r\nway\u{200b}{}", "x".repeat(500));
+        let text = refusal_text(Some(&dirty));
+        let want = crate::clean_peer_text(&dirty).unwrap();
+        assert_eq!(text, format!("refused: {want}"));
+        assert!(text.starts_with("refused: no way"), "{text:?}");
+        assert!(text.len() <= "refused: ".len() + crate::MAX_DISCONNECT_REASON);
+        assert!(text
+            .chars()
+            .all(|c| !c.is_control() && !fray_keep::is_invisible(c)));
+    }
 
     fn found(relay: &Keys, host: &PublicKey) -> Found {
         Found {
