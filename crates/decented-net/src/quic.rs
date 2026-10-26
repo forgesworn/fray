@@ -693,14 +693,16 @@ pub(crate) fn verify_welcome(
     if w.host_name.len() > MAX_HOST_NAME {
         return Err("host name too long".into());
     }
+    // `check_inbox_relays` errors are our own fixed text (a count and a rule),
+    // never the peer's strings, so they can pass through as they are.
     crate::identity::check_inbox_relays(&w.inbox_relays).map_err(|e| format!("welcome: {e}"))?;
-    let pk = PublicKey::from_hex(&w.host_pubkey).map_err(|e| format!("host pubkey: {e}"))?;
-    let xonly = pk.xonly().map_err(|e| format!("host pubkey: {e}"))?;
-    let relay_key = PublicKey::from_hex(&w.relay_key).map_err(|e| format!("relay key: {e}"))?;
+    let pk = PublicKey::from_hex(&w.host_pubkey).map_err(|e| malformed("host pubkey", &e))?;
+    let xonly = pk.xonly().map_err(|e| malformed("host pubkey", &e))?;
+    let relay_key = PublicKey::from_hex(&w.relay_key).map_err(|e| malformed("relay key", &e))?;
     let sig: Signature = w
         .sig
         .parse()
-        .map_err(|e| format!("welcome signature: {e}"))?;
+        .map_err(|e| malformed("welcome signature", &e))?;
     let base = welcome_digest(
         binding,
         session,
@@ -785,8 +787,7 @@ pub(crate) async fn client_open_bound(
     let frame = read_frame(&mut recv, HANDSHAKE_FRAME_CAP)
         .await?
         .ok_or("host closed the stream")?;
-    let w: Welcome = serde_json::from_slice(&frame)
-        .map_err(|e| HandshakeError::Unverified(format!("welcome: {e}")))?;
+    let w = parse_welcome(&frame).map_err(HandshakeError::Unverified)?;
     let proof = verify_welcome(&w, &b, session).map_err(HandshakeError::Unverified)?;
     if proof.migration.as_ref() != expected {
         return Err(HandshakeError::Unverified(
@@ -851,7 +852,7 @@ async fn read_accepted(opened: &mut Opened) -> Result<(), HandshakeError> {
     let frame = read_frame(&mut opened.recv, HANDSHAKE_FRAME_CAP)
         .await?
         .ok_or("host closed the stream")?;
-    let a: Accepted = serde_json::from_slice(&frame).map_err(|e| format!("accepted: {e}"))?;
+    let a = parse_accepted(&frame)?;
     if a.v != NET_PROTOCOL_VERSION {
         return Err(HandshakeError::Io(format!("accepted version {}", a.v)));
     }
@@ -887,6 +888,50 @@ impl std::fmt::Display for HandshakeError {
     }
 }
 
+/// The text for a parse failure on something the other side sent: a fixed
+/// phrase naming what failed, `what: malformed`. A parser's own message can
+/// quote the offending value (serde_json does), so it never goes into text a
+/// game or the peer sees; it goes to the debug log, cleaned by [`log_detail`].
+pub(crate) fn malformed(what: &str, detail: &dyn std::fmt::Display) -> String {
+    log::debug!("[net] {what}: {}", log_detail(detail));
+    format!("{what}: malformed")
+}
+
+/// A parser's message for the log: cleaned by the same cleaner as peer text in
+/// a close frame (no control characters, bounded length).
+pub(crate) fn log_detail(detail: &dyn std::fmt::Display) -> String {
+    crate::clean_peer_text(&detail.to_string()).unwrap_or_else(|| "(no detail)".to_string())
+}
+
+fn parse_welcome(frame: &[u8]) -> Result<Welcome, String> {
+    serde_json::from_slice(frame).map_err(|e| malformed("welcome", &e))
+}
+
+fn parse_accepted(frame: &[u8]) -> Result<Accepted, String> {
+    serde_json::from_slice(frame).map_err(|e| malformed("accepted", &e))
+}
+
+fn parse_hello(frame: &[u8]) -> Result<Hello, String> {
+    serde_json::from_slice(frame).map_err(|e| malformed("hello", &e))
+}
+
+fn parse_identify(frame: &[u8]) -> Result<Identify, String> {
+    serde_json::from_slice(frame).map_err(|e| malformed("identity", &e))
+}
+
+/// The key and signature a joiner's identity frame names, or a fixed phrase.
+fn identify_keys(
+    id: &Identify,
+) -> Result<(PublicKey, nostr::secp256k1::XOnlyPublicKey, Signature), String> {
+    let pk = PublicKey::from_hex(&id.pubkey).map_err(|e| malformed("identity pubkey", &e))?;
+    let xonly = pk.xonly().map_err(|e| malformed("identity pubkey", &e))?;
+    let sig: Signature = id
+        .sig
+        .parse()
+        .map_err(|e| malformed("identity signature", &e))?;
+    Ok((pk, xonly, sig))
+}
+
 /// Host, phase 1: accept the stream and read the hello. The caller checks
 /// admission before answering it.
 pub(crate) async fn server_read_hello(
@@ -900,8 +945,7 @@ pub(crate) async fn server_read_hello(
         .await
         .map_err(|e| (close::BAD_HELLO, e))?
         .ok_or((close::BAD_HELLO, "no hello".to_string()))?;
-    let hello: Hello =
-        serde_json::from_slice(&frame).map_err(|e| (close::BAD_HELLO, format!("hello: {e}")))?;
+    let hello = parse_hello(&frame).map_err(|e| (close::BAD_HELLO, e))?;
     if hello.v != NET_PROTOCOL_VERSION {
         return Err((close::VERSION, format!("version {}", hello.v)));
     }
@@ -981,14 +1025,8 @@ pub(crate) async fn server_read_identify(
         .await
         .map_err(|e| (close::BAD_HELLO, e))?
         .ok_or((close::BAD_HELLO, "no identity".to_string()))?;
-    let id: Identify =
-        serde_json::from_slice(&frame).map_err(|e| (close::BAD_HELLO, format!("identity: {e}")))?;
-    let pk = PublicKey::from_hex(&id.pubkey).map_err(|e| (close::BAD_HELLO, e.to_string()))?;
-    let xonly = pk.xonly().map_err(|e| (close::BAD_HELLO, e.to_string()))?;
-    let sig: Signature = id
-        .sig
-        .parse()
-        .map_err(|e| (close::BAD_HELLO, format!("signature: {e}")))?;
+    let id = parse_identify(&frame).map_err(|e| (close::BAD_HELLO, e))?;
+    let (pk, xonly, sig) = identify_keys(&id).map_err(|e| (close::BAD_HELLO, e))?;
     if id
         .attestation
         .as_ref()
@@ -1553,6 +1591,157 @@ mod tests {
             digest(&["wss://a", "wss://bwss://c"])
         );
         assert_eq!(base, digest(&["wss://a.example"]));
+    }
+
+    /// A value a peer chose: a marker, then a control character.
+    const MARKER: &str = "PEERMARK-zq7\u{7}";
+
+    fn assert_fixed(text: &str, expected: &str) {
+        assert_eq!(text, expected);
+        assert!(!text.contains("PEERMARK"), "{text:?}");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+    }
+
+    #[test]
+    fn a_frame_that_does_not_parse_gives_a_fixed_phrase_without_the_peers_text() {
+        let welcome = format!(r#"{{"v":"{MARKER}"}}"#).replace('\u{7}', "\\u0007");
+        let accepted = welcome.clone();
+        let hello = format!(r#"{{"v":6,"session":null,"path":"Direct","admit":"{MARKER}"}}"#)
+            .replace('\u{7}', "\\u0007");
+        let identity = format!(r#"{{"pubkey":"a","sig":"b","inbox_relays":"{MARKER}"}}"#)
+            .replace('\u{7}', "\\u0007");
+        // The test is only meaningful if the parser really does quote the value.
+        for (raw, quoted) in [
+            (
+                serde_json::from_slice::<Welcome>(welcome.as_bytes()).err(),
+                "welcome",
+            ),
+            (
+                serde_json::from_slice::<Accepted>(accepted.as_bytes()).err(),
+                "accepted",
+            ),
+            (
+                serde_json::from_slice::<Hello>(hello.as_bytes()).err(),
+                "hello",
+            ),
+            (
+                serde_json::from_slice::<Identify>(identity.as_bytes()).err(),
+                "identity",
+            ),
+        ] {
+            let raw = raw.unwrap_or_else(|| panic!("{quoted} parsed")).to_string();
+            assert!(
+                raw.contains("PEERMARK"),
+                "{quoted}: serde no longer quotes: {raw}"
+            );
+        }
+        assert_fixed(
+            &parse_welcome(welcome.as_bytes()).unwrap_err(),
+            "welcome: malformed",
+        );
+        assert_fixed(
+            &parse_accepted(accepted.as_bytes()).unwrap_err(),
+            "accepted: malformed",
+        );
+        assert_fixed(
+            &parse_hello(hello.as_bytes()).unwrap_err(),
+            "hello: malformed",
+        );
+        assert_fixed(
+            &parse_identify(identity.as_bytes()).unwrap_err(),
+            "identity: malformed",
+        );
+        // An unknown variant is quoted by serde too.
+        let path = format!(r#"{{"v":6,"session":null,"path":"{MARKER}","admit":[]}}"#)
+            .replace('\u{7}', "\\u0007");
+        assert_fixed(
+            &parse_hello(path.as_bytes()).unwrap_err(),
+            "hello: malformed",
+        );
+        // Good frames still parse.
+        assert!(parse_accepted(br#"{"v":6}"#).is_ok());
+    }
+
+    #[test]
+    fn a_welcome_with_a_bad_field_gives_a_fixed_phrase_without_the_peers_text() {
+        let host = Keys::generate();
+        let relay = Keys::generate();
+        let b = [7u8; 32];
+        let w = sign_welcome(&host, &b, None, 1, "Ava", &relay.public_key(), None, &[]);
+        assert!(verify_welcome(&w, &b, None).is_ok());
+        let mut bad = w.clone();
+        bad.host_pubkey = MARKER.into();
+        assert_fixed(
+            &verify_welcome(&bad, &b, None).unwrap_err(),
+            "host pubkey: malformed",
+        );
+        let mut bad = w.clone();
+        bad.relay_key = MARKER.into();
+        assert_fixed(
+            &verify_welcome(&bad, &b, None).unwrap_err(),
+            "relay key: malformed",
+        );
+        let mut bad = w.clone();
+        bad.sig = MARKER.into();
+        assert_fixed(
+            &verify_welcome(&bad, &b, None).unwrap_err(),
+            "welcome signature: malformed",
+        );
+    }
+
+    #[test]
+    fn an_inbox_relay_list_error_never_carries_the_peers_text() {
+        // `check_inbox_relays` is left as it is: its errors are a count and a rule.
+        let long = vec![format!("wss://{MARKER}"); 4];
+        let err = crate::identity::check_inbox_relays(&long).unwrap_err();
+        assert!(!err.contains("PEERMARK"), "{err:?}");
+        let err = crate::identity::check_inbox_relays(&[format!("https://{MARKER}")]).unwrap_err();
+        assert!(!err.contains("PEERMARK"), "{err:?}");
+    }
+
+    #[test]
+    fn an_identity_with_a_bad_key_or_signature_gives_a_fixed_phrase() {
+        let keys = Keys::generate();
+        let good = Identify {
+            pubkey: keys.public_key().to_hex(),
+            sig: keys
+                .sign_schnorr(&Message::from_digest([1u8; 32]))
+                .to_string(),
+            attestation: None,
+            inbox_relays: Vec::new(),
+        };
+        assert!(identify_keys(&good).is_ok());
+        let mut bad = good.clone();
+        bad.pubkey = MARKER.into();
+        assert_fixed(
+            &identify_keys(&bad).unwrap_err(),
+            "identity pubkey: malformed",
+        );
+        let mut bad = good.clone();
+        bad.sig = MARKER.into();
+        assert_fixed(
+            &identify_keys(&bad).unwrap_err(),
+            "identity signature: malformed",
+        );
+    }
+
+    #[test]
+    fn a_parser_message_is_cleaned_before_it_reaches_the_log() {
+        let noisy = format!(
+            "invalid type: string \"a\u{7}b\u{202e}c\nd\", {}",
+            "x".repeat(1000)
+        );
+        let line = log_detail(&noisy);
+        assert!(
+            !line.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{line:?}"
+        );
+        assert!(line.len() <= crate::MAX_DISCONNECT_REASON, "{}", line.len());
+        assert!(
+            line.starts_with("invalid type: string \"abc d\""),
+            "{line:?}"
+        );
+        assert_eq!(log_detail(&"\u{7}\u{8}"), "(no detail)");
     }
 
     #[test]

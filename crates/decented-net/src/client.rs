@@ -825,8 +825,13 @@ fn host_matches_answer(proof: &quic::HostProof, found: &Found) -> Result<(), Str
 
 /// [`host_matches_answer`] on the answer's named identity (hex) and signer.
 fn host_matches(proof: &quic::HostProof, named: &str, signer: &PublicKey) -> Result<(), String> {
-    let named = PublicKey::from_hex(named)
-        .map_err(|e| format!("the answer names no valid host identity: {e}"))?;
+    let named = PublicKey::from_hex(named).map_err(|e| {
+        log::debug!(
+            "[join] the answer's host identity: {}",
+            quic::log_detail(&e)
+        );
+        "the answer names no valid host identity".to_string()
+    })?;
     if proof.pubkey != named {
         return Err(format!(
             "welcome signed by {} but the answer named {named}",
@@ -980,7 +985,11 @@ async fn find_host(
                         Some("full") => FailReason::RoomFull,
                         Some("closed") => FailReason::RoomClosed,
                         Some("version") => FailReason::VersionMismatch,
-                        other => FailReason::Network(format!("refused: {other:?}")),
+                        // The host's own word, cleaned like any text a peer chose.
+                        other => FailReason::Network(match other.and_then(crate::clean_peer_text) {
+                            Some(text) => format!("refused: {text}"),
+                            None => "refused".to_string(),
+                        }),
                     })
                 }
                 Err(e) => log::debug!("[join] ignoring an answer: {e:?}"),
@@ -1104,6 +1113,12 @@ mod tests {
         for bad in ["", "zz", "00"] {
             f.answer.host_pubkey = bad.into();
             assert!(host_matches_answer(&proof, &f).is_err(), "{bad:?}");
+        }
+        // Whatever the answer named, the text carries none of it.
+        for bad in ["PEERMARK-zq7\u{7}", "zz"] {
+            f.answer.host_pubkey = bad.into();
+            let err = host_matches_answer(&proof, &f).unwrap_err();
+            assert_eq!(err, "the answer names no valid host identity");
         }
     }
 }
