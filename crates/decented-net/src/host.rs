@@ -1738,7 +1738,10 @@ impl HostTask {
                             if let Ok(mut g) = m.lock() {
                                 if let Some(pm) = g.as_mut() {
                                     if let Err(e) = pm.renew(Instant::now()) {
-                                        log::info!("[nat] router mapping renew failed: {e}");
+                                        log::info!(
+                                            "[nat] router mapping renew failed: {}",
+                                            crate::quic::log_detail(&e)
+                                        );
                                     }
                                 }
                             }
@@ -2281,7 +2284,9 @@ pub(crate) async fn prepare_advertising(
                 let v4 = crate::nat::candidates::local_outbound_v4()?;
                 let internal = SocketAddr::new(std::net::IpAddr::V4(v4), local.port());
                 crate::nat::upnp::map_port(internal, crate::nat::upnp::SEARCH_TIMEOUT)
-                    .map_err(|e| log::info!("[nat] no router mapping: {e}"))
+                    .map_err(|e| {
+                        log::info!("[nat] no router mapping: {}", crate::quic::log_detail(&e))
+                    })
                     .ok()
             })
         });
