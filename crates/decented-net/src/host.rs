@@ -2521,9 +2521,9 @@ pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
             Arriving::Incoming(incoming) => {
                 let conn = incoming
                     .accept()
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| quic::connection_error_text(&e))?
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| quic::connection_error_text(&e))?;
                 if let Ok(mut accepted) = accepted.lock() {
                     *accepted = Some(conn.clone());
                 }

@@ -1358,6 +1358,62 @@ fn a_host_close_with_no_text_gives_no_dangling_separator() {
     assert!(m.ends_with("closed by peer (code 99)"), "{m:?}");
 }
 
+/// The log-line texts (the accept path in a host and the listener, a LAN
+/// connect, a candidate, a datagram, a failed race) all come from the same
+/// helpers; those sites can only be reached through a live connection that
+/// closes with a hostile reason, so the helpers are tested here.
+#[test]
+fn log_texts_never_carry_a_peers_close_reason_raw() {
+    use crate::quic::{
+        attempt_error_text, connection_error_text, ended_of, ended_text, race_failure_text,
+        send_datagram_error_text, AttemptError, Ended, HandshakeError, RaceFailure,
+    };
+    let app = |reason: &[u8]| {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: 99u32.into(),
+            reason: Bytes::copy_from_slice(reason),
+        })
+    };
+    let long = format!("{DIRTY_CLOSE_TEXT}{}", "y".repeat(500));
+    let want = "closed by peer (code 99): Fake orders: reboot";
+    // The accept path's mapping, a LAN connect and a candidate: a quinn error
+    // goes through connection_error_text where it is still a ConnectionError.
+    assert_eq!(connection_error_text(&app(DIRTY_CLOSE_TEXT.as_bytes())), want);
+    let text = connection_error_text(&app(long.as_bytes()));
+    assert_clean(&text);
+    assert!(text.len() <= 200 + 40, "{} bytes: {text:?}", text.len());
+    // A datagram send on a connection the peer closed.
+    let lost = quinn::SendDatagramError::ConnectionLost(app(DIRTY_CLOSE_TEXT.as_bytes()));
+    assert_eq!(
+        send_datagram_error_text(&lost),
+        format!("connection lost: {want}")
+    );
+    assert_eq!(
+        send_datagram_error_text(&quinn::SendDatagramError::UnsupportedByPeer),
+        quinn::SendDatagramError::UnsupportedByPeer.to_string()
+    );
+    // How a connection ended.
+    let remote = ended_of(&app(long.as_bytes()));
+    let text = ended_text(&remote);
+    assert_clean(&text);
+    assert!(text.starts_with("closed by peer (code 99): Fake orders: reboot"), "{text:?}");
+    assert_eq!(ended_text(&Ended::TimedOut), "timed out");
+    assert_eq!(ended_text(&Ended::Local), "closed locally");
+    assert_eq!(ended_text(&Ended::Error("x".into())), "x");
+    // A failed race.
+    let attempt = AttemptError::Open(HandshakeError::Io("no welcome".into()), Some(remote));
+    let text = attempt_error_text(&attempt);
+    assert_clean(&text);
+    assert!(text.starts_with("no verified welcome: no welcome; closed by peer (code 99): Fake"), "{text:?}");
+    assert_eq!(attempt_error_text(&AttemptError::Connect), "no connection");
+    let text = race_failure_text(&RaceFailure {
+        errors: vec![AttemptError::Connect, attempt],
+        connected: true,
+    });
+    assert_clean(&text);
+    assert!(text.starts_with("connected: true; [no connection, no verified welcome"), "{text:?}");
+}
+
 #[test]
 fn quinn_close_errors_are_described_from_kind_and_code_plus_cleaned_text() {
     use crate::quic::{connection_error_text, ended_of, Ended};

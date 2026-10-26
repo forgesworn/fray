@@ -839,9 +839,9 @@ async fn demux(incoming: quinn::Incoming, listener: Arc<ListenerShared>) {
     let found = async {
         let conn = incoming
             .accept()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| quic::connection_error_text(&e))?
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| quic::connection_error_text(&e))?;
         let refuse = |conn: &quinn::Connection, code: u32, why: String| {
             conn.close(code.into(), why.as_bytes());
             Err(why)
