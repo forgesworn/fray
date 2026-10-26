@@ -781,7 +781,10 @@ async fn run_listener(
                     if let Ok(mut g) = m.lock() {
                         if let Some(pm) = g.as_mut() {
                             if let Err(e) = pm.renew(Instant::now()) {
-                                log::info!("[nat] router mapping renew failed: {e}");
+                                log::info!(
+                                    "[nat] router mapping renew failed: {}",
+                                    crate::quic::log_detail(&e)
+                                );
                             }
                         }
                     }

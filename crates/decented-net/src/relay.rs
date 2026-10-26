@@ -152,6 +152,16 @@ pub fn event_frame(ev: &Event) -> String {
     json!(["EVENT", ev]).to_string()
 }
 
+/// The log line for a relay that refused an event. The id comes from the
+/// relay's own OK frame, so it is cleaned and bounded like any text a peer
+/// chose; the URL is ours.
+fn rejected_line(url: &str, id: &str) -> String {
+    format!(
+        "[relay] {url} rejected event {}",
+        crate::quic::log_detail(&id)
+    )
+}
+
 pub fn parse_frame(text: &str, sub_id: &str) -> Frame {
     parse_frame_where(text, |id| id == sub_id)
 }
@@ -705,7 +715,7 @@ async fn relay_worker(
                                 id,
                                 accepted: false,
                             } => {
-                                log::warn!("[relay] {} rejected event {id}", urls[i]);
+                                log::warn!("{}", rejected_line(&urls[i], &id));
                             }
                             Frame::Ok { .. } | Frame::Eose | Frame::Other => {}
                         }
@@ -771,6 +781,25 @@ mod tests {
             .tags([Tag::parse([letter, value]).unwrap()])
             .sign_with_keys(&Keys::generate())
             .unwrap()
+    }
+
+    #[test]
+    fn a_relay_chosen_event_id_is_cleaned_before_it_reaches_the_log() {
+        let line = rejected_line(
+            "wss://r.example",
+            &format!("ab\u{7}c\u{202e}\nd{}", "x".repeat(1000)),
+        );
+        assert!(
+            !line.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{line:?}"
+        );
+        assert!(line.starts_with("[relay] wss://r.example rejected event abc d"));
+        assert!(
+            line.len() < 100 + crate::MAX_DISCONNECT_REASON,
+            "{}",
+            line.len()
+        );
+        assert!(rejected_line("u", "\u{7}").ends_with("(no detail)"));
     }
 
     #[test]

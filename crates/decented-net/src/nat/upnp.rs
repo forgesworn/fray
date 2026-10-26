@@ -123,7 +123,10 @@ impl PortMapping {
             .gateway
             .remove_port(PortMappingProtocol::UDP, self.external.port())
         {
-            log::debug!("[nat] releasing the port mapping: {e}");
+            log::debug!(
+                "[nat] releasing the port mapping: {}",
+                crate::quic::log_detail(&e)
+            );
         }
     }
 }
