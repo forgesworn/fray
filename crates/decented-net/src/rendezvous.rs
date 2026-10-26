@@ -129,7 +129,12 @@ fn open<T: serde::de::DeserializeOwned>(
     }
     let json = nostr::nips::nip44::decrypt(recipient.secret_key(), &ev.pubkey, &ev.content)
         .map_err(|e| RendezvousError::Decrypt(e.to_string()))?;
-    serde_json::from_str(&json).map_err(|e| RendezvousError::Parse(e.to_string()))
+    // serde_json's message quotes the offending value, so the error carries a
+    // fixed phrase and the detail goes to the debug log, cleaned.
+    serde_json::from_str(&json).map_err(|e| {
+        log::debug!("[rendezvous] payload: {}", crate::quic::log_detail(&e));
+        RendezvousError::Parse("malformed".to_string())
+    })
 }
 
 fn fresh(sent_at: u64, now: u64) -> Result<(), RendezvousError> {
@@ -256,6 +261,25 @@ mod tests {
             open_offer(&room, &ev, now),
             Err(RendezvousError::PubkeyMismatch)
         );
+    }
+
+    #[test]
+    fn an_offer_that_does_not_parse_carries_no_peer_text() {
+        let now = crate::unix_now();
+        let (joiner, room) = (Keys::generate(), Keys::generate());
+        let tag = Tag::parse(["t", "x"]).unwrap();
+        // The test is only meaningful if serde quotes the value.
+        let payload = serde_json::json!({
+            "v": 6, "session": "s", "pubkey": "p", "sent_at": 1,
+            "candidates": "PEERMARK-zq7\u{7}",
+        });
+        let raw = serde_json::from_value::<Offer>(payload.clone()).unwrap_err();
+        assert!(raw.to_string().contains("PEERMARK"), "{raw}");
+        let ev = seal(&joiner, &room.public_key(), KIND_JOIN_OFFER, tag, &payload).unwrap();
+        match open_offer(&room, &ev, now) {
+            Err(RendezvousError::Parse(text)) => assert_eq!(text, "malformed"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

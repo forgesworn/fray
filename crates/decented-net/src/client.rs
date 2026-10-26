@@ -825,8 +825,13 @@ fn host_matches_answer(proof: &quic::HostProof, found: &Found) -> Result<(), Str
 
 /// [`host_matches_answer`] on the answer's named identity (hex) and signer.
 fn host_matches(proof: &quic::HostProof, named: &str, signer: &PublicKey) -> Result<(), String> {
-    let named = PublicKey::from_hex(named)
-        .map_err(|e| format!("the answer names no valid host identity: {e}"))?;
+    let named = PublicKey::from_hex(named).map_err(|e| {
+        log::debug!(
+            "[join] the answer's host identity: {}",
+            quic::log_detail(&e)
+        );
+        "the answer names no valid host identity".to_string()
+    })?;
     if proof.pubkey != named {
         return Err(format!(
             "welcome signed by {} but the answer named {named}",
@@ -1104,6 +1109,12 @@ mod tests {
         for bad in ["", "zz", "00"] {
             f.answer.host_pubkey = bad.into();
             assert!(host_matches_answer(&proof, &f).is_err(), "{bad:?}");
+        }
+        // Whatever the answer named, the text carries none of it.
+        for bad in ["PEERMARK-zq7\u{7}", "zz"] {
+            f.answer.host_pubkey = bad.into();
+            let err = host_matches_answer(&proof, &f).unwrap_err();
+            assert_eq!(err, "the answer names no valid host identity");
         }
     }
 }
