@@ -12,9 +12,9 @@
 //! is lower-cased, names are cleaned, there is one entry per host key (the
 //! newest kept), newest first, at most [`MAX_KEEPS`]. A file that is not a JSON
 //! array at all is moved aside and reads as empty. It goes to the first of
-//! `<file>.bad`, `<file>.bad.2` ... `<file>.bad.10` that does not exist, so an
-//! earlier corrupt file is never replaced, and [`Keeps::set_aside`] says where it
-//! went. Once all ten names are taken, `<file>.bad.10` holds the newest: the
+//! `<file>.bad`, `<file>.bad.2` ... `<file>.bad.10` that does not exist, so the
+//! first nine are never replaced, and [`Keeps::set_aside`] says where it went.
+//! Once all ten names are taken, `<file>.bad.10` holds the newest: the
 //! file replaces it there, so the first nine are kept and a game can always save
 //! again. If it cannot be moved (the folder is read-only, or `.bad.10` is not a
 //! plain file), that is an error and it stays where it is. A file that cannot be
@@ -31,7 +31,7 @@
 //! can lose an update, or leave a half-written file that the next read sets
 //! aside. A game saves from its one frame loop. Setting a corrupt file aside does
 //! not need that: the name is reserved atomically, so two writers never replace
-//! a set-aside file.
+//! a set-aside file before all ten names are taken.
 
 use crate::invite::{hex_encode, parse_hex32};
 use serde::{Deserialize, Serialize};
@@ -200,7 +200,11 @@ fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
             Ok(placeholder) => {
                 drop(placeholder);
                 if let Err(e) = std::fs::rename(path, &target) {
-                    let _ = std::fs::remove_file(&target);
+                    // Only our empty placeholder: a writer that found all ten names
+                    // taken may have moved its corrupt file here meanwhile.
+                    if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_file() && m.len() == 0) {
+                        let _ = std::fs::remove_file(&target);
+                    }
                     return Err(e);
                 }
                 return Ok(target);
@@ -316,7 +320,8 @@ impl Keeps {
     }
 
     /// Where the most recent read that found a corrupt file put it (`<file>.bad`,
-    /// or the next free `<file>.bad.N`), or `None` if no read of this `Keeps`
+    /// the next free `<file>.bad.N`, or `<file>.bad.10` once all ten are taken),
+    /// or `None` if no read of this `Keeps`
     /// has had to. A later read that finds a good file does not clear it. For
     /// the log: a game says where the player's old list went.
     pub fn set_aside(&self) -> Option<&Path> {
@@ -944,6 +949,25 @@ mod tests {
         }
         assert_eq!(std::fs::read_to_string(d.join(bad_name(10))).unwrap(), "corrupt 12", "the last name holds the newest");
         assert!(!d.join("keeps.json.bad.11").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_last_name_is_never_replaced() {
+        let d = dir("lastlink");
+        std::fs::create_dir_all(&d).unwrap();
+        for n in 1..=9u32 {
+            std::fs::write(d.join(bad_name(n)), format!("corrupt {n}")).unwrap();
+        }
+        let elsewhere = d.join("elsewhere");
+        std::fs::write(&elsewhere, "not ours").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, d.join(bad_name(10))).unwrap();
+        std::fs::write(file(&d), "corrupt 10").unwrap();
+        assert!(Keeps::load(file(&d)).is_err());
+        assert_eq!(std::fs::read_to_string(file(&d)).unwrap(), "corrupt 10", "left in place");
+        assert!(std::fs::symlink_metadata(d.join(bad_name(10))).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "not ours");
         let _ = std::fs::remove_dir_all(d);
     }
 
