@@ -14,8 +14,10 @@
 //! array at all is moved aside and reads as empty. It goes to the first of
 //! `<file>.bad`, `<file>.bad.2` ... `<file>.bad.10` that does not exist, so an
 //! earlier corrupt file is never replaced, and [`Keeps::set_aside`] says where it
-//! went. If all ten names are taken, or it cannot be moved (the folder is
-//! read-only), that is an error and it stays where it is. A file that cannot be
+//! went. Once all ten names are taken, `<file>.bad.10` holds the newest: the
+//! file replaces it there, so the first nine are kept and a game can always save
+//! again. If it cannot be moved (the folder is read-only, or `.bad.10` is not a
+//! plain file), that is an error and it stays where it is. A file that cannot be
 //! read for any reason but being absent is an error, and nothing is ever saved
 //! over it.
 //!
@@ -187,8 +189,10 @@ const MAX_SET_ASIDE: u32 = 10;
 /// fails if anything is there (a directory or a dangling link counts), and the
 /// corrupt file is then renamed over that placeholder. Two writers can no
 /// longer replace a set-aside file: whoever loses the race for a name moves on
-/// to the next one. With no free name, or if the move fails (the placeholder is
-/// removed, best effort), the file stays where it is and this is an error.
+/// to the next one. With no free name the file replaces the last name, but only
+/// when a plain file is there. If that is not so, or the move fails (the
+/// placeholder is removed, best effort), the file stays where it is and this is
+/// an error.
 fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
     for n in 1..=MAX_SET_ASIDE {
         let target = if n == 1 { sibling(path, ".bad") } else { sibling(path, &format!(".bad.{n}")) };
@@ -205,7 +209,14 @@ fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other(format!("all {MAX_SET_ASIDE} set-aside names for a corrupt keeps file are taken")))
+    let last = sibling(path, &format!(".bad.{MAX_SET_ASIDE}"));
+    if !std::fs::symlink_metadata(&last).is_ok_and(|m| m.is_file()) {
+        return Err(std::io::Error::other(format!(
+            "all {MAX_SET_ASIDE} set-aside names for a corrupt keeps file are taken, and the last is not a plain file"
+        )));
+    }
+    std::fs::rename(path, &last)?;
+    Ok(last)
 }
 
 /// Read the file as the module docs say, and say where a corrupt file was set
@@ -909,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_files_use_all_ten_names_in_order_and_the_next_is_an_error() {
+    fn corrupt_files_use_all_ten_names_in_order_then_replace_the_last() {
         let d = dir("tenbad");
         std::fs::create_dir_all(&d).unwrap();
         for n in 1..=10u32 {
@@ -920,11 +931,18 @@ mod tests {
         for n in 1..=10u32 {
             assert_eq!(std::fs::read_to_string(d.join(bad_name(n))).unwrap(), format!("corrupt {n}"));
         }
-        std::fs::write(file(&d), "corrupt 11").unwrap();
-        assert!(Keeps::load(file(&d)).is_err());
-        assert_eq!(std::fs::read_to_string(file(&d)).unwrap(), "corrupt 11", "left in place");
-        assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad")).unwrap(), "corrupt 1");
-        assert_eq!(std::fs::read_to_string(d.join(bad_name(10))).unwrap(), "corrupt 10");
+        for n in 11..=12u32 {
+            std::fs::write(file(&d), format!("corrupt {n}")).unwrap();
+            let mut keeps = Keeps::load(file(&d)).unwrap();
+            assert_eq!(keeps.set_aside(), Some(d.join(bad_name(10)).as_path()));
+            assert!(!file(&d).exists());
+            keeps.remember(&[1; 32], &[2; 32], None, 3).unwrap();
+            std::fs::remove_file(file(&d)).unwrap();
+        }
+        for n in 1..=9u32 {
+            assert_eq!(std::fs::read_to_string(d.join(bad_name(n))).unwrap(), format!("corrupt {n}"), "{} is kept", bad_name(n));
+        }
+        assert_eq!(std::fs::read_to_string(d.join(bad_name(10))).unwrap(), "corrupt 12", "the last name holds the newest");
         assert!(!d.join("keeps.json.bad.11").exists());
         let _ = std::fs::remove_dir_all(d);
     }
