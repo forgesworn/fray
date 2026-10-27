@@ -27,8 +27,9 @@
 //!
 //! One writer at a time: two threads or processes saving the same file at once
 //! can lose an update, or leave a half-written file that the next read sets
-//! aside. A game saves from its one frame loop. Choosing the name to set a file
-//! aside under (check it is free, then rename) assumes the same single writer.
+//! aside. A game saves from its one frame loop. Setting a corrupt file aside does
+//! not need that: the name is reserved atomically, so two writers never replace
+//! a set-aside file.
 
 use crate::invite::{hex_encode, parse_hex32};
 use serde::{Deserialize, Serialize};
@@ -182,20 +183,25 @@ fn sibling(file: &Path, suffix: &str) -> PathBuf {
 const MAX_SET_ASIDE: u32 = 10;
 
 /// Move the corrupt file at `path` to the first free `.bad` name and return it.
-/// A name is used only after checking nothing is there (a dangling link counts
-/// as there), so an earlier set-aside file is never replaced. This assumes one
-/// writer: another process creating the same name between the check and the
-/// rename would be overwritten. With no free name, or if the move fails, the
-/// file stays where it is and this is an error.
+/// A name is reserved by creating an empty file there with `create_new`, which
+/// fails if anything is there (a directory or a dangling link counts), and the
+/// corrupt file is then renamed over that placeholder. Two writers can no
+/// longer replace a set-aside file: whoever loses the race for a name moves on
+/// to the next one. With no free name, or if the move fails (the placeholder is
+/// removed, best effort), the file stays where it is and this is an error.
 fn set_aside(path: &Path) -> std::io::Result<PathBuf> {
     for n in 1..=MAX_SET_ASIDE {
         let target = if n == 1 { sibling(path, ".bad") } else { sibling(path, &format!(".bad.{n}")) };
-        match std::fs::symlink_metadata(&target) {
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::rename(path, &target)?;
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            Ok(placeholder) => {
+                drop(placeholder);
+                if let Err(e) = std::fs::rename(path, &target) {
+                    let _ = std::fs::remove_file(&target);
+                    return Err(e);
+                }
                 return Ok(target);
             }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
     }
@@ -875,12 +881,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad")).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad.2")).unwrap(), "second");
         assert!(!file(&d).exists());
-        // A good file read afterwards does not clear where the last one went.
+        // On one instance, a good file read after a set-aside does not clear where it went.
+        std::fs::write(file(&d), "third").unwrap();
         let mut keeps = Keeps::load(file(&d)).unwrap();
-        assert!(keeps.set_aside().is_none());
+        let third = d.join("keeps.json.bad.3");
+        assert_eq!(keeps.set_aside(), Some(third.as_path()));
         keeps.remember(&[1; 32], &[2; 32], None, 3).unwrap();
         keeps.reload().unwrap();
-        assert!(keeps.set_aside().is_none(), "nothing was set aside by these reads");
+        assert_eq!(keeps.list().len(), 1, "the good list was read");
+        assert_eq!(keeps.set_aside(), Some(third.as_path()), "a good read leaves the last set-aside in place");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_name_that_is_already_taken_is_never_replaced() {
+        let d = dir("foreign");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("keeps.json.bad"), "").unwrap();
+        std::fs::write(d.join("keeps.json.bad.2"), "foreign").unwrap();
+        std::fs::write(file(&d), "corrupt").unwrap();
+        let keeps = Keeps::load(file(&d)).unwrap();
+        assert_eq!(keeps.set_aside(), Some(d.join("keeps.json.bad.3").as_path()));
+        assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad")).unwrap(), "", "the empty file is untouched");
+        assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad.2")).unwrap(), "foreign");
+        assert_eq!(std::fs::read_to_string(d.join("keeps.json.bad.3")).unwrap(), "corrupt");
         let _ = std::fs::remove_dir_all(d);
     }
 
