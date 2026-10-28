@@ -10,8 +10,7 @@ use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fmt;
 
-pub const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
-pub const MAX_COMMANDS: usize = 256;
+pub use crate::checkpoint::{MAX_BATCH as MAX_COMMANDS, MAX_IMAGE as MAX_CHECKPOINT_BYTES};
 pub const STATE_HASH_DOMAIN: &[u8] = b"fray/authority-state/v1\0";
 
 /// Session-stable identity assigned by the host, never a connection-local ID.

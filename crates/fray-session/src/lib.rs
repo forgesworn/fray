@@ -11,6 +11,8 @@
 
 #[cfg(feature = "authority")]
 pub mod authority;
+#[cfg(any(feature = "session", feature = "authority"))]
+pub mod checkpoint;
 #[cfg(feature = "session")]
 pub mod code;
 #[cfg(feature = "session")]

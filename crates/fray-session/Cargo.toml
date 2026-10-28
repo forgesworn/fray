@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["session", "authority"]
 session = ["dep:getrandom", "dep:nostr", "dep:serde", "dep:sha2"]
-authority = ["dep:sha2"]
+authority = ["dep:serde", "dep:sha2"]
 
 [dependencies]
 getrandom = { version = "0.3", optional = true }

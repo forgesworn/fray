@@ -229,6 +229,44 @@ fn errors_keep_the_contract_code() {
     assert!(error.to_string().contains("checkpoint schema"));
 }
 
+#[test]
+fn pure_image_helpers_keep_the_existing_domain_and_numeric_bounds() {
+    use fray_session::checkpoint::{bounded_vec, state_hash, validate_finite, Error};
+    let image_hash = state_hash(b"canonical\0checkpoint").unwrap();
+    let hex: String = image_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        hex,
+        "320946aa607a40ad26f47a6ef87f89245b443762ce375ae381a194b33bccac0c"
+    );
+    assert_ne!(
+        image_hash,
+        checkpoint_hash(b"canonical\0checkpoint").unwrap()
+    );
+    validate_finite(&(Some(vec![1.0f64, -2.0]), [0.0f32, 3.0])).unwrap();
+    assert_eq!(
+        validate_finite(&[f64::NAN]),
+        Err(Error::Invalid("nonfinite checkpoint number"))
+    );
+    assert!(validate_finite(&(vec![Some(f32::INFINITY)],)).is_err());
+    let values = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(0u8..3);
+    assert!(bounded_vec::<_, u8, 2>(values).is_err());
+    let values = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(0u8..2);
+    assert_eq!(bounded_vec::<_, u8, 2>(values).unwrap(), vec![0, 1]);
+    assert!(state_hash(&vec![0; MAX_CHECKPOINT_BYTES + 1]).is_err());
+    #[cfg(feature = "session")]
+    {
+        let error: fray_session::migration::Error = Error::Bounds;
+        assert_eq!(error, fray_session::migration::Error::Bounds);
+        assert_eq!(
+            image_hash,
+            fray_session::migration::state_hash(b"canonical\0checkpoint").unwrap()
+        );
+    }
+}
+
 #[cfg(feature = "session")]
 #[test]
 fn authority_limits_retain_the_existing_session_ceilings() {
