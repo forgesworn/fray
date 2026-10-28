@@ -1,0 +1,79 @@
+package fray:authority@0.1.0;
+
+interface authority {
+    type player-id = u64;
+
+    record time {
+        tick: u64,
+        elapsed-us: u64,
+    }
+
+    enum delivery {
+        reliable,
+        lossy,
+    }
+
+    record player {
+        id: player-id,
+        identity: option<list<u8>>,
+        metadata: list<u8>,
+    }
+
+    record leave {
+        player: player-id,
+        reason: string,
+    }
+
+    record message {
+        player: player-id,
+        delivery: delivery,
+        bytes: list<u8>,
+    }
+
+    variant event {
+        joined(player),
+        left(leave),
+        message(message),
+        control(list<u8>),
+    }
+
+    variant target {
+        player(player-id),
+        broadcast,
+    }
+
+    record send-command {
+        target: target,
+        delivery: delivery,
+        bytes: list<u8>,
+    }
+
+    variant command {
+        send(send-command),
+        disconnect(leave),
+        set-open(bool),
+    }
+
+    enum error-code {
+        invalid-config,
+        invalid-checkpoint,
+        unsupported-version,
+        fault,
+    }
+
+    record authority-error {
+        code: error-code,
+        message: string,
+    }
+
+    init: func(config: list<u8>, seed: u64) -> result<_, authority-error>;
+    on-event: func(time: time, event: event) -> result<list<command>, authority-error>;
+    tick: func(time: time) -> result<list<command>, authority-error>;
+    checkpoint: func() -> result<list<u8>, authority-error>;
+    restore: func(config: list<u8>, checkpoint: list<u8>) -> result<_, authority-error>;
+    state-hash: func() -> result<list<u8>, authority-error>;
+}
+
+world game-authority {
+    export authority;
+}
