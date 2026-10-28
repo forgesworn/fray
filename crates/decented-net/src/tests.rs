@@ -4409,3 +4409,69 @@ mod invites {
         h.shutdown();
     }
 }
+
+
+#[test]
+fn explicit_beacon_suppression_keeps_direct_connections_working_for_standalone_and_listener_rooms()
+{
+    for on_listener in [false, true] {
+        let mut c = cfg();
+        assert!(
+            c.lan_beacon,
+            "existing consumers retain their default discovery"
+        );
+        c.lan_beacon = false;
+        let mut browser = lan_browse(&c);
+        assert!(browser.is_listening());
+        let listener = on_listener.then(|| {
+            Listener::bind(ListenerConfig {
+                stun: Vec::new(),
+                upnp: false,
+                ..ListenerConfig::new()
+            })
+            .unwrap()
+        });
+        let id = Identity::ephemeral();
+        let quiet = match &listener {
+            Some(l) => l.host(&c, &id, room(4)),
+            None => host(&c, &id, room(4)),
+        };
+        let addr = local_addr(&quiet);
+        let client = join_addr(&c, &Identity::ephemeral(), addr, &quiet.lan_token());
+        wait_client(&client, 10, |ev| {
+            matches!(ev, ClientEvent::Connected { .. })
+        });
+        client.send_reliable(Bytes::from_static(b"private game"));
+        let ev = wait_host(&quiet, 5, |ev| matches!(ev, HostEvent::Reliable { .. }));
+        assert!(matches!(ev, HostEvent::Reliable { bytes, .. } if &bytes[..] == b"private game"));
+        let until = Instant::now() + Duration::from_millis(2500);
+        while Instant::now() < until {
+            assert!(browser.poll().is_empty(), "private room sent a beacon");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Same browser, same port, existing default: absence above is observable.
+        let mut ordinary = c.clone();
+        ordinary.lan_beacon = true;
+        let control = match &listener {
+            Some(l) => l.host(&ordinary, &Identity::ephemeral(), room(4)),
+            None => host(&ordinary, &Identity::ephemeral(), room(4)),
+        };
+        wait_host(&control, 10, |e| matches!(e, HostEvent::Ready { .. }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rooms = browser.poll();
+            assert!(!rooms.iter().any(|r| r.code == quiet.code()));
+            if rooms.iter().any(|r| r.code == control.code()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "control beacon not heard");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        client.shutdown();
+        quiet.shutdown();
+        control.shutdown();
+        if let Some(l) = listener {
+            l.shutdown();
+        }
+    }
+}
