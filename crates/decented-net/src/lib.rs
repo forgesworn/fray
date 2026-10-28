@@ -133,6 +133,11 @@ pub struct NetConfig {
     pub stun: Vec<String>,
     /// UDP port of the LAN beacon (host sends to it, browsers bind it).
     pub lan_port: u16,
+    /// Send this room's discovery beacon on the LAN. Default true. Set false
+    /// for a private host whose endpoint/admission are shared out of band.
+    /// This suppresses only the beacon, not relay, STUN, candidate or punch
+    /// traffic; configure those separately. Listener rooms keep their own value.
+    pub lan_beacon: bool,
     /// UDP port QUIC binds. 0 = ephemeral.
     pub quic_port: u16,
     /// Whether the host reserves a local player seat. Defaults to true.
@@ -249,6 +254,7 @@ impl NetConfig {
             relay_fallback: true,
             stun: DEFAULT_STUN.iter().map(|s| s.to_string()).collect(),
             lan_port: DEFAULT_LAN_PORT,
+            lan_beacon: true,
             quic_port: 0,
             host_has_player: true,
             app_tag: app_tag.into(),
