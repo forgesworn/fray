@@ -4,7 +4,7 @@
 
 Fray is a poll-driven Rust transport for small realtime multiplayer games. Games supply their own rules, simulation and messages. The initial implementation is extracted from the transport already shared by Twang and Stampede, with the same wire format, authentication, defaults and limits.
 
-**Status: shared transport, with dedicated-host seat accounting.** Sessions, host election, migration, peer assistance, the authority interface, sandboxed Keep hosting and Godot bindings are future work. The transport supports up to 8 player seats and 1024-byte reliable messages or datagrams. Phone hosts reserve one local seat by default; a dedicated host can expose all eight seats to remote players. The broader 2–64-player scope is a development target.
+**Status: shared transport, migration state machines and Keep-join helpers.** The pure authority interface is available in `fray-session`; the opt-in sandboxed Keep path is being qualified in Ingle. Host election improvements, peer assistance and Godot bindings remain future work. The transport uses wire v7 and supports up to 8 player seats. Reliable messages default to 1024 bytes and can be configured up to 1 MiB for apps without migration; datagrams remain capped at 1024 bytes. Phone hosts reserve one local seat by default; a dedicated host can expose all eight seats to remote players. The development target is the defined S/M/L profiles, with per-session ceilings of 8/16/32 players. The current universal eight-player cap is an implementation gap for M/L; larger tiers are not supported yet.
 
 ## Packages
 
