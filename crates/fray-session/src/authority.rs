@@ -386,6 +386,11 @@ pub trait RecordReader {
 /// returned a `last` batch, so an authority withholds `last` on a tick it
 /// cannot checkpoint rather than returning an error.
 ///
+/// Fray defines this contract and ships no tier-L runner. At a `last` step the
+/// store must equal the record set the paired checkpoint binds: every changed
+/// record has been written in that batch or an earlier staged one, and every
+/// key no longer bound is in `removed`. There is no acknowledgement.
+///
 /// `seed` is 32 bytes of OS randomness drawn by the runner and passed once. It
 /// must not be logged, persisted or copied into a checkpoint, a stored record
 /// or any value sent to a player; derive each value from it through a one-way
@@ -435,8 +440,8 @@ pub struct StoredLimits {
 
 /// Validate one persist batch, staged or `last`, before the caller accepts any
 /// of it. A violation is a module fault. This checks only the batch itself:
-/// total stored bytes and keys, the commit, and the number of batches per tick
-/// belong to the runner, which knows the store.
+/// total stored bytes and keys and the commit belong to the runner, which knows
+/// the store, and one batch per tick holds by construction ([`TickOutput`]).
 ///
 /// Keys must be unique within `records` and within `removed`, and no key may be
 /// in both: the order of a write and a removal of one key inside a single batch

@@ -154,7 +154,7 @@ fn ceilings() -> StoredLimits {
 }
 
 #[test]
-fn initial_limit_values_match_the_plan() {
+fn initial_limit_values() {
     // Initial values, pending measurement on the slowest target.
     assert_eq!(MAX_STORED_KEY_BYTES, 128);
     assert_eq!(MAX_PERSIST_BATCH_BYTES, 1024 * 1024);
@@ -182,21 +182,19 @@ fn stored_types_are_plain_comparable_values() {
         metadata: Vec::new(),
     });
     assert_eq!(joined.clone(), joined);
-    let _ = format!(
-        "{:?}",
-        StoredEvent::Left {
-            player: PlayerId(1),
-            reason: String::new()
-        }
-    );
-    let _ = format!(
-        "{:?}",
-        StoredEvent::Message {
-            player: PlayerId(1),
-            delivery: Delivery::Reliable,
-            bytes: Vec::new()
-        }
-    );
+    let left = StoredEvent::Left {
+        player: PlayerId(1),
+        reason: String::new(),
+    };
+    assert_eq!(left.clone(), left);
+    assert_ne!(left, StoredEvent::Stopping);
+    let message = StoredEvent::Message {
+        player: PlayerId(1),
+        delivery: Delivery::Reliable,
+        bytes: Vec::new(),
+    };
+    assert_eq!(message.clone(), message);
+    assert_ne!(message, left);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +264,18 @@ fn entry_count_is_checked_over_records_and_removals_together() {
         .collect();
     let message = fault(validate_persist_batch(
         &batch(Vec::new(), removed, true),
+        ceilings(),
+    ));
+    assert!(message.contains("entries"), "{message}");
+    // Records and removals together: each list is under the cap, the sum is not.
+    let records: Vec<_> = (0..MAX_PERSIST_BATCH_ENTRIES / 2 + 1)
+        .map(|i| record(&(i as u32).to_be_bytes(), b""))
+        .collect();
+    let removed: Vec<_> = (0..MAX_PERSIST_BATCH_ENTRIES / 2)
+        .map(|i| (1_000_000 + i as u32).to_be_bytes().to_vec())
+        .collect();
+    let message = fault(validate_persist_batch(
+        &batch(records, removed, true),
         ceilings(),
     ));
     assert!(message.contains("entries"), "{message}");
@@ -392,6 +402,11 @@ fn a_profile_may_declare_less_but_never_more_than_the_ceilings() {
         ),
         small,
     ));
+    // The profile's key limit also applies to removed keys.
+    fault(validate_persist_batch(
+        &batch(Vec::new(), vec![b"abcde".to_vec()], true),
+        small,
+    ));
     // Limits above the ceilings are clamped to them.
     let huge = StoredLimits {
         key_bytes: usize::MAX,
@@ -414,6 +429,30 @@ fn a_profile_may_declare_less_but_never_more_than_the_ceilings() {
         ),
         huge,
     ));
+    fault(validate_persist_batch(
+        &batch(
+            Vec::new(),
+            (0..=MAX_PERSIST_BATCH_ENTRIES)
+                .map(|i| (i as u32).to_be_bytes().to_vec())
+                .collect(),
+            true,
+        ),
+        huge,
+    ));
+}
+
+#[test]
+fn an_empty_key_is_valid_and_counts_no_bytes() {
+    validate_persist_batch(
+        &batch(
+            vec![record(b"", &vec![0; MAX_PERSIST_BATCH_BYTES])],
+            Vec::new(),
+            false,
+        ),
+        ceilings(),
+    )
+    .unwrap();
+    validate_persist_batch(&batch(Vec::new(), vec![Vec::new()], true), ceilings()).unwrap();
 }
 
 #[test]
@@ -456,16 +495,28 @@ impl RecordReader for FailingReader {
 
 /// Holds one stored record. The checkpoint binds it by key and SHA-256 digest
 /// of its stored bytes. `restore` verifies the digest before it parses.
+///
+/// It shows the seed rule: `init` derives a value from the seed under a domain
+/// label and keeps only that value. The raw seed is never stored, and the
+/// derived value travels in the checkpoint, so `restore` needs no seed.
 #[derive(Debug, PartialEq, Eq)]
 struct Notebook {
     tick: u64,
     page: u32,
-    seed_seen: [u8; 32],
+    derived: [u8; 32],
     dirty: bool,
     stopping: bool,
 }
 
 const KEY: &[u8] = b"page";
+const DERIVE_LABEL: &[u8] = b"notebook/derived/v1\0";
+
+fn derive(seed: &[u8; 32]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(DERIVE_LABEL);
+    hash.update(seed);
+    hash.finalize().into()
+}
 
 impl Notebook {
     fn stored_page(&self) -> Vec<u8> {
@@ -478,7 +529,7 @@ impl StoredAuthority for Notebook {
         Ok(Self {
             tick: 0,
             page: 0,
-            seed_seen: *seed,
+            derived: derive(seed),
             dirty: false,
             stopping: false,
         })
@@ -524,6 +575,7 @@ impl StoredAuthority for Notebook {
     fn checkpoint(&self) -> Result<Vec<u8>, AuthorityError> {
         let mut out = self.tick.to_be_bytes().to_vec();
         out.extend_from_slice(&Sha256::digest(self.stored_page()));
+        out.extend_from_slice(&self.derived);
         Ok(out)
     }
 
@@ -533,11 +585,12 @@ impl StoredAuthority for Notebook {
         records: &dyn RecordReader,
     ) -> Result<Self, AuthorityError> {
         let invalid = |what| AuthorityError::new(ErrorCode::InvalidCheckpoint, what);
-        if checkpoint.len() != 40 {
+        if checkpoint.len() != 72 {
             return Err(invalid("checkpoint length"));
         }
         let tick = u64::from_be_bytes(checkpoint[..8].try_into().unwrap());
-        let bound = &checkpoint[8..];
+        let bound = &checkpoint[8..40];
+        let derived: [u8; 32] = checkpoint[40..].try_into().unwrap();
         // A reader error is the runner's, and goes back unchanged.
         let stored = records
             .get(KEY)?
@@ -554,7 +607,7 @@ impl StoredAuthority for Notebook {
         Ok(Self {
             tick,
             page,
-            seed_seen: [0; 32],
+            derived,
             dirty: false,
             stopping: false,
         })
@@ -578,10 +631,9 @@ fn committed(authority: &Notebook, batch: &PersistBatch) -> (Vec<u8>, MapReader)
 }
 
 #[test]
-fn init_takes_a_32_byte_seed_and_tick_returns_an_optional_batch() {
+fn tick_returns_an_optional_batch() {
     let seed = [7u8; 32];
     let mut authority = Notebook::init(b"", &seed).unwrap();
-    assert_eq!(authority.seed_seen, seed);
     assert_eq!(authority.tick(time(1)).unwrap().persist, None);
     authority
         .on_event(time(2), StoredEvent::Control(vec![5]))
@@ -593,7 +645,7 @@ fn init_takes_a_32_byte_seed_and_tick_returns_an_optional_batch() {
 }
 
 #[test]
-fn stopping_is_an_event_that_does_not_return_commands() {
+fn stopping_leads_to_a_last_batch() {
     let mut authority = Notebook::init(b"", &[0; 32]).unwrap();
     assert_eq!(
         authority.on_event(time(1), StoredEvent::Stopping).unwrap(),
@@ -618,8 +670,26 @@ fn restore_round_trips_through_the_record_reader() {
         restored.state_hash().unwrap(),
         authority.state_hash().unwrap()
     );
-    // No seed survives a restore.
-    assert_eq!(restored.seed_seen, [0; 32]);
+    // The derived value comes back from the checkpoint; there is no seed.
+    assert_eq!(restored.derived, authority.derived);
+}
+
+#[test]
+fn the_seed_is_derived_from_and_forgotten() {
+    let seed = [0x5au8; 32];
+    let authority = Notebook::init(b"", &seed).unwrap();
+    // The kept value is neither the seed nor a prefix of it.
+    assert_ne!(authority.derived, seed);
+    assert_ne!(authority.derived[..16], seed[..16]);
+    // It depends on the seed, and a different seed gives a different value.
+    assert_ne!(
+        authority.derived,
+        Notebook::init(b"", &[0x5bu8; 32]).unwrap().derived
+    );
+    // The checkpoint carries the derived value and never the raw seed.
+    let checkpoint = authority.checkpoint().unwrap();
+    assert!(checkpoint.windows(32).any(|w| w == authority.derived));
+    assert!(!checkpoint.windows(32).any(|w| w == seed));
 }
 
 fn committed_root() -> (Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>) {
@@ -654,7 +724,8 @@ fn restore_verifies_digests_before_using_a_record() {
     let error = Notebook::restore(b"", &checkpoint, &MapReader(store)).unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidCheckpoint);
 
-    // A valid record swapped in from another key.
+    // The bound key is absent and a valid record sits under another key. (A
+    // single-key fixture cannot swap two bound records.)
     let (checkpoint, mut store) = committed_root();
     let valid = store.remove(KEY).unwrap();
     store.insert(b"other".to_vec(), valid);
