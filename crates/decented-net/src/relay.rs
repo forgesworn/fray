@@ -633,9 +633,8 @@ async fn relay_worker(
                 }
                 Cmd::Unsubscribe => {
                     if let Some(old) = standing.take() {
-                        let ids: Vec<String> = (0..req_count(old.values.len()))
-                            .map(chunk_sub_id)
-                            .collect();
+                        let ids: Vec<String> =
+                            (0..req_count(old.values.len())).map(chunk_sub_id).collect();
                         for ws in sockets.iter_mut().flatten() {
                             for id in &ids {
                                 let _ = send_text(ws, close_frame(id)).await;
@@ -768,11 +767,16 @@ mod tests {
             dial_error_text("HTTP error: 503 Service Unavailable"),
             "HTTP error: 503 Service Unavailable"
         );
-        let dirty = format!("cert \u{202e}name\u{0}\u{1b}[2J\r\nis\u{200b} bad {}", "z".repeat(400));
+        let dirty = format!(
+            "cert \u{202e}name\u{0}\u{1b}[2J\r\nis\u{200b} bad {}",
+            "z".repeat(400)
+        );
         let text = dial_error_text(&dirty);
         assert!(text.starts_with("cert name[2J is bad zzz"), "{text:?}");
         assert_eq!(text.chars().count(), 120);
-        assert!(text.chars().all(|c| !c.is_control() && !fray_keep::is_invisible(c)));
+        assert!(text
+            .chars()
+            .all(|c| !c.is_control() && !fray_keep::is_invisible(c)));
         assert_eq!(dial_error_text("\u{202e}\u{0}\n"), "dial failed");
     }
 
