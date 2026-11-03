@@ -20,6 +20,71 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[test]
+fn stored_debug_reports_lengths_and_counts_only() {
+    let record = StoredRecord {
+        key: b"private-key-marker".to_vec(),
+        value: b"private-value-marker".to_vec(),
+    };
+    assert_eq!(
+        format!("{record:?}"),
+        "StoredRecord { key_len: 18, value_len: 20 }"
+    );
+    let batch = PersistBatch {
+        records: vec![record],
+        removed: vec![b"private-removed-marker".to_vec()],
+        last: false,
+    };
+    assert_eq!(
+        format!("{batch:?}"),
+        "PersistBatch { records: 1, record_bytes: 38, removed: 1, last: false }"
+    );
+}
+
+#[test]
+fn stored_debug_stays_short_for_large_payloads_and_nested_outputs() {
+    let marker = b"private-record-marker";
+    let numeric_marker = format!("{:?}", marker);
+    let numeric_marker = numeric_marker.trim_matches(['[', ']']);
+    for count in [0, 1, 4096] {
+        let batch = PersistBatch {
+            records: vec![
+                StoredRecord {
+                    key: marker.to_vec(),
+                    value: marker.repeat(16),
+                };
+                count
+            ],
+            removed: vec![marker.to_vec(); count],
+            last: true,
+        };
+        let record = StoredRecord {
+            key: marker.repeat(count),
+            value: marker.repeat(count),
+        };
+        let output = TickOutput {
+            commands: vec![],
+            persist: Some(batch.clone()),
+        };
+        for text in [
+            format!("{record:?}"),
+            format!("{record:#?}"),
+            format!("{batch:?}"),
+            format!("{batch:#?}"),
+            format!("{output:?}"),
+            format!("{output:#?}"),
+        ] {
+            assert!(!text.contains(std::str::from_utf8(marker).unwrap()));
+            assert!(!text.contains(numeric_marker));
+            assert!(
+                text.len() < 512,
+                "debug output grew to {} bytes",
+                text.len()
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The WIT packages
 // ---------------------------------------------------------------------------
