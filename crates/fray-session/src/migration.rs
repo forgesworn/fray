@@ -5,8 +5,10 @@
 //! speculative state and a validation result are never publication authority.
 //! Game admission and checkpoint completeness remain the game runner's duties.
 
+pub use crate::checkpoint::{
+    bounded_vec, state_hash, validate_finite, Error, Hash, Result, MAX_BATCH, MAX_IMAGE,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-pub use crate::checkpoint::{bounded_vec, state_hash, validate_finite, Error, Hash, Result, MAX_BATCH, MAX_IMAGE};
 
 use nostr::secp256k1::{schnorr::Signature, Message};
 use nostr::{Keys, PublicKey};

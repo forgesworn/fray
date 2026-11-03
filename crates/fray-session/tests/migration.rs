@@ -1146,7 +1146,6 @@ fn activation_requires_all_human_capabilities_and_actual_initial_restore_equival
     assert!(missing.arm(&standby, |b| Ok(b.to_vec())).is_err());
 }
 
-
 #[test]
 fn phone_primary_shares_its_original_link_for_replication_and_player_control() {
     let (mut descriptor, host, standby, _) = descriptor_fixture();
@@ -1619,7 +1618,6 @@ fn membership_certificates_expose_only_installed_tables_and_reject_rollback_or_t
     assert!(MembershipCertificate::decode(root, &trailing).is_err());
     assert!(sequencer.membership_certificate(&newcomer).is_err());
 }
-
 
 #[test]
 fn authenticated_channel_filters_role_and_manifest_size_before_reassembly_allocation() {
@@ -2939,7 +2937,6 @@ fn standby_receive_attributes_frame_rejection_apart_from_local_faults() {
     }
 }
 
-
 #[test]
 fn incomplete_failed_and_expired_activation_cannot_produce_an_armed_authority() {
     for case in ["missing", "restore", "timeout", "clock", "bad_hash"] {
@@ -3297,7 +3294,10 @@ fn completed_activation_leaves_a_queued_probe_for_the_armed_primary() {
         .acknowledge(CapabilityAck::sign(&root, 1, initial, 7, &host).unwrap(), 0)
         .unwrap();
     source
-        .acknowledge(CapabilityAck::sign(&root, 2, initial, 1, &player).unwrap(), 0)
+        .acknowledge(
+            CapabilityAck::sign(&root, 2, initial, 1, &player).unwrap(),
+            0,
+        )
         .unwrap();
     while let Some(wire) = source.poll_send(0).unwrap() {
         sink.receive(&wire, 0).unwrap();
@@ -3324,8 +3324,7 @@ fn completed_activation_leaves_a_queued_probe_for_the_armed_primary() {
     assert_eq!(queue.queued_bytes(), probe.len());
     assert_eq!(source.receive(&probe, 0), Err(Error::RateLimited));
     let (primary, client) = source.finish(0).unwrap();
-    let mut original =
-        PrimaryActor::new(descriptor, primary, client, Activity::Idle, 0).unwrap();
+    let mut original = PrimaryActor::new(descriptor, primary, client, Activity::Idle, 0).unwrap();
     assert!(queue
         .poll(|wire| original.receive(wire, 0, &host))
         .unwrap()
@@ -7406,7 +7405,6 @@ fn prepared_player_control_receives_only_public_pulses_from_the_owned_replica_an
     );
     assert_eq!(standby.receipt().index, 1);
 }
-
 
 fn security_boundary_fixture(local: bool) -> (Root, Keys, Recovery) {
     let (mut descriptor, host, key, _) = descriptor_fixture();

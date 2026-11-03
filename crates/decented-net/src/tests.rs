@@ -1307,7 +1307,14 @@ fn closing_host(code: u32, reason: Vec<u8>) -> std::net::SocketAddr {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let endpoint = quic::server_endpoint(socket, TAG, quic::Liveness::DEFAULT).unwrap();
         tx.send(endpoint.local_addr().unwrap()).unwrap();
-        let conn = endpoint.accept().await.unwrap().accept().unwrap().await.unwrap();
+        let conn = endpoint
+            .accept()
+            .await
+            .unwrap()
+            .accept()
+            .unwrap()
+            .await
+            .unwrap();
         let _ = quic::server_read_hello(&conn).await;
         conn.close(code.into(), &reason);
         // Keep the endpoint up until the close frame has been delivered.
@@ -1378,7 +1385,10 @@ fn log_texts_never_carry_a_peers_close_reason_raw() {
     let want = "closed by peer (code 99): Fake orders: reboot";
     // The accept path's mapping, a LAN connect and a candidate: a quinn error
     // goes through connection_error_text where it is still a ConnectionError.
-    assert_eq!(connection_error_text(&app(DIRTY_CLOSE_TEXT.as_bytes())), want);
+    assert_eq!(
+        connection_error_text(&app(DIRTY_CLOSE_TEXT.as_bytes())),
+        want
+    );
     let text = connection_error_text(&app(long.as_bytes()));
     assert_clean(&text);
     assert!(text.len() <= 200 + 40, "{} bytes: {text:?}", text.len());
@@ -1396,7 +1406,10 @@ fn log_texts_never_carry_a_peers_close_reason_raw() {
     let remote = ended_of(&app(long.as_bytes()));
     let text = ended_text(&remote);
     assert_clean(&text);
-    assert!(text.starts_with("closed by peer (code 99): Fake orders: reboot"), "{text:?}");
+    assert!(
+        text.starts_with("closed by peer (code 99): Fake orders: reboot"),
+        "{text:?}"
+    );
     assert_eq!(ended_text(&Ended::TimedOut), "timed out");
     assert_eq!(ended_text(&Ended::Local), "closed locally");
     assert_eq!(ended_text(&Ended::Error("x".into())), "x");
@@ -1404,14 +1417,20 @@ fn log_texts_never_carry_a_peers_close_reason_raw() {
     let attempt = AttemptError::Open(HandshakeError::Io("no welcome".into()), Some(remote));
     let text = attempt_error_text(&attempt);
     assert_clean(&text);
-    assert!(text.starts_with("no verified welcome: no welcome; closed by peer (code 99): Fake"), "{text:?}");
+    assert!(
+        text.starts_with("no verified welcome: no welcome; closed by peer (code 99): Fake"),
+        "{text:?}"
+    );
     assert_eq!(attempt_error_text(&AttemptError::Connect), "no connection");
     let text = race_failure_text(&RaceFailure {
         errors: vec![AttemptError::Connect, attempt],
         connected: true,
     });
     assert_clean(&text);
-    assert!(text.starts_with("connected: true; [no connection, no verified welcome"), "{text:?}");
+    assert!(
+        text.starts_with("connected: true; [no connection, no verified welcome"),
+        "{text:?}"
+    );
 }
 
 #[test]
@@ -1434,7 +1453,10 @@ fn quinn_close_errors_are_described_from_kind_and_code_plus_cleaned_text() {
         connection_error_text(&app(99, DIRTY_CLOSE_TEXT.as_bytes())),
         "closed by peer (code 99): Fake orders: reboot"
     );
-    assert_eq!(connection_error_text(&app(7, b"")), "closed by peer (code 7)");
+    assert_eq!(
+        connection_error_text(&app(7, b"")),
+        "closed by peer (code 7)"
+    );
     // The transport-level close a client sees as Disconnected(Error(..)): the
     // one path no test can drive over a real connection, because quinn only
     // sends application closes.
@@ -1455,13 +1477,18 @@ fn quinn_close_errors_are_described_from_kind_and_code_plus_cleaned_text() {
     // The pump's Ended carries the same text; Fray's own errors are unchanged.
     assert_eq!(
         ended_of(&transport(DIRTY_CLOSE_TEXT.as_bytes())),
-        Ended::Error(connection_error_text(&transport(DIRTY_CLOSE_TEXT.as_bytes())))
+        Ended::Error(connection_error_text(&transport(
+            DIRTY_CLOSE_TEXT.as_bytes()
+        )))
     );
     assert_eq!(
         connection_error_text(&quinn::ConnectionError::TimedOut),
         "timed out"
     );
-    assert_eq!(connection_error_text(&quinn::ConnectionError::Reset), "reset by peer");
+    assert_eq!(
+        connection_error_text(&quinn::ConnectionError::Reset),
+        "reset by peer"
+    );
     // A lost connection inside a stream error spells out how the peer closed.
     let lost = quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(app(
         99,

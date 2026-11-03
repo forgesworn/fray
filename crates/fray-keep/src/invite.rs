@@ -74,7 +74,10 @@ pub fn format_invite_link(prefix: &str, host_key: &[u8; 32], secret: &[u8; 32]) 
 
 /// `text` starts with `prefix`, ignoring ASCII case.
 fn starts_with_ci(text: &str, prefix: &str) -> bool {
-    !prefix.is_empty() && text.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    !prefix.is_empty()
+        && text
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// Read a link pasted by a person. Leading and trailing whitespace is ignored,
@@ -88,7 +91,10 @@ pub fn parse_invite_link(prefix: &str, text: &str) -> Option<Invite> {
     }
     let rest = &text[prefix.len()..];
     let (host, secret) = rest.split_once('/')?;
-    Some(Invite { host_key: parse_hex32(host)?, secret: parse_hex32(secret)? })
+    Some(Invite {
+        host_key: parse_hex32(host)?,
+        secret: parse_hex32(secret)?,
+    })
 }
 
 /// The longest pasted text searched for a link, in bytes. Longer text is not a
@@ -117,9 +123,11 @@ pub fn invite_in_text<'a>(prefix: &str, text: &'a str) -> Option<&'a str> {
     if text.len() > MAX_TEXT {
         return None;
     }
-    text.split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']'))
-        .map(|w| w.trim_end_matches(['.', ',', ';', ':', '!', '?']))
-        .find(|w| is_link_word(prefix, w))
+    text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')
+    })
+    .map(|w| w.trim_end_matches(['.', ',', ';', ':', '!', '?']))
+    .find(|w| is_link_word(prefix, w))
 }
 
 #[cfg(test)]
@@ -135,19 +143,28 @@ mod tests {
     }
 
     fn invite() -> Option<Invite> {
-        Some(Invite { host_key: HOST, secret: SECRET })
+        Some(Invite {
+            host_key: HOST,
+            secret: SECRET,
+        })
     }
 
     #[test]
     fn a_link_round_trips() {
-        assert_eq!(link(), format!("stampede://keep/{}/{}", "ab".repeat(32), "01".repeat(32)));
+        assert_eq!(
+            link(),
+            format!("stampede://keep/{}/{}", "ab".repeat(32), "01".repeat(32))
+        );
         assert_eq!(parse_invite_link(PREFIX, &link()), invite());
     }
 
     #[test]
     fn the_prefix_is_the_callers() {
         let other = format_invite_link("axenstax://keep/", &HOST, &SECRET);
-        assert_eq!(other, format!("axenstax://keep/{}/{}", "ab".repeat(32), "01".repeat(32)));
+        assert_eq!(
+            other,
+            format!("axenstax://keep/{}/{}", "ab".repeat(32), "01".repeat(32))
+        );
         assert_eq!(parse_invite_link("axenstax://keep/", &other), invite());
         assert_eq!(parse_invite_link(PREFIX, &other), None);
         assert_eq!(parse_invite_link("axenstax://keep/", &link()), None);
@@ -156,7 +173,10 @@ mod tests {
     #[test]
     fn whitespace_and_case_are_forgiven() {
         let upper = link().to_uppercase();
-        assert_eq!(parse_invite_link(PREFIX, &format!("  \n{upper}\t \r\n")), invite());
+        assert_eq!(
+            parse_invite_link(PREFIX, &format!("  \n{upper}\t \r\n")),
+            invite()
+        );
         let mixed = link().replacen("stampede://keep", "StAmPeDe://KeEp", 1);
         assert_eq!(parse_invite_link(PREFIX, &mixed), invite());
     }
@@ -205,34 +225,76 @@ mod tests {
     fn an_invite_is_found_in_pasted_text() {
         let l = link();
         assert_eq!(invite_in_text(PREFIX, &l), Some(l.as_str()));
-        assert_eq!(invite_in_text(PREFIX, &format!("\n {l}  \n")), Some(l.as_str()));
-        assert_eq!(invite_in_text(PREFIX, &format!("Join my Keep: {l}.")), Some(l.as_str()));
+        assert_eq!(
+            invite_in_text(PREFIX, &format!("\n {l}  \n")),
+            Some(l.as_str())
+        );
+        assert_eq!(
+            invite_in_text(PREFIX, &format!("Join my Keep: {l}.")),
+            Some(l.as_str())
+        );
         assert_eq!(invite_in_text(PREFIX, &format!("<{l}>")), Some(l.as_str()));
-        assert_eq!(invite_in_text(PREFIX, &format!("(see {l})")), Some(l.as_str()));
+        assert_eq!(
+            invite_in_text(PREFIX, &format!("(see {l})")),
+            Some(l.as_str())
+        );
         let upper = l.replacen("stampede://keep", "STAMPEDE://KEEP", 1);
-        assert_eq!(invite_in_text(PREFIX, &format!("hi {upper}")), Some(upper.as_str()));
+        assert_eq!(
+            invite_in_text(PREFIX, &format!("hi {upper}")),
+            Some(upper.as_str())
+        );
         // Whatever is found goes to the parser.
-        assert_eq!(invite_in_text(PREFIX, &format!("Join my Keep: {l}.")).and_then(|w| parse_invite_link(PREFIX, w)), invite());
+        assert_eq!(
+            invite_in_text(PREFIX, &format!("Join my Keep: {l}."))
+                .and_then(|w| parse_invite_link(PREFIX, w)),
+            invite()
+        );
         // The first Keep link is the one read, even a bad one.
         let text = format!("try stampede://keep/short and then {l}");
         let first = invite_in_text(PREFIX, &text);
         assert_eq!(first, Some("stampede://keep/short"));
         assert_eq!(first.and_then(|w| parse_invite_link(PREFIX, w)), None);
-        assert_eq!(invite_in_text(PREFIX, "stampede://keep/nope"), Some("stampede://keep/nope"));
+        assert_eq!(
+            invite_in_text(PREFIX, "stampede://keep/nope"),
+            Some("stampede://keep/nope")
+        );
         // A link cut short at the prefix is still a Keep link, so the caller can call it bad.
-        assert_eq!(invite_in_text(PREFIX, "stampede://keep"), Some("stampede://keep"));
-        assert_eq!(invite_in_text(PREFIX, "STAMPEDE://KEEP and more"), Some("STAMPEDE://KEEP"));
+        assert_eq!(
+            invite_in_text(PREFIX, "stampede://keep"),
+            Some("stampede://keep")
+        );
+        assert_eq!(
+            invite_in_text(PREFIX, "STAMPEDE://KEEP and more"),
+            Some("STAMPEDE://KEEP")
+        );
     }
 
     #[test]
     fn text_without_a_keep_link_finds_nothing() {
-        for text in ["KWTQPM", "stampede://join#KWTQPM", "https://example.com/keeps", "stampede://keeper/x", "", "keep"] {
+        for text in [
+            "KWTQPM",
+            "stampede://join#KWTQPM",
+            "https://example.com/keeps",
+            "stampede://keeper/x",
+            "",
+            "keep",
+        ] {
             assert_eq!(invite_in_text(PREFIX, text), None, "{text:?}");
         }
         let long = format!("{} {}", "x".repeat(5000), link());
-        assert_eq!(invite_in_text(PREFIX, &long), None, "long text is not searched");
+        assert_eq!(
+            invite_in_text(PREFIX, &long),
+            None,
+            "long text is not searched"
+        );
         // Non-ASCII text next to a prefix-sized slice does not panic.
-        assert_eq!(invite_in_text(PREFIX, "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"), None);
+        assert_eq!(
+            invite_in_text(
+                PREFIX,
+                "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -266,10 +328,19 @@ mod tests {
 
     #[test]
     fn nothing_prints_the_secret() {
-        let i = Invite { host_key: HOST, secret: SECRET };
+        let i = Invite {
+            host_key: HOST,
+            secret: SECRET,
+        };
         assert_eq!(format!("{i:?}"), "Invite(Keep ababab)");
         assert!(!format!("{i:?}").contains("0101"));
         assert_eq!(describe(&HOST), "ababab");
-        assert_eq!(keep_id(&[0xab, 0xcd, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]), "ABCDEF");
+        assert_eq!(
+            keep_id(&[
+                0xab, 0xcd, 0xef, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+                19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
+            ]),
+            "ABCDEF"
+        );
     }
 }

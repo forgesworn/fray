@@ -335,10 +335,19 @@ pub enum StoredEvent {
 /// within a batch, at most [`MAX_STORED_KEY_BYTES`] bytes, and should carry no
 /// persona identifier. `value` is the record's complete canonical bytes; a
 /// later write to the same key replaces it entirely.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredRecord {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+}
+
+impl fmt::Debug for StoredRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredRecord")
+            .field("key_len", &self.key.len())
+            .field("value_len", &self.value.len())
+            .finish()
+    }
 }
 
 /// A batch of record writes and removals, returned from `tick`.
@@ -348,12 +357,28 @@ pub struct StoredRecord {
 /// since the previous commit, this batch, the checkpoint taken after the same
 /// tick and the runner's own session record as one durable root. Within a
 /// staged set the latest write or removal of a key wins.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PersistBatch {
     pub records: Vec<StoredRecord>,
     /// Keys to remove from the store at the next commit.
     pub removed: Vec<Vec<u8>>,
     pub last: bool,
+}
+
+impl fmt::Debug for PersistBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let record_bytes = self.records.iter().fold(0usize, |total, record| {
+            total
+                .saturating_add(record.key.len())
+                .saturating_add(record.value.len())
+        });
+        f.debug_struct("PersistBatch")
+            .field("records", &self.records.len())
+            .field("record_bytes", &record_bytes)
+            .field("removed", &self.removed.len())
+            .field("last", &self.last)
+            .finish()
+    }
 }
 
 /// What a tier-L `tick` returns: the commands, and at most one persist batch.
