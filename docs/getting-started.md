@@ -10,7 +10,7 @@ The packages are not published. Use a path or a pinned git revision, as shown be
 
 The starter is the package `fray-starter` in [`examples/starter`](../examples/starter). It is a tiny game with its own hand-written byte protocol: a client says hello with a name, the host answers with a player number, clients send their position as datagrams, and the host sends everyone's positions back. Both sides handle the other going away.
 
-You need a Rust toolchain. The starter uses `Option::is_none_or`, which needs Rust 1.82 or later.
+You need a Rust toolchain. The current dependency tree needs Rust 1.88 or later.
 
 From the root of the Fray checkout, open two terminals. In the first:
 
@@ -33,7 +33,7 @@ In the second terminal, join. With no address, `join` listens for the host's LAN
 cargo run -p fray-starter -- join --name Ada
 ```
 
-The client prints what it sees: the join stages, `welcome: you are player 1`, and snapshots of every player. The host prints `player 1 joined: Ada` and, once a second, where it last saw that player. Stop the client with `--seconds 5` (or let the host go): the host prints `player 1 left: Ada (Left)`. Add `--until-empty` to the host and it exits once its last player has gone.
+The client prints what it sees: the join stages, `welcome: you are player 1`, and snapshots of every player. The host prints `player 1 joined: Ada` and, once a second, where it last saw that player. Stop the client with `--seconds 5` (or let the host go): the host prints `player 1 left: Ada (Left)`. Ctrl+C kills the client without a goodbye, so the host reports `TimedOut` after about 6 seconds instead. Add `--until-empty` to the host and it exits once its last player has gone.
 
 If the beacon is not heard, join by address instead, using the line the host printed:
 
@@ -95,7 +95,7 @@ Import it as `fray_net`. Pin a revision rather than a branch, so an update is a 
 
 Fray's API is synchronous and does not wait on the network. The only calls that block are shutting a handle down and dropping one, covered below. Work that takes time happens on a runtime inside the crate and comes back as events from `poll`. Your game never starts that runtime, never enters it and never awaits anything from Fray.
 
-The shape of a host is a loop that polls, reacts, and sleeps for the rest of the frame. This is the example at the top of [`examples/starter/src/lib.rs`](../examples/starter/src/lib.rs); `cargo test -p fray-starter --doc` compiles it.
+Each `poll()` on a Fray handle returns one event, so a frame drains the handle with `while let Some(event) = handle.poll()`. The starter's `HostSession::poll` and `ClientSession::poll` do this, and return the game's own notes. The shape of a host is a loop that polls, reacts, and sleeps for the rest of the frame. This is the example at the top of [`examples/starter/src/lib.rs`](../examples/starter/src/lib.rs); `cargo test -p fray-starter --doc` compiles it.
 
 ```rust
 use std::time::{Duration, Instant};
@@ -120,7 +120,10 @@ fn main() {
                 HostNote::PlayerJoined { player, name } => println!("{name} is player {player}"),
                 HostNote::PlayerLeft { player, .. } => println!("Player {player} left"),
                 HostNote::Refused { why } => println!("Refused a peer: {why}"),
-                HostNote::Failed { reason } => panic!("Host failed: {reason}"),
+                HostNote::Failed { reason } => {
+                    eprintln!("Host failed: {reason}");
+                    return;
+                }
             }
         }
         if now >= next_state {
@@ -272,9 +275,9 @@ A key proves that the peer holds it on this connection. It does not say who the 
 
 ### Room codes over public relays
 
-Without `lan_only()`, a host answers a six-letter room code on Nostr relays. By default these are public relays. `NetConfig::relays` is the list to use instead, and `DEFAULT_RELAYS` is the built-in list when you give none. The starter's `--code` flag turns this on: the host prints a code, and `join --code --room-code ABCDEF` uses it.
+Without `lan_only()`, a host answers a six-letter room code on Nostr relays. `NetConfig::new` fills in `DEFAULT_RELAYS`, which are public relays, and `relay_fallback` tries them when every configured relay fails; an empty list means no relays. The starter's `--code` flag turns this on: the host prints a code, and `join --code --room-code ABCDEF` uses it.
 
-**Third-party relays see the lookup.** Per [the security notes](../crates/decented-net/SECURITY.md), a relay operator can see the room tag, the signer keys, timestamps, message sizes and the IP address of every client connected to it. The offer and answer are encrypted, and game messages never pass through a relay: after the lookup, peers talk to the host directly over QUIC. The host may also ask STUN servers for its public address and try a router port mapping (UPnP), which `lan_only()` avoids. A set `vpn_active` skips the port mapping but not STUN.
+**Third-party relays see the lookup.** Per [the security notes](../crates/decented-net/SECURITY.md), a relay operator can see the room tag, the signer keys, timestamps, message sizes and the IP address of every client connected to it. The offer and answer are encrypted, but the offer is encrypted under a key derived from the code, and a determined observer can recover a day's codes within that day (see [room codes](../crates/decented-net/SECURITY.md#room-codes-protocol-v5)). That reveals the joiner's candidate addresses. Game messages never pass through a relay: after the lookup, peers talk to the host directly over QUIC. The host may also ask STUN servers for its public address and try a router port mapping (UPnP), which `lan_only()` avoids. A set `vpn_active` skips the port mapping but not STUN.
 
 Fray tries several candidate addresses and hole punching. It does not promise a connection on every network. `FailReason::PunchFailed` is what a failure looks like.
 

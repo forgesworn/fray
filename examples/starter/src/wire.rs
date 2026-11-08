@@ -87,9 +87,10 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 impl Message {
-    /// The bytes to hand to Fray. A `Hello` with an unacceptable name is cut
-    /// to the longest acceptable prefix, so encoding never produces a frame
-    /// the other side refuses for its length.
+    /// The bytes to hand to Fray. Only the length of a `Hello` name is
+    /// repaired: one longer than [`MAX_NAME_LEN`] is cut to the longest prefix
+    /// that ends on a character boundary. An empty name or one with control
+    /// characters is sent as it is, and the receiver refuses it.
     pub fn encode(&self) -> Bytes {
         let mut out = Vec::new();
         match self {
@@ -116,7 +117,7 @@ impl Message {
             Message::State { tick, players } => {
                 out.push(TAG_STATE);
                 out.extend_from_slice(&tick.to_le_bytes());
-                // At most 9 players ever exist, so the count fits in a byte.
+                // At most 8 players ever exist, so the count fits in a byte.
                 out.push(players.len().min(usize::from(u8::MAX)) as u8);
                 for p in players.iter().take(usize::from(u8::MAX)) {
                     out.push(p.player);
@@ -324,7 +325,7 @@ mod tests {
     #[test]
     fn the_largest_state_fits_a_datagram() {
         let players = (0..=u8::MAX)
-            .take(9)
+            .take(8)
             .map(|player| PlayerState { player, x: 0, y: 0 })
             .collect();
         let bytes = Message::State { tick: 0, players }.encode();

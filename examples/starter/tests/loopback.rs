@@ -247,14 +247,22 @@ fn datagrams_carry_positions_both_ways() {
 }
 
 #[test]
-fn a_dedicated_host_has_no_player_zero() {
-    let mut host = start_host("dedicated", |c| c.host_has_player = false, 4);
-    let mut client = join(&host, "Ada");
-    pump("welcome", &mut host, &mut [&mut client], |_, c| {
-        welcomed(c[0])
+fn a_dedicated_host_gives_every_seat_to_remote_players() {
+    // Two seats. With the default (the host holds one) a second client would
+    // be refused, as in the full-room test; a dedicated host seats both.
+    let mut host = start_host("dedicated", |c| c.host_has_player = false, 2);
+    let mut a = join(&host, "Ada");
+    let mut b = join(&host, "Bo");
+    pump("both welcomed", &mut host, &mut [&mut a, &mut b], |_, c| {
+        welcomed(c[0]) && welcomed(c[1])
     });
+    let mut numbers = vec![a.session.player(), b.session.player()];
+    numbers.sort();
+    assert_eq!(numbers, vec![Some(1), Some(2)]);
+    assert_eq!(host.session.handle().peer_count(), 2);
+
     let mut last_send = Instant::now() - Duration::from_secs(1);
-    pump("a state", &mut host, &mut [&mut client], |h, c| {
+    pump("a state", &mut host, &mut [&mut a, &mut b], |h, c| {
         if last_send.elapsed() >= Duration::from_millis(20) {
             h.session.broadcast_state();
             last_send = Instant::now();
@@ -263,7 +271,7 @@ fn a_dedicated_host_has_no_player_zero() {
             .iter()
             .any(|n| matches!(n, ClientNote::State { .. }))
     });
-    for note in &client.notes {
+    for note in &a.notes {
         if let ClientNote::State { players, .. } = note {
             assert!(players.iter().all(|p| p.player != 0), "{players:?}");
         }

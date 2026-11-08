@@ -24,11 +24,12 @@ COMMON OPTIONS
   --seconds N        Stop after N seconds (default: run until the other side goes)
   --code             Use room codes over PUBLIC Nostr relays instead of LAN only.
                      The relays you reach can see that a lookup happened and your
-                     IP address; they do not see game messages.
+                     IP address, and so can the STUN servers asked for your public
+                     address; they do not see game messages.
 
 HOST OPTIONS
-  --max-players N    Seats, including the host's own (2 to 8, default 4)
-  --dedicated        The host has no player of its own
+  --max-players N    Seats (2 to 8, default 4); the host's own seat counts unless --dedicated
+  --dedicated        The host has no player of its own (all seats are for remote players)
   --until-empty      Stop once a player has joined and then everyone has left
 
 JOIN OPTIONS

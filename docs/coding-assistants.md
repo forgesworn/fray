@@ -6,7 +6,7 @@ These rules describe the code in this repository. Fray is unpublished and change
 
 ## Invariants
 
-1. **Poll from the game loop and never block it.** Call `poll()` on the host or client handle once per frame and handle every event it returns. Do not sleep, spin or wait for an event inside a frame. The only calls that block are `shutdown()` and dropping a handle (up to about one second for a host, 300 milliseconds for a client). Make them when the player leaves, not per frame.
+1. **Poll from the game loop and never block it.** Each frame, call `poll()` until it returns `None` (`while let Some(event) = handle.poll()`) and handle every event. It returns one event per call. Do not sleep, spin or wait for an event inside a frame. The only calls that block are `shutdown()` and dropping a handle (up to about one second for a host, 300 milliseconds for a client). Make them when the player leaves, not per frame.
 2. **Never start or own the async runtime.** Fray runs its own runtime inside the crate. Do not add `tokio` for Fray, create a runtime, call `block_on`, or `.await` anything from Fray. The API is synchronous.
 3. **Respect the size limits.** At most `MAX_PLAYERS` (8) seats. Reliable messages are at most `MAX_RELIABLE_LEN` (1024 bytes) unless `NetConfig::max_reliable_len` is raised on both ends together with a new `app_tag`. Datagrams are at most `MAX_LOSSY_LEN` (1024 bytes). An oversized send is dropped and logged, not returned as an error, so split large data yourself.
 4. **The game owns its messages.** Fray carries opaque bytes. Define a versioned encoding in the game, validate every inbound frame (from the host as well as from clients), and use datagrams only for state that the next datagram can replace. Datagrams can be lost, repeated or reordered.
@@ -18,7 +18,7 @@ Also:
 - `PeerJoined` seats a connection. It does not admit a player. Admission policy belongs to the game: wait for the game's own hello, and `kick` or `disconnect_with_reason` anyone who fails it.
 - A room code is an invitation, not an identity.
 - Choose one `app_tag` unique to the game. Use `NetConfig::lan_only()` unless the player has agreed to room codes over public relays, which can see the lookup.
-- Do not log or commit an `identity.key`, a LAN token or an invite secret. Use loopback (`127.0.0.1`) or documentation addresses (`192.0.2.0/24`) in examples and tests, never real ones.
+- Do not log or commit an `identity.key`, a LAN token or an invite secret, outside a deliberate manual-join prompt (the starter prints a LAN token for that). Use loopback (`127.0.0.1`) or documentation addresses (`192.0.2.0/24`) in examples and tests, never real ones.
 - Do not promise connectivity on every network, or host migration, or that Fray is a standard.
 
 ## Checklist
@@ -28,7 +28,7 @@ Before offering generated Fray code, check each item:
 - [ ] The dependency is a path or a pinned git revision.
 - [ ] One `NetConfig::new(data_dir, app_tag)` with the game's own tag; `lan_only()` unless public relays are intended and disclosed.
 - [ ] An `Identity` is chosen on purpose: `ephemeral()` or `load_or_create(&data_dir)`.
-- [ ] The host or client handle is created once, stored, and polled every frame.
+- [ ] The host or client handle is created once, stored, and drained with `poll()` every frame.
 - [ ] Every event variant is matched explicitly.
 - [ ] Nothing waits inside the frame loop, and `shutdown()` runs on leaving.
 - [ ] Reliable and lossy sends stay inside the limits.
@@ -46,7 +46,7 @@ cargo test -p fray-starter
 cargo test -p fray-starter --doc
 ```
 
-The first runs the starter's unit and integration tests: join, a reliable round trip, datagrams, the host seeing a client leave, the client seeing the host shut down, bad and missing hellos, and a docs test that checks every code excerpt and link in these guides. The second compiles the starter's doc examples. Passing shows that the revision and the documented behaviour agree. It does not test the game's own code.
+The first runs the starter's unit and integration tests: join, a reliable round trip, datagrams, the host seeing a client leave, the client seeing the host shut down, bad and missing hellos, and a docs test that checks every code excerpt and link in these guides. The second compiles the starter's doc examples. Passing shows that the revision and the documented behaviour agree for the behaviour these tests cover. It does not test the game's own code.
 
 To check generated code, follow the pattern in [`examples/starter/tests/loopback.rs`](../examples/starter/tests/loopback.rs). Run the game's host and client in one process, join with `join_addr` and the host's `lan_token()`, turn the beacon off, use a temporary data directory, and need no internet. Assert the join, a reliable round trip, a datagram (send several and expect at least one), the host seeing the client leave, and the client seeing the host shut down. Then run the game's own tests.
 

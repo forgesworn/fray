@@ -42,7 +42,10 @@
 //!                 HostNote::PlayerJoined { player, name } => println!("{name} is player {player}"),
 //!                 HostNote::PlayerLeft { player, .. } => println!("Player {player} left"),
 //!                 HostNote::Refused { why } => println!("Refused a peer: {why}"),
-//!                 HostNote::Failed { reason } => panic!("Host failed: {reason}"),
+//!                 HostNote::Failed { reason } => {
+//!                     eprintln!("Host failed: {reason}");
+//!                     return;
+//!                 }
 //!             }
 //!         }
 //!         if now >= next_state {
