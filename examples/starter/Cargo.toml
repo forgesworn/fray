@@ -1,0 +1,10 @@
+[package]
+name = "fray-starter"
+description = "A tiny two-player-or-more game that shows how to host, join, send and handle disconnects with Fray."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fray-net = { path = "../../crates/decented-net" }
