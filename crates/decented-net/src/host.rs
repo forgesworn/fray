@@ -1574,7 +1574,10 @@ impl HostTask {
             code: self.code.clone(),
         });
 
-        let mut beacon = BeaconSender::new(self.cfg.lan_port, self.cfg.lan_socket_hook.as_ref());
+        let mut beacon = self
+            .cfg
+            .lan_beacon
+            .then(|| BeaconSender::new(self.cfg.lan_port, self.cfg.lan_socket_hook.as_ref()));
         let mut last_beacon = Instant::now() - BEACON_EVERY;
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1708,7 +1711,7 @@ impl HostTask {
                     // An advertise-only host announces nothing it discovered: no beacon.
                     if open && !only && last_beacon.elapsed() >= BEACON_EVERY {
                         last_beacon = Instant::now();
-                        if let Some(local) = local {
+                        if let (Some(local), Some(beacon)) = (local, beacon.as_mut()) {
                             let players = usize::from(self.cfg.host_has_player)
                                 + self.shared.peers.lock().map(|p| p.len()).unwrap_or(0);
                             // The beacon is IPv4 broadcast; never advertise

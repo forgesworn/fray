@@ -1,3 +1,5 @@
+#![cfg(feature = "session")]
+
 //! Host-migration tests that need no sockets: the state machines, codecs,
 //! journals and recovery player, driven directly. The tests that run over a
 //! real QUIC connection live in `fray-net`'s `tests/migration.rs`.
