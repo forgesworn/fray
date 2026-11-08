@@ -370,7 +370,7 @@ fn a1_a_host_inbound_byte_bound_trips_before_the_count_bound() {
     }
     assert!(left, "the peer past the byte bound was dropped");
     assert!(bytes <= 64 * 1024, "{bytes} bytes queued");
-    assert!(count < 40 && count >= 1, "{count} queued of 40");
+    assert!((1..40).contains(&count), "{count} queued of 40");
     h.shutdown();
 }
 
@@ -401,7 +401,7 @@ fn a1_a_client_inbound_byte_bound_trips_before_the_count_bound() {
     }
     assert!(disconnected, "the host past the byte bound was dropped");
     assert!(bytes <= 64 * 1024, "{bytes} bytes queued");
-    assert!(count < 40 && count >= 1, "{count} queued of 40");
+    assert!((1..40).contains(&count), "{count} queued of 40");
     h.shutdown();
 }
 

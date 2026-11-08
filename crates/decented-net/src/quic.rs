@@ -1315,6 +1315,8 @@ pub(crate) fn race_failure_text(f: &RaceFailure) -> String {
 
 /// Move bytes until the connection ends. Reliable frames go to `on_reliable`,
 /// datagrams to `on_lossy`; `out` feeds the stream. Returns how it ended.
+// Crate-private pump; bundling the arguments would be a refactor of the transport loop.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn pump(
     conn: quinn::Connection,
     mut send: quinn::SendStream,

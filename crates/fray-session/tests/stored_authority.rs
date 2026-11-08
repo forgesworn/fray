@@ -480,7 +480,7 @@ fn a_profile_may_declare_less_but_never_more_than_the_ceilings() {
     };
     fault(validate_persist_batch(
         &batch(
-            vec![record(&vec![0; MAX_STORED_KEY_BYTES + 1], b"")],
+            vec![record(&[0; MAX_STORED_KEY_BYTES + 1], b"")],
             Vec::new(),
             true,
         ),

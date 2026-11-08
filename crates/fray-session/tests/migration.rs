@@ -5118,7 +5118,9 @@ fn human_input_envelopes_bind_original_bytes_to_authenticated_player_tls_and_ter
     assert_eq!(server.remote_key(), player.public_key().to_bytes());
     let mut intents = IntentJournal::default();
     let original = vec![0x5a; 1024];
-    let id = intents.append_batch(&[original.clone()]).unwrap()[0];
+    let id = intents
+        .append_batch(std::slice::from_ref(&original))
+        .unwrap()[0];
     let record = PlayerControl::sign(
         &root,
         &certificate,
@@ -5426,6 +5428,8 @@ fn normal_player_endpoint() -> (
     normal_player_endpoint_with_activation().0
 }
 
+// Test fixture tuple; an alias would add noise for no gain.
+#[allow(clippy::type_complexity)]
 fn normal_player_endpoint_with_activation() -> (
     (
         Root,
@@ -5988,11 +5992,9 @@ fn normal_player_endpoint_committed_ack_frees_full_journal_before_reliable_follo
     for size in [0, 1024] {
         let (root, _, key, mut seq, mut primary, mut endpoint, mut server, _, mut image) =
             normal_player_endpoint();
-        let count = if size == 0 {
-            MAX_JOURNAL_RECORDS
-        } else {
-            MAX_JOURNAL_BYTES / size
-        };
+        let count = MAX_JOURNAL_BYTES
+            .checked_div(size)
+            .unwrap_or(MAX_JOURNAL_RECORDS);
         let bytes = vec![10; size];
         endpoint
             .intents_mut()
@@ -6532,11 +6534,9 @@ fn player_queue_caps_are_retryable_and_committed_original_conflicts_are_sticky()
         let mut queue = primary
             .attach_player(&channel, certificate.clone())
             .unwrap();
-        let capacity = if size == 0 {
-            MAX_JOURNAL_RECORDS
-        } else {
-            MAX_JOURNAL_BYTES / size
-        } as u64;
+        let capacity = MAX_JOURNAL_BYTES
+            .checked_div(size)
+            .unwrap_or(MAX_JOURNAL_RECORDS) as u64;
         let payload = vec![3; size];
         let wire = |number| {
             PlayerControl::sign(
@@ -10529,7 +10529,7 @@ fn eight_member_queues() -> (
     descriptor.consent(&standby).unwrap();
     let routes: Vec<(u64, u32)> = (1..=8).map(|p| (p, 9 + p as u32)).collect();
     let image = SessionImage::initial(&root, &routes, vec![0], 1, 100).unwrap();
-    let mut seq = Sequencer::arm_session(root.clone(), image.clone(), &standby).unwrap();
+    let seq = Sequencer::arm_session(root.clone(), image.clone(), &standby).unwrap();
     let mut primary = Primary::armed(
         root.context().unwrap(),
         image.encode(&root).unwrap(),
