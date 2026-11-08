@@ -3,6 +3,8 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+// Boxing the payload would change the public variant type, so the size gap is allowed.
+#[allow(clippy::large_enum_variant)]
 pub enum RecoveryPlayerEvent {
     Output(PlayerEvent),
     ClockCut { logical_ms: u64 },
@@ -315,7 +317,7 @@ impl PlayerRecovery {
                     }
                     if let Some((old, reply)) = &self.proof {
                         if old == &challenge {
-                            let queued = self.queued_controls(&[reply.clone()])?;
+                            let queued = self.queued_controls(std::slice::from_ref(reply))?;
                             self.install_controls(queued);
                         }
                     }
@@ -337,7 +339,7 @@ impl PlayerRecovery {
                     &self.endpoint.keys,
                 )?;
                 let reply = proof.encode_with_certificate(&root, &self.endpoint.membership)?;
-                let queued = self.queued_controls(&[reply.clone()])?;
+                let queued = self.queued_controls(std::slice::from_ref(&reply))?;
                 incoming.commit()?;
                 self.install_controls(queued);
                 self.endpoint.intents = intents;
@@ -452,7 +454,7 @@ impl PlayerRecovery {
                 if !incoming.is_new() {
                     if self.cut.as_ref() == Some(&cut) {
                         if let Some((_, reply)) = &self.ready {
-                            let queued = self.queued_controls(&[reply.clone()])?;
+                            let queued = self.queued_controls(std::slice::from_ref(reply))?;
                             self.install_controls(queued);
                         }
                     }
@@ -479,7 +481,7 @@ impl PlayerRecovery {
                         &self.endpoint.keys,
                     )?;
                     let reply = ready.encode(&root, &self.promotion, &cut)?;
-                    let queued = self.queued_controls(&[reply.clone()])?;
+                    let queued = self.queued_controls(std::slice::from_ref(&reply))?;
                     incoming.commit()?;
                     self.install_controls(queued);
                     self.cut = Some(cut);
@@ -572,7 +574,7 @@ impl PlayerRecovery {
             &self.endpoint.keys,
         )?;
         let bytes = ready.encode(root, &self.promotion, cut)?;
-        let queued = self.queued_controls(&[bytes.clone()])?;
+        let queued = self.queued_controls(std::slice::from_ref(&bytes))?;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rebase(self.promotion.final_receipt.logical_ms, clock_delta)
         }))

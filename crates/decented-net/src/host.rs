@@ -612,6 +612,8 @@ pub(crate) fn start_session_endpoint(
 /// and the handle. `task` gets the code, the clamped room, the
 /// shared state and the command channel, and returns the transport's loop,
 /// which runs on the crate runtime (the UDP loop above, or `virt`'s).
+// Crate-private entry point; bundling the arguments would be a refactor of host start-up.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_host<F, Fut>(
     id: &Identity,
     room: RoomInfo,

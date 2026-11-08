@@ -732,7 +732,12 @@ fn actual_quic_player_input_output_and_ack_use_handshake_channels_and_committed_
         .unwrap();
     let mut intents = IntentJournal::default();
     let payload = vec![0xa5; 1024];
-    assert_eq!(intents.append_batch(&[payload.clone()]).unwrap(), vec![1]);
+    assert_eq!(
+        intents
+            .append_batch(std::slice::from_ref(&payload))
+            .unwrap(),
+        vec![1]
+    );
     let record = PlayerControl::sign(
         &root,
         &certificate,
