@@ -2181,8 +2181,10 @@ mod reservation_exhaustion_tests {
     use super::*;
     #[test]
     fn reservation_refuses_sequence_overflow_before_simulation_can_mutate() {
-        let mut journal = IntentJournal::default();
-        journal.next = u64::MAX;
+        let mut journal = IntentJournal {
+            next: u64::MAX,
+            ..IntentJournal::default()
+        };
         assert!(!journal.can_reserve(1, 1));
         assert_eq!(journal.append_batch(&[vec![1]]), Err(Error::Bounds));
         assert_eq!(journal.next, u64::MAX);
@@ -3927,6 +3929,8 @@ impl ResumeProof {
             root, None, challenge, tls, output_ack, input_tail, sequence, keys,
         )
     }
+    // Public signature is kept as is; grouping the arguments would change the API.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign_with_certificate(
         root: &Root,
         membership: &MembershipCertificate,
@@ -3948,6 +3952,8 @@ impl ResumeProof {
             keys,
         )
     }
+    // Private helper shared by the public signers; grouping the arguments is a refactor.
+    #[allow(clippy::too_many_arguments)]
     fn sign_bound(
         root: &Root,
         membership: Option<&MembershipCertificate>,
@@ -7823,6 +7829,8 @@ impl StandbyActor {
                 let staged = by_frame(frame, self.sequencer.stage(candidate))?;
                 let image = by_frame(frame, SessionImage::decode(root, &staged.candidate.image))?;
                 let previous = SessionImage::decode(root, self.sequencer.image())?;
+                // Local one-off closure signature; an alias would add noise for no gain.
+                #[allow(clippy::type_complexity)]
                 let restore_once = |restore: &mut dyn FnMut(
                     &Candidate,
                     &SessionImage,
@@ -8498,6 +8506,8 @@ impl RecoveryReady {
     }
     /// The game validates and performs its bounded clock rebase before calling
     /// this. Exact retained journals, never reconstructed fields, prove the cut.
+    // Public signature is kept as is; grouping the arguments would change the API.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         root: &Root,
         promotion: &Promotion,
@@ -9265,6 +9275,8 @@ impl PlayerControl {
     fn digest(&self, root: &Root) -> Result<Hash> {
         Ok(hash(b"fray/migration/control/v1\0", &self.body(root)?))
     }
+    // Public signature is kept as is; grouping the arguments would change the API.
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         root: &Root,
         membership: &MembershipCertificate,
@@ -10829,7 +10841,7 @@ impl PlayerEndpoint {
     ) -> Result<Option<PlayerEvent>> {
         match kind {
             PacketKind::Output => {
-                let record = CertifiedOutput::decode(&self.descriptor.root.context()?, &bytes)?;
+                let record = CertifiedOutput::decode(&self.descriptor.root.context()?, bytes)?;
                 if record.output.recipient != self.player {
                     return Err(Error::Unauthorized);
                 }
@@ -10865,7 +10877,7 @@ impl PlayerEndpoint {
                 }))
             }
             PacketKind::Control => {
-                let membership = MembershipCertificate::decode(&self.descriptor.root, &bytes)?;
+                let membership = MembershipCertificate::decode(&self.descriptor.root, bytes)?;
                 // Decode authenticates the complete signed certificate. Check
                 // remembered canonical contradictions before stale-frontier
                 // filtering; a failed later check rolls back this ticket.
@@ -11614,6 +11626,8 @@ impl InputRound {
 impl PlayerControl {
     /// Seal the actual retained journals after this round's output replay. A
     /// state-lost client cannot synthesize the already-handled input prefix.
+    // Public signature is kept as is; grouping the arguments would change the API.
+    #[allow(clippy::too_many_arguments)]
     pub fn seal_round(
         root: &Root,
         promotion: &Promotion,
