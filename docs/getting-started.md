@@ -233,7 +233,7 @@ Use whatever encoding suits your game. Version it, and treat every inbound frame
 
 | Limit | Value | What happens past it |
 |---|---|---|
-| `MAX_PLAYERS` | 8 seats | `RoomInfo::max_players` is clamped to 2 through 8 and includes the host's own seat. A ninth joiner fails with `FailReason::RoomFull`. |
+| `MAX_PLAYERS` | 8 seats | `RoomInfo::max_players` is clamped to 2 through 8 and includes the host's own seat. A joiner who arrives when every seat is taken fails with `FailReason::RoomFull`. The host's own seat counts while `host_has_player` is true. |
 | `MAX_RELIABLE_LEN` | 1024 bytes by default | A larger `send_reliable` is dropped and logged; nothing is returned. A larger frame from a peer ends the connection. |
 | `MAX_LOSSY_LEN` | 1024 bytes | A larger `send_lossy` is dropped and logged. |
 | `MAX_DISCONNECT_REASON` | 200 bytes | A longer reason given to `disconnect_with_reason` is cut. |
@@ -274,7 +274,7 @@ A key proves that the peer holds it on this connection. It does not say who the 
 
 Without `lan_only()`, a host answers a six-letter room code on Nostr relays. By default these are public relays. `NetConfig::relays` is the list to use instead, and `DEFAULT_RELAYS` is the built-in list when you give none. The starter's `--code` flag turns this on: the host prints a code, and `join --code --room-code ABCDEF` uses it.
 
-**Third-party relays see the lookup.** Per [the security notes](../crates/decented-net/SECURITY.md), a relay operator can see the room tag, the signer keys, timestamps, message sizes and the IP address of every client connected to it. The offer and answer are encrypted, and game messages never pass through a relay: after the lookup, peers talk to the host directly over QUIC. The host may also ask STUN servers for its public address and try a router port mapping (UPnP), which `vpn_active` and `lan_only()` avoid.
+**Third-party relays see the lookup.** Per [the security notes](../crates/decented-net/SECURITY.md), a relay operator can see the room tag, the signer keys, timestamps, message sizes and the IP address of every client connected to it. The offer and answer are encrypted, and game messages never pass through a relay: after the lookup, peers talk to the host directly over QUIC. The host may also ask STUN servers for its public address and try a router port mapping (UPnP), which `lan_only()` avoids. A set `vpn_active` skips the port mapping but not STUN.
 
 Fray tries several candidate addresses and hole punching. It does not promise a connection on every network. `FailReason::PunchFailed` is what a failure looks like.
 
