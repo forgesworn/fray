@@ -17,6 +17,10 @@ Fray is a poll-driven Rust transport for small realtime multiplayer games. Games
 
 The legacy directory names preserve the existing source-layout tests. New applications import `fray_net` and `fray_relays`; the session types can also come straight from `fray_session`. Existing consumers can keep their source imports using Cargo dependency aliases.
 
+## Getting started
+
+New to Fray? Run the [starter](examples/starter), a tiny game with its own message format, then follow [getting started](docs/getting-started.md) to add the same loop to your game. Coding assistants can use the [rule sheet](docs/coding-assistants.md) to check what they generate.
+
 ## Try a LAN host
 
 The packages are not published. From a neighbouring Rust project:
