@@ -1,0 +1,88 @@
+package fray:stored-authority@0.1.0;
+
+/// Tier L only. One restore-only, namespace-scoped read.
+interface storage {
+    /// Valid only while `restore` is executing; from any other export it is a
+    /// module fault. Returns the committed bytes of the record the checkpoint
+    /// being restored was committed with, or none if the key is not in the
+    /// store. Never torn or partial. A runner read failure traps the call and
+    /// is reported as a storage failure, never as none. A key over the limit
+    /// is a module fault. Per-restore budgets on calls and total bytes
+    /// returned are module faults when exceeded.
+    get: func(key: list<u8>) -> option<list<u8>>;
+}
+
+interface stored-authority {
+    type player-id = u64;
+
+    record time { tick: u64, elapsed-us: u64 }
+
+    enum delivery { reliable, lossy }
+
+    record player { id: player-id, identity: option<list<u8>>, metadata: list<u8> }
+
+    record leave { player: player-id, reason: string }
+
+    record message { player: player-id, delivery: delivery, bytes: list<u8> }
+
+    variant target { player(player-id), broadcast }
+
+    record send-command { target: target, delivery: delivery, bytes: list<u8> }
+
+    variant command { send(send-command), disconnect(leave), set-open(bool) }
+
+    enum error-code { invalid-config, invalid-checkpoint, unsupported-version, fault }
+
+    record authority-error { code: error-code, message: string }
+
+    variant event {
+        joined(player),
+        left(leave),
+        message(message),
+        control(list<u8>),
+        /// The room is closed. The runner keeps stepping and exits after the next commit or at the end of the
+        /// profile's stop budget, whichever is first.
+        stopping,
+    }
+
+    /// One stored record. `key` is game-defined, opaque to the runner, unique
+    /// within a batch, at most 128 bytes, and should carry no persona
+    /// identifier. `value` is the record's complete canonical bytes; a later
+    /// write to the same key replaces it entirely.
+    record stored-record {
+        key: list<u8>,
+        value: list<u8>,
+    }
+
+    record persist-batch {
+        records: list<stored-record>,
+        /// Keys to remove from the store at the next commit. Within a staged
+        /// set, the latest write or removal of a key wins.
+        removed: list<list<u8>>,
+        /// false: staged, durable or discarded on crash, not a restore point.
+        /// true: commit everything staged, this batch, this step's checkpoint
+        /// and the runner's session record as one root.
+        last: bool,
+    }
+
+    record tick-output {
+        commands: list<command>,
+        persist: option<persist-batch>,
+    }
+
+    /// `seed` is exactly 32 bytes of OS randomness, drawn by the runner,
+    /// passed once, never logged, displayed, persisted or copied into config,
+    /// status or the session record.
+    init: func(config: list<u8>, seed: list<u8>) -> result<_, authority-error>;
+    on-event: func(time: time, event: event) -> result<list<command>, authority-error>;
+    tick: func(time: time) -> result<tick-output, authority-error>;
+    checkpoint: func() -> result<list<u8>, authority-error>;
+    /// Reads records through `storage.get`.
+    restore: func(config: list<u8>, checkpoint: list<u8>) -> result<_, authority-error>;
+    state-hash: func() -> result<list<u8>, authority-error>;
+}
+
+world stored-game-authority {
+    import storage;
+    export stored-authority;
+}

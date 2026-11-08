@@ -937,10 +937,12 @@ fn identify_keys(
 pub(crate) async fn server_read_hello(
     conn: &quinn::Connection,
 ) -> Result<(quinn::SendStream, quinn::RecvStream, Hello), (u32, String)> {
-    let (send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| (close::BAD_HELLO, format!("accept stream: {}", connection_error_text(&e))))?;
+    let (send, mut recv) = conn.accept_bi().await.map_err(|e| {
+        (
+            close::BAD_HELLO,
+            format!("accept stream: {}", connection_error_text(&e)),
+        )
+    })?;
     let frame = read_frame(&mut recv, HELLO_FRAME_CAP)
         .await
         .map_err(|e| (close::BAD_HELLO, e))?
