@@ -4437,7 +4437,6 @@ mod invites {
     }
 }
 
-
 #[test]
 fn explicit_beacon_suppression_keeps_direct_connections_working_for_standalone_and_listener_rooms()
 {
