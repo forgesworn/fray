@@ -339,8 +339,13 @@ signed welcome, identify, attestation, the confirm step and kicks.
   welcome still proves the host's identity key, which is linked to the
   persona if the host has chosen "Let contacts invite me" (that key is then
   published and names the persona): a stranger in range who already knows
-  that link can tell whose game it is. A per-room ephemeral transport key
-  would close that; it is a design question, accepted for now. On virtual
+  that link can tell whose game it is. An app can close that with
+  `NetConfig::virtual_door_key` (off by default): each `host_virtual` handle
+  then signs its welcomes with a fresh door key (`HostHandle::door_key`), so
+  anyone who gets as far as the welcome learns and verifies that key, not the
+  runtime key. Fray does not tie the door key to the runtime key; that is the
+  app's step, after Accept.
+  Session-bound welcomes always prove the runtime key. On virtual
   links the welcome **withholds the host's persona attestation** (`NetConfig::withhold_host_attestation`, default on for
   `host_virtual`, off for LAN and code joins), so a stranger in range does not
   learn who the host is. The persona reaches a joiner only once the host has

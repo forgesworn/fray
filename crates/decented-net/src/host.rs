@@ -165,8 +165,13 @@ pub(crate) struct Shared {
     local_addr: Mutex<Option<SocketAddr>>,
     /// The online endpoint's address; `None` without a LAN hook (one endpoint).
     online_addr: Mutex<Option<SocketAddr>>,
-    /// Signs every welcome, so joiners can verify who they reached.
+    /// Signs every welcome, so joiners can verify who they reached (except
+    /// a door welcome, below).
     host_keys: Keys,
+    /// A virtual host's door key ([`crate::NetConfig::virtual_door_key`]):
+    /// signs the welcome of every join that is not session-bound, in place
+    /// of `host_keys`. `None` = every welcome is runtime-signed.
+    door_keys: Option<Keys>,
     /// The host identity's persona attestation, if any (unverified seam).
     attestation: Option<String>,
     /// The host identity's inbox relays, sent in the welcome next to the attestation.
@@ -641,12 +646,14 @@ where
         limits,
         pinned,
         None,
+        false,
         task,
     )
 }
 
 /// [`start_host`], for a room on a shared listener when `placement` is set
-/// (its code, its seat on the listener and the listener's peer numbering).
+/// (its code, its seat on the listener and the listener's peer numbering),
+/// and with a fresh door key for this handle when `door_key` is set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_host_with<F, Fut>(
     id: &Identity,
@@ -659,6 +666,7 @@ pub(crate) fn start_host_with<F, Fut>(
     limits: crate::ReliableLimits,
     pinned: Option<(String, crate::migration::EndpointPolicy)>,
     placement: Option<crate::listener::Placement>,
+    door_key: bool,
     task: F,
 ) -> HostHandle
 where
@@ -715,6 +723,7 @@ where
         local_addr: Mutex::new(None),
         online_addr: Mutex::new(None),
         host_keys: id.keys().clone(),
+        door_keys: door_key.then(Keys::generate),
         attestation: id.attestation().map(str::to_string),
         inbox_relays: id.inbox_relays().to_vec(),
         answer_keys: Mutex::new(AnswerKeys::default()),
@@ -778,6 +787,17 @@ impl HostHandle {
     /// This endpoint's runtime identity. This does not attest a persona.
     pub fn runtime_key(&self) -> PublicKey {
         self.shared.host_keys.public_key()
+    }
+
+    /// The x-only door key this handle signs its welcomes with: a virtual
+    /// host's with [`crate::NetConfig::virtual_door_key`] on, fresh for this
+    /// handle (one door opening). `None` for any other host, which signs with
+    /// [`HostHandle::runtime_key`].
+    pub fn door_key(&self) -> Option<[u8; 32]> {
+        self.shared
+            .door_keys
+            .as_ref()
+            .map(|k| k.public_key().to_bytes())
     }
 
     /// The runtime key proven by Identify on this currently live connection.
@@ -2610,12 +2630,31 @@ pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                 .map_err(|_| "peer namespace exhausted")?,
         );
+        // A door welcome is signed with the door key; a session-bound one
+        // always with the runtime key. Identify is verified against the key
+        // that signed this connection's welcome.
+        let door = match (&shared.door_keys, &hello.migration) {
+            (Some(door), None) => Some(door),
+            _ => None,
+        };
+        let welcome_keys = door.unwrap_or(&shared.host_keys);
+        // A door welcome always withholds the persona, whatever
+        // `withhold_host_attestation` says: the runtime key's attestation
+        // and inbox relays would name who is behind the door key.
+        let (welcome_attestation, welcome_relays) = if door.is_some() {
+            (None, &[] as &[String])
+        } else {
+            (
+                shared.attestation.as_deref(),
+                shared.inbox_relays.as_slice(),
+            )
+        };
         let transcript = quic::server_send_welcome_bound(
             &conn,
             &mut send,
-            &shared.host_keys,
-            shared.attestation.as_deref(),
-            &shared.inbox_relays,
+            welcome_keys,
+            welcome_attestation,
+            welcome_relays,
             &shared.room_name,
             &shared.answer_key_for(hello.session.as_deref()),
             hello.session.as_deref(),
@@ -2624,7 +2663,7 @@ pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
         )
         .await?;
         // The joiner verified us; now it says who it is.
-        let host_pk = shared.host_keys.public_key();
+        let host_pk = welcome_keys.public_key();
         let (pk, attestation, inbox_relays) = match quic::server_read_identify(
             &conn,
             &mut recv,

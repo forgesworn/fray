@@ -71,6 +71,16 @@ fn ready_host(id: &Identity, max: u8) -> (HostHandle, VirtualLinkSender) {
     (h, links_tx)
 }
 
+/// A ready virtual host with the door key on ([`NetConfig::virtual_door_key`]).
+fn door_host(id: &Identity, max: u8) -> (HostHandle, VirtualLinkSender) {
+    let mut c = cfg();
+    c.virtual_door_key = true;
+    let (links_tx, links_rx) = virtual_link_queue(64);
+    let h = host_virtual(&c, id, room(max), links_rx);
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    (h, links_tx)
+}
+
 /// Hand the host a fresh link; return the joiner's end.
 fn dial(links: &VirtualLinkSender, label: &str) -> VirtualLink {
     let (client_end, host_end) = virtual_pair(label, "host", 256);
@@ -958,5 +968,179 @@ fn a_virtual_link_gives_both_ends_the_same_app_value() {
     let mine = cl.app_binding().expect("client computes it");
     assert_eq!(h.app_binding(peer), Some(mine));
     assert_ne!(Some(mine), cl.tls_binding());
+    h.shutdown();
+}
+
+/// The door key: with `virtual_door_key` on, a virtual host signs the
+/// welcome with this handle's door key, not its runtime key. Identify is
+/// verified against that key (the host seats the joiner only after it), and
+/// frames cross both ways. The persona stays withheld.
+#[test]
+fn a_door_key_signs_the_virtual_welcome_and_the_joiner_gets_in() {
+    let host_id = Identity::ephemeral().with_attestation("{\"host\":1}".into());
+    let (h, links) = door_host(&host_id, 4);
+    let door = h
+        .door_key()
+        .expect("a virtual host with the switch on has a door key");
+    let runtime = h.runtime_key().to_bytes();
+    assert_eq!(runtime, host_id.pubkey().to_bytes());
+    assert_ne!(door, runtime, "the door key is not the runtime key");
+
+    let id = Identity::ephemeral();
+    let cl = join_virtual(&cfg(), &id, dial(&links, "BLE door"));
+    let ev = outcome(&cl);
+    let ClientEvent::Connected {
+        path,
+        host_pubkey,
+        attestation,
+        inbox_relays,
+        ..
+    } = ev
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(path, PathKind::Virtual);
+    assert_eq!(
+        host_pubkey.to_bytes(),
+        door,
+        "the welcome proves the door key"
+    );
+    assert_eq!(
+        attestation, None,
+        "the door welcome still withholds the persona"
+    );
+    assert!(inbox_relays.is_empty());
+    assert_eq!(
+        cl.host_key(),
+        Some(door),
+        "the joiner's host key is the door key"
+    );
+    assert_ne!(cl.host_key(), Some(runtime));
+
+    let HostEvent::PeerJoined {
+        peer, admitted_by, ..
+    } = wait_host(
+        &h,
+        10,
+        |e| matches!(e, HostEvent::PeerJoined { pubkey, .. } if *pubkey == id.pubkey()),
+    )
+    else {
+        unreachable!()
+    };
+    assert_eq!(admitted_by, crate::Admission::Other);
+    assert_eq!(
+        h.peer_key(peer),
+        Some(id.pubkey()),
+        "identify verified against the door key"
+    );
+
+    cl.send_reliable(Bytes::from_static(b"up"));
+    wait_host(
+        &h,
+        10,
+        |e| matches!(e, HostEvent::Reliable { peer: p, bytes } if *p == peer && &bytes[..] == b"up"),
+    );
+    h.send_reliable(peer, Bytes::from_static(b"down"));
+    let ev = wait_client(&cl, 10, |e| matches!(e, ClientEvent::Reliable(_)));
+    assert!(
+        matches!(ev, ClientEvent::Reliable(ref b) if &b[..] == b"down"),
+        "{ev:?}"
+    );
+    h.shutdown();
+}
+
+/// One door key per door opening: two `host_virtual` handles of one identity
+/// have different door keys, over the same runtime key.
+#[test]
+fn each_virtual_door_opening_has_its_own_door_key() {
+    let host_id = Identity::ephemeral();
+    let (a, _links_a) = door_host(&host_id, 4);
+    let (b, _links_b) = door_host(&host_id, 4);
+    let first = a.door_key().expect("first opening");
+    let second = b.door_key().expect("second opening");
+    assert_ne!(first, second, "a fresh door key per opening");
+    assert_eq!(a.runtime_key(), b.runtime_key());
+    a.shutdown();
+    b.shutdown();
+}
+
+/// With the switch off (the default), a virtual welcome is signed with the
+/// runtime key, as before the door key existed.
+#[test]
+fn without_the_switch_the_virtual_welcome_is_runtime_signed() {
+    let host_id = Identity::ephemeral();
+    let (h, links) = ready_host(&host_id, 4);
+    assert_eq!(h.door_key(), None, "off by default");
+    let id = Identity::ephemeral();
+    let cl = join_virtual(&cfg(), &id, dial(&links, "BLE plain"));
+    let ev = outcome(&cl);
+    let ClientEvent::Connected { host_pubkey, .. } = ev else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(host_pubkey, h.runtime_key());
+    assert_eq!(cl.host_key(), Some(host_id.pubkey().to_bytes()));
+    wait_host(
+        &h,
+        10,
+        |e| matches!(e, HostEvent::PeerJoined { pubkey, .. } if *pubkey == id.pubkey()),
+    );
+    h.shutdown();
+}
+
+/// The switch is for virtual hosts only: a LAN host with it on has no door
+/// key and still signs its welcome with the runtime key.
+#[test]
+fn the_door_key_switch_leaves_a_lan_host_runtime_signed() {
+    let host_id = Identity::ephemeral();
+    let mut c = cfg();
+    c.virtual_door_key = true;
+    let h = crate::host(&c, &host_id, room(4));
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    assert_eq!(h.door_key(), None);
+    let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), h.local_addr().unwrap().port());
+    let cl = crate::join_addr(&cfg(), &Identity::ephemeral(), addr, &h.lan_token());
+    let ev = outcome(&cl);
+    let ClientEvent::Connected { host_pubkey, .. } = ev else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(host_pubkey, host_id.pubkey());
+    assert_eq!(cl.host_key(), Some(host_id.pubkey().to_bytes()));
+    h.shutdown();
+}
+
+/// A door welcome always withholds the persona: with the door key on, even
+/// `withhold_host_attestation = Some(false)` sends no attestation and no
+/// inbox relays (they would name who is behind the door key).
+#[test]
+fn a_door_welcome_withholds_the_persona_even_when_the_flag_sends_it() {
+    let host_id = Identity::ephemeral().with_attestation("{\"host\":1}".into());
+    let mut c = cfg();
+    c.virtual_door_key = true;
+    c.withhold_host_attestation = Some(false);
+    c.inbox_relays = vec!["wss://inbox.example".into()];
+    let (links_tx, links_rx) = virtual_link_queue(4);
+    let h = host_virtual(&c, &host_id, room(4), links_rx);
+    wait_host(&h, 10, |e| matches!(e, HostEvent::Ready { .. }));
+    let door = h.door_key().expect("door key on");
+    let ev = outcome(&join_virtual(
+        &cfg(),
+        &Identity::ephemeral(),
+        dial(&links_tx, "door opt in"),
+    ));
+    let ClientEvent::Connected {
+        host_pubkey,
+        attestation,
+        inbox_relays,
+        ..
+    } = ev
+    else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(host_pubkey.to_bytes(), door);
+    assert_eq!(
+        attestation, None,
+        "a door welcome withholds the attestation"
+    );
+    assert!(inbox_relays.is_empty(), "and the inbox relays");
     h.shutdown();
 }
