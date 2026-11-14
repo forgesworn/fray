@@ -2630,13 +2630,11 @@ pub(crate) async fn accept_arriving(arriving: Arriving, shared: Arc<Shared>) {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                 .map_err(|_| "peer namespace exhausted")?,
         );
-        // A door welcome is signed with the door key; a session-bound one
-        // always with the runtime key. Identify is verified against the key
-        // that signed this connection's welcome.
-        let door = match (&shared.door_keys, &hello.migration) {
-            (Some(door), None) => Some(door),
-            _ => None,
-        };
+        // On a door handle every welcome is signed with the door key, so it
+        // fails closed: a session-bound hello there (virtual hosts never pin a
+        // session) gets no runtime-signed welcome. Identify is verified
+        // against the key that signed this connection's welcome.
+        let door = shared.door_keys.as_ref();
         let welcome_keys = door.unwrap_or(&shared.host_keys);
         // A door welcome always withholds the persona, whatever
         // `withhold_host_attestation` says: the runtime key's attestation
