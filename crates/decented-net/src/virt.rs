@@ -41,7 +41,7 @@ use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::mpsc;
 
 use crate::client::{spawn, ClientHandle, Target};
-use crate::host::{accept_peer, start_host, Cmd, HostHandle, Shared};
+use crate::host::{accept_peer, start_host_with, Cmd, HostHandle, Shared};
 use crate::quic::{self, close};
 use crate::{FailReason, HostEvent, Identity, JoinStage, NetConfig, PathKind, RoomInfo};
 
@@ -138,7 +138,9 @@ pub fn virtual_pair(a_label: &str, b_label: &str, capacity: usize) -> (VirtualLi
 ///
 /// The welcome withholds the host's persona attestation and inbox relays unless
 /// [`NetConfig::withhold_host_attestation`] is `Some(false)`: anyone in radio
-/// range can get as far as the welcome, so it carries only the key.
+/// range can get as far as the welcome, so it carries only the key. With
+/// [`NetConfig::virtual_door_key`] on, that key is this handle's own door key
+/// ([`HostHandle::door_key`]), not the runtime key.
 pub fn host_virtual(
     cfg: &NetConfig,
     id: &Identity,
@@ -148,7 +150,7 @@ pub fn host_virtual(
     let app_tag = cfg.app_tag.clone();
     let live = cfg.checked();
     let id = host_identity(cfg, id, true);
-    start_host(
+    start_host_with(
         &id,
         room,
         cfg.host_has_player,
@@ -158,6 +160,8 @@ pub fn host_virtual(
         cfg.app_binding_label.clone(),
         cfg.host_limits(),
         None,
+        None,
+        cfg.virtual_door_key,
         move |code, _room, shared, cmd_rx| run_host(app_tag, live, code, links, shared, cmd_rx),
     )
 }

@@ -160,6 +160,17 @@ pub struct NetConfig {
     /// virtual links ([`host_virtual`]: anyone in radio range can get as far as
     /// the welcome), sent on LAN and code joins.
     pub withhold_host_attestation: Option<bool>,
+    /// Virtual (Bluetooth) hosts only: sign each joiner's welcome with a door
+    /// key, a fresh key per [`host_virtual`] handle (one handle is one door
+    /// opening), instead of the runtime key. A stranger in radio range then
+    /// learns that key, not the host's runtime key;
+    /// [`HostHandle::door_key`] returns it, and the app decides whether and
+    /// when to tie it to the runtime key. A door welcome always withholds the
+    /// host's attestation and inbox relays, whatever
+    /// [`NetConfig::withhold_host_attestation`] says: they would name the
+    /// persona behind the door key. Session-bound welcomes are never
+    /// affected, and other hosts ignore it. Default false.
+    pub virtual_door_key: bool,
     /// Binds a socket that talks to local peers to the local network, so a VPN
     /// cannot swallow it (Android: the Wi-Fi `Network`). See [`netbind`].
     /// `None` = sockets use the default route.
@@ -260,6 +271,7 @@ impl NetConfig {
             app_tag: app_tag.into(),
             inbox_relays: Vec::new(),
             withhold_host_attestation: None,
+            virtual_door_key: false,
             lan_socket_hook: None,
             vpn_active: false,
             idle_timeout: quic::IDLE_TIMEOUT,

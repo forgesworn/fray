@@ -504,6 +504,7 @@ impl Listener {
             cfg.host_limits(),
             None,
             Some(placement),
+            false,
             move |code, room, shared, cmd_rx| {
                 HostTask {
                     cfg,
