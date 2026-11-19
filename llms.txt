@@ -1,0 +1,17 @@
+# Fray
+
+> Poll-driven Rust transport and session state machines for small realtime multiplayer games. The current wire supports up to eight player seats.
+
+## Documentation
+
+- [Integrate Fray](https://github.com/forgesworn/fray/blob/main/docs/getting-started.md): Run the starter and add the transport loop to a Rust game.
+- [Integration constraints](https://github.com/forgesworn/fray/blob/main/docs/coding-assistants.md): Transport rules and examples for changes made by coding agents.
+- [Cargo packages and status](https://github.com/forgesworn/fray/blob/main/README.md): Source dependencies, supported paths and work in progress.
+
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/fray): Canonical source repository, documentation and release information.
+- [friend-link-kit](https://github.com/forgesworn/friend-link-kit): Game invitation and encrypted hello formats.
+- [fray-relay-client](https://github.com/forgesworn/fray-relay-client): General-purpose Nostr relay client in Rust.
